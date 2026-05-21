@@ -2587,7 +2587,11 @@ class FastMLXModel:
                         model._unsloth_quantized_source = adapter_cfg.get(
                             "base_quantized_source"
                         )
-                    _keep_norm_parameters_float32(model)
+                    if (
+                        getattr(model, "_is_vlm_model", False)
+                        and not getattr(model, "_unsloth_text_only_vlm", False)
+                    ):
+                        _keep_norm_parameters_float32(model)
                     _patch_mlx_saving(model, tokenizer)
                     return model, tokenizer
             except Exception as e:
@@ -2690,7 +2694,13 @@ class FastMLXModel:
             elif want_runtime_quant:
                 import mlx.core as mx
                 mx.eval(model.parameters())
-            _keep_norm_parameters_float32(model)
+            # VLM parity keeps normalization weights in fp32. Skip it when a
+            # multimodal wrapper is being used for text-only training: MLX
+            # RMSNorm/LayerNorm output follows the norm weight dtype, so fp32
+            # text norms promote the whole text activation stream and erase
+            # the memory advantage of bf16 CCE training.
+            if not force_vlm_text_path:
+                _keep_norm_parameters_float32(model)
 
             from .utils import (
                 normalize_mlx_chat_template,
@@ -2802,7 +2812,9 @@ class FastMLXModel:
             elif want_runtime_quant:
                 import mlx.core as mx
                 mx.eval(model.parameters())
-            _keep_norm_parameters_float32(model)
+            # Keep text-only norms in the requested model dtype. In MLX,
+            # fp32 norm weights make RMSNorm/LayerNorm return fp32 activations,
+            # which roughly doubles activation memory during text training.
             from .utils import normalize_mlx_chat_template
 
             tokenizer = normalize_mlx_chat_template(
