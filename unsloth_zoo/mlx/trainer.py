@@ -2145,8 +2145,8 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             return list(items)
         if dataset_order == "torch_randperm":
             from .utils import _torch_randperm_order
-            # Reseed per epoch (matches `create_ordered_batches`).
-            order = _torch_randperm_order(len(items), seed + epoch_idx)
+            # Match CUDA Trainer's effective DataLoader(RandomSampler(...)) stream.
+            order = _torch_randperm_order(len(items), seed, epoch=epoch_idx)
             return [items[i] for i in order]
         # legacy default: length-sort once
         return sorted(items, key=lambda x: len(x[0]))

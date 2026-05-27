@@ -167,6 +167,26 @@ def test_ordered_text_torch_randperm_can_materialize_multiple_epochs():
     assert first_epoch != second_epoch
 
 
+def test_torch_randperm_order_matches_accelerate_seedable_random_sampler():
+    import torch
+
+    from unsloth_zoo.mlx.utils import _torch_randperm_order
+
+    expected = [
+        _torch_randperm_order(8, seed=3407, epoch=epoch)
+        for epoch in range(3)
+    ]
+    actual = []
+    for epoch in range(3):
+        generator = torch.Generator()
+        # CUDA Trainer prepares RandomSampler through Accelerate's
+        # SeedableRandomSampler, which uses data_seed + epoch.
+        generator.manual_seed(3407 + epoch)
+        actual.append(torch.randperm(8, generator=generator).tolist())
+
+    assert expected == actual
+
+
 def test_vlm_torch_randperm_seed_none_and_multi_epoch_batches():
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import create_vlm_batches

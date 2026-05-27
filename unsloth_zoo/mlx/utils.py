@@ -2904,7 +2904,7 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
     target_epochs = 1 if num_batches is None and num_epochs is None else num_epochs
     indices = list(range(len(dataset)))
     if dataset_order == "torch_randperm":
-        indices = _torch_randperm_order(len(dataset), base_seed)
+        indices = _torch_randperm_order(len(dataset), base_seed, epoch=epoch)
     elif dataset_order in (None, "default"):
         if num_batches is not None:
             np.random.seed(base_seed)
@@ -2920,7 +2920,7 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
             seen = 0
             indices = list(range(len(dataset)))
             if dataset_order == "torch_randperm":
-                indices = _torch_randperm_order(len(dataset), base_seed + epoch)
+                indices = _torch_randperm_order(len(dataset), base_seed, epoch=epoch)
             elif dataset_order in (None, "default"):
                 np.random.seed(base_seed + epoch)
                 np.random.shuffle(indices)
@@ -2993,7 +2993,7 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
         epoch = 0
         while True:
             if dataset_order == "torch_randperm":
-                indices = _torch_randperm_order(len(dataset), base_seed + epoch)
+                indices = _torch_randperm_order(len(dataset), base_seed, epoch=epoch)
             elif dataset_order == "sequential":
                 indices = list(range(len(dataset)))
             elif dataset_order in (None, "default"):
@@ -3180,7 +3180,7 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
     return batch_pairs
 
 
-def _torch_randperm_order(length, seed):
+def _torch_randperm_order(length, seed, epoch=0):
     try:
         import torch
     except Exception as exc:
@@ -3189,7 +3189,9 @@ def _torch_randperm_order(length, seed):
             "Studio can mirror CUDA Studio batch order."
         ) from exc
     generator = torch.Generator()
-    generator.manual_seed(3407 if seed is None else int(seed))
+    # Accelerate wraps Trainer's RandomSampler as SeedableRandomSampler, which
+    # reseeds the sampler generator to data_seed + epoch on each iterator.
+    generator.manual_seed(_normalize_seed(seed) + max(0, int(epoch)))
     return torch.randperm(length, generator=generator).tolist()
 
 
@@ -3229,7 +3231,7 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
     def make_order(epoch):
         base_seed = _normalize_seed(seed)
         if dataset_order == "torch_randperm":
-            return _torch_randperm_order(len(tokenized), base_seed + epoch)
+            return _torch_randperm_order(len(tokenized), base_seed, epoch=epoch)
         if dataset_order not in (None, "sequential"):
             raise ValueError(f"Unsupported MLX dataset_order: {dataset_order!r}")
         return list(range(len(tokenized)))
