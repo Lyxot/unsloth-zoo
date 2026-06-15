@@ -89,6 +89,7 @@ def _text_model_extra_kwargs(model, extra, *, cce=False):
     extra = _text_batch_extra(extra)
     kwargs = {}
     attention_mask = extra.get("attention_mask")
+    input_attention_mask = None
     if attention_mask is not None:
         input_attention_mask = attention_mask[:, :-1]
         if cce:
@@ -96,6 +97,11 @@ def _text_model_extra_kwargs(model, extra, *, cce=False):
             if attention_mask_4d is not None:
                 kwargs["attention_mask_4d"] = attention_mask_4d
         else:
+            kwargs["attention_mask"] = input_attention_mask
+    token_type_ids = extra.get("token_type_ids")
+    if token_type_ids is not None:
+        kwargs["token_type_ids"] = token_type_ids[:, :-1]
+        if cce and input_attention_mask is not None:
             kwargs["attention_mask"] = input_attention_mask
     if cce:
         return kwargs
@@ -3539,6 +3545,192 @@ def _has_pretokenized_text_rows(dataset):
     return isinstance(first, dict) and "input_ids" in first
 
 
+def _collect_text_strings(dataset, tokenizer, dataset_text_field="text",
+                          formatting_func=None):
+    """Render raw or formatting_func text rows before CUDA-style tokenization."""
+    texts = []
+    for item in dataset:
+        if formatting_func is not None:
+            item = formatting_func(item)
+        for text in collect_mlx_texts(
+            tokenizer, item, dataset_text_field=dataset_text_field,
+            is_vlm=False,
+        ):
+            if text:
+                texts.append(text)
+    return texts
+
+
+def _cuda_text_add_special_tokens(processing_class, tokenizer, test_text, *, is_vlm=False):
+    """Use the same double-BOS guard as CUDA SFT dataset preparation."""
+    chat_template = getattr(processing_class, "chat_template", "")
+    if chat_template == "" and is_vlm:
+        chat_template = getattr(tokenizer, "chat_template", "")
+    if chat_template is None:
+        chat_template = ""
+
+    bos_token = (
+        getattr(processing_class, "bos_token", None)
+        or getattr(tokenizer, "bos_token", None)
+    )
+    if bos_token is not None and (
+        (test_text is not None and test_text.startswith(bos_token))
+        or bos_token in chat_template
+    ):
+        return False
+    return True
+
+
+def _flatten_text_token_ids(value):
+    """Normalize tokenizer outputs to a flat int list."""
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, dict):
+        value = value["input_ids"]
+    elif hasattr(value, "input_ids"):
+        value = value.input_ids
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if value and isinstance(value[0], list):
+        value = value[0]
+    return [int(x) for x in list(value)]
+
+
+def _callable_text_tokenizer(tokenizer):
+    """Unwrap mlx-lm-style tokenizer proxies for CUDA-style tokenizer calls."""
+    if callable(tokenizer):
+        return tokenizer
+    for attr in ("tokenizer", "_tokenizer"):
+        wrapped = getattr(tokenizer, attr, None)
+        if wrapped is not None and wrapped is not tokenizer and callable(wrapped):
+            return wrapped
+    return tokenizer
+
+
+def _cuda_tokenize_text_with_metadata(
+    tokenizer,
+    text,
+    max_seq_length,
+    *,
+    add_special_tokens=True,
+    append_eos=True,
+    return_token_type_ids=False,
+):
+    """Tokenize raw text with CUDA SFT tokenizer kwargs and keep metadata."""
+    tokenizer = _callable_text_tokenizer(tokenizer)
+    if not callable(tokenizer):
+        raise TypeError(
+            "Unsloth MLX: raw text token_type_ids require a callable "
+            "Hugging Face tokenizer or tokenizer wrapper."
+        )
+    try:
+        tokenized = tokenizer(
+            text,
+            truncation=True,
+            max_length=max_seq_length,
+            return_token_type_ids=return_token_type_ids,
+            add_special_tokens=add_special_tokens,
+        )
+    except TypeError:
+        tokenized = tokenizer(text, add_special_tokens=add_special_tokens)
+
+    input_ids = _flatten_text_token_ids(tokenized)
+    attention_mask = None
+    token_type_ids = None
+    if isinstance(tokenized, dict):
+        attention_mask = _to_int_list(tokenized.get("attention_mask"))
+        token_type_ids = _to_int_list(tokenized.get("token_type_ids"))
+    else:
+        if hasattr(tokenized, "attention_mask"):
+            attention_mask = _to_int_list(tokenized.attention_mask)
+        if hasattr(tokenized, "token_type_ids"):
+            token_type_ids = _to_int_list(tokenized.token_type_ids)
+
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    if append_eos and eos_id is not None and (not input_ids or input_ids[-1] != eos_id):
+        input_ids = list(input_ids) + [int(eos_id)]
+        if attention_mask is not None:
+            attention_mask = list(attention_mask) + [1]
+        if token_type_ids is not None:
+            token_type_ids = list(token_type_ids) + [0]
+
+    input_ids = input_ids[:max_seq_length]
+    if attention_mask is not None:
+        attention_mask = attention_mask[:len(input_ids)]
+    else:
+        attention_mask = [1] * len(input_ids)
+    if return_token_type_ids:
+        if token_type_ids is None:
+            token_type_ids = [0] * len(input_ids)
+        else:
+            token_type_ids = token_type_ids[:len(input_ids)]
+    else:
+        token_type_ids = None
+
+    return {
+        "input_ids": input_ids,
+        "labels": None,
+        "attention_mask": attention_mask,
+        "token_type_ids": token_type_ids,
+    }
+
+
+def _prepare_tokenized_text_rows(
+    dataset,
+    tokenizer,
+    max_seq_length,
+    dataset_text_field="text",
+    formatting_func=None,
+    chat_template=None,
+    model_name=None,
+    model_type=None,
+    append_eos=True,
+    return_token_type_ids=False,
+):
+    """Tokenize raw text rows when CUDA metadata fields must be preserved."""
+    tokenizer = normalize_mlx_chat_template(
+        tokenizer,
+        chat_template=chat_template,
+        model_name=model_name,
+        model_type=model_type,
+        is_vlm=False,
+        strict=False,
+    )
+    texts = _collect_text_strings(
+        dataset,
+        tokenizer,
+        dataset_text_field=dataset_text_field,
+        formatting_func=formatting_func,
+    )
+    if not texts:
+        raise ValueError(
+            f"No text data found. Provide a dataset with a '{dataset_text_field}' "
+            "column, messages/conversations with a tokenizer chat_template, or "
+            "a formatting_func that returns text."
+        )
+    add_special_tokens = _cuda_text_add_special_tokens(
+        tokenizer, tokenizer, texts[0], is_vlm=False,
+    )
+    rows = []
+    for text in texts:
+        row = _cuda_tokenize_text_with_metadata(
+            tokenizer,
+            text,
+            max_seq_length,
+            add_special_tokens=add_special_tokens,
+            append_eos=append_eos,
+            return_token_type_ids=return_token_type_ids,
+        )
+        if len(row["input_ids"]) >= 2:
+            rows.append(row)
+    if not rows:
+        raise ValueError(
+            "Unsloth MLX: tokenized text dataset produced no trainable token "
+            "sequences (need at least two input_ids after truncation)."
+        )
+    return rows
+
+
 def _prepare_pretokenized_text_rows(dataset, max_seq_length):
     rows = []
     for item in dataset:
@@ -3553,10 +3745,14 @@ def _prepare_pretokenized_text_rows(dataset, max_seq_length):
         attention_mask = _to_int_list(item.get("attention_mask"))
         if attention_mask is not None:
             attention_mask = attention_mask[:len(input_ids)]
+        token_type_ids = _to_int_list(item.get("token_type_ids"))
+        if token_type_ids is not None:
+            token_type_ids = token_type_ids[:len(input_ids)]
         rows.append({
             "input_ids": input_ids,
             "labels": None,
             "attention_mask": attention_mask,
+            "token_type_ids": token_type_ids,
         })
     if not rows:
         raise ValueError(
@@ -3578,6 +3774,8 @@ def _make_text_batch_tuple(batch_rows, max_seq_length, pad_id=0, pad_to_multiple
     has_labels = any(row.get("labels") is not None for row in batch_rows)
     attention_masks = []
     has_attention_mask = any(row.get("attention_mask") is not None for row in batch_rows)
+    token_type_ids = []
+    has_token_type_ids = any(row.get("token_type_ids") is not None for row in batch_rows)
 
     for row in batch_rows:
         ids = row["input_ids"][:max_len]
@@ -3600,6 +3798,13 @@ def _make_text_batch_tuple(batch_rows, max_seq_length, pad_id=0, pad_to_multiple
             row_mask = row_mask[:length]
             attention_masks.append(row_mask + [0] * pad_len)
 
+        if has_token_type_ids:
+            row_token_types = row.get("token_type_ids")
+            if row_token_types is None:
+                row_token_types = [0] * length
+            row_token_types = row_token_types[:length]
+            token_type_ids.append(row_token_types + [0] * pad_len)
+
     result = [
         mx.array(batch_ids),
         mx.array(lengths),
@@ -3608,6 +3813,8 @@ def _make_text_batch_tuple(batch_rows, max_seq_length, pad_id=0, pad_to_multiple
     extra = {}
     if has_attention_mask:
         extra["attention_mask"] = mx.array(attention_masks)
+    if has_token_type_ids:
+        extra["token_type_ids"] = mx.array(token_type_ids)
     if extra:
         result.append(extra)
     return tuple(result)
@@ -3726,7 +3933,8 @@ def _eval_text_batch_tensors(batches):
 def create_batches(dataset, tokenizer, batch_size, max_seq_length,
                    num_batches=None, seed=42, dataset_text_field="text",
                    formatting_func=None, chat_template=None,
-                   model_name=None, model_type=None, append_eos=True):
+                   model_name=None, model_type=None, append_eos=True,
+                   return_token_type_ids=False):
     """Pre-tokenize and batch a HuggingFace dataset for MLX training.
 
     Uses iterate_batches from mlx_lm for efficient dynamic-padding batching:
@@ -3746,6 +3954,24 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
 
     if formatting_func is None and _has_pretokenized_text_rows(dataset):
         rows = _prepare_pretokenized_text_rows(dataset, max_seq_length)
+        batch_pairs = _create_pretokenized_text_batches(
+            rows, tokenizer, batch_size, max_seq_length,
+            num_batches=num_batches, seed=seed,
+        )
+        _eval_text_batch_tensors(batch_pairs)
+        return batch_pairs
+
+    if return_token_type_ids:
+        rows = _prepare_tokenized_text_rows(
+            dataset, tokenizer, max_seq_length,
+            dataset_text_field=dataset_text_field,
+            formatting_func=formatting_func,
+            chat_template=chat_template,
+            model_name=model_name,
+            model_type=model_type,
+            append_eos=append_eos,
+            return_token_type_ids=return_token_type_ids,
+        )
         batch_pairs = _create_pretokenized_text_batches(
             rows, tokenizer, batch_size, max_seq_length,
             num_batches=num_batches, seed=seed,
@@ -3798,7 +4024,8 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
                            dataset_text_field="text",
                            formatting_func=None, chat_template=None,
                            model_name=None, model_type=None,
-                           num_epochs=None, append_eos=True):
+                           num_epochs=None, append_eos=True,
+                           return_token_type_ids=False):
     """Create text batches with an explicit dataset order.
 
     Studio uses this to mirror CUDA's effective sampler stream without
@@ -3807,6 +4034,25 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
 
     if formatting_func is None and _has_pretokenized_text_rows(dataset):
         rows = _prepare_pretokenized_text_rows(dataset, max_seq_length)
+        batch_pairs = _create_ordered_pretokenized_text_batches(
+            rows, tokenizer, batch_size, max_seq_length,
+            num_batches=num_batches, seed=seed,
+            dataset_order=dataset_order, num_epochs=num_epochs,
+        )
+        _eval_text_batch_tensors(batch_pairs)
+        return batch_pairs
+
+    if return_token_type_ids:
+        rows = _prepare_tokenized_text_rows(
+            dataset, tokenizer, max_seq_length,
+            dataset_text_field=dataset_text_field,
+            formatting_func=formatting_func,
+            chat_template=chat_template,
+            model_name=model_name,
+            model_type=model_type,
+            append_eos=append_eos,
+            return_token_type_ids=return_token_type_ids,
+        )
         batch_pairs = _create_ordered_pretokenized_text_batches(
             rows, tokenizer, batch_size, max_seq_length,
             num_batches=num_batches, seed=seed,
@@ -3905,7 +4151,7 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
                              seed=42, dataset_text_field="text",
                              formatting_func=None, chat_template=None,
                              model_name=None, model_type=None,
-                             append_eos=True):
+                             append_eos=True, return_token_type_ids=False):
     """Streaming batch generator for MLX training.
 
     Wraps mlx-lm's iterate_batches(loop=True) as a generator, avoiding
@@ -3918,6 +4164,25 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
 
     if formatting_func is None and _has_pretokenized_text_rows(dataset):
         rows = _prepare_pretokenized_text_rows(dataset, max_seq_length)
+        batches = _create_pretokenized_text_batches(
+            rows, tokenizer, batch_size, max_seq_length,
+            num_batches=None, seed=seed,
+        )
+        while True:
+            for batch in batches:
+                yield batch
+
+    if return_token_type_ids:
+        rows = _prepare_tokenized_text_rows(
+            dataset, tokenizer, max_seq_length,
+            dataset_text_field=dataset_text_field,
+            formatting_func=formatting_func,
+            chat_template=chat_template,
+            model_name=model_name,
+            model_type=model_type,
+            append_eos=append_eos,
+            return_token_type_ids=return_token_type_ids,
+        )
         batches = _create_pretokenized_text_batches(
             rows, tokenizer, batch_size, max_seq_length,
             num_batches=None, seed=seed,
