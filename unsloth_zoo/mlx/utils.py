@@ -42,10 +42,73 @@ from .cce import _get_runtime_cce
 
 
 _LLAMA_CPP_PATCHER_ENV_LOCK = threading.Lock()
+_PAD_MULTIPLE = 32
 
 
 def _safe_token_denominator(ntoks):
     return mx.maximum(ntoks.astype(mx.float32), mx.array(1.0, dtype=mx.float32))
+
+
+def _text_batch_extra(extra):
+    """Normalize optional text batch metadata to a dict for loss helpers."""
+    return extra if isinstance(extra, dict) else {}
+
+
+def _text_attention_mask_4d(attention_mask):
+    """Build the CCE-compatible causal mask from a 2D text attention mask."""
+    if attention_mask is None:
+        return None
+    seq_len = attention_mask.shape[1]
+    if seq_len <= 1:
+        return None
+    q_idx = mx.arange(seq_len)[:, None]
+    kv_idx = mx.arange(seq_len)[None, :]
+    causal = q_idx >= kv_idx
+    valid = attention_mask != 0
+    mask = mx.logical_and(causal[None, :, :], valid[:, None, :])
+    mask = mx.logical_and(mask, valid[:, :, None])
+    return mx.expand_dims(mask, axis=1)
+
+
+def _filter_call_kwargs(callable_obj, kwargs):
+    """Drop unsupported model kwargs for eager text forward calls."""
+    if not kwargs:
+        return {}
+    try:
+        params = inspect.signature(callable_obj.__call__).parameters
+    except (AttributeError, TypeError, ValueError):
+        return kwargs
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
+        return kwargs
+    allowed = set(params)
+    return {key: value for key, value in kwargs.items() if key in allowed}
+
+
+def _text_model_extra_kwargs(model, extra, *, cce=False):
+    """Prepare attention/token-type kwargs for text model forward parity."""
+    extra = _text_batch_extra(extra)
+    kwargs = {}
+    attention_mask = extra.get("attention_mask")
+    if attention_mask is not None:
+        input_attention_mask = attention_mask[:, :-1]
+        if cce:
+            attention_mask_4d = _text_attention_mask_4d(input_attention_mask)
+            if attention_mask_4d is not None:
+                kwargs["attention_mask_4d"] = attention_mask_4d
+        else:
+            kwargs["attention_mask"] = input_attention_mask
+    if cce:
+        return kwargs
+    return _filter_call_kwargs(model, kwargs)
+
+
+def _text_target_mask(extra, targets):
+    """Return the shifted attention loss mask when this batch should use it."""
+    extra = _text_batch_extra(extra)
+    attention_mask = extra.get("attention_mask")
+    if attention_mask is None:
+        return None
+    return attention_mask[:, 1:][:, :targets.shape[1]] != 0
 
 
 def _normalize_seed(seed, default=3407):
@@ -431,13 +494,14 @@ def make_cce_loss_fn(model):
             mode=quant_mode,
         )
 
-        def loss_fn(model, batch, lengths, labels=None):
+        def loss_fn(model, batch, lengths, labels=None, extra=None):
             if labels is None:
                 inputs, targets = batch[:, :-1], batch[:, 1:]
             else:
                 inputs = batch[:, :-1]
                 targets = labels[:, 1:]
-            hidden = _get_backbone(model)(model, inputs)
+            model_kwargs = _text_model_extra_kwargs(model, extra, cce=True)
+            hidden = _get_backbone(model)(model, inputs, **model_kwargs)
             layer = _get_lm_weight_layer(model)
             w = layer.weight
             sc = layer.scales
@@ -453,6 +517,9 @@ def make_cce_loss_fn(model):
                 mask = length_mask
             else:
                 mask = mx.logical_and(targets != -100, length_mask)
+            target_attention_mask = _text_target_mask(extra, targets)
+            if target_attention_mask is not None:
+                mask = mx.logical_and(mask, target_attention_mask)
             ignore = mx.array(-100, dtype=targets.dtype)
             masked_targets = mx.where(mask, targets, ignore)
             ntoks = mask.sum()
@@ -471,13 +538,14 @@ def make_cce_loss_fn(model):
             logit_softcap=softcap,
         )
 
-        def loss_fn(model, batch, lengths, labels=None):
+        def loss_fn(model, batch, lengths, labels=None, extra=None):
             if labels is None:
                 inputs, targets = batch[:, :-1], batch[:, 1:]
             else:
                 inputs = batch[:, :-1]
                 targets = labels[:, 1:]
-            hidden = _get_backbone(model)(model, inputs)
+            model_kwargs = _text_model_extra_kwargs(model, extra, cce=True)
+            hidden = _get_backbone(model)(model, inputs, **model_kwargs)
             w = _get_lm_weight_layer(model).weight
             if _skip_weight_grad:
                 w = mx.stop_gradient(w)
@@ -489,6 +557,9 @@ def make_cce_loss_fn(model):
                 mask = length_mask
             else:
                 mask = mx.logical_and(targets != -100, length_mask)
+            target_attention_mask = _text_target_mask(extra, targets)
+            if target_attention_mask is not None:
+                mask = mx.logical_and(mask, target_attention_mask)
             ignore = mx.array(-100, dtype=targets.dtype)
             masked_targets = mx.where(mask, targets, ignore)
             ntoks = mask.sum()
@@ -510,15 +581,19 @@ def make_baseline_loss_fn():
     labels[:,1:] and (targets != -100) as mask. The labels=None branch is
     byte-identical to ``mlx_lm.tuner.trainer.default_loss``.
     """
-    def loss_fn(model, batch, lengths, labels=None):
+    def loss_fn(model, batch, lengths, labels=None, extra=None):
         if labels is None:
             # Half-open [start, end) end-exclusive mask; matches CCE/labels paths
             # (:360, :393, :439) and mlx_lm's lengths convention.
             inputs = batch[:, :-1]
             targets = batch[:, 1:]
-            logits = model(inputs)
+            model_kwargs = _text_model_extra_kwargs(model, extra, cce=False)
+            logits = model(inputs, **model_kwargs)
             steps = mx.arange(1, targets.shape[1] + 1)
             mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
+            target_attention_mask = _text_target_mask(extra, targets)
+            if target_attention_mask is not None:
+                mask = mx.logical_and(mask, target_attention_mask)
             ce = nn.losses.cross_entropy(logits, targets) * mask
             ntoks = mask.sum()
             ce = ce.astype(mx.float32).sum() / ntoks
@@ -528,13 +603,17 @@ def make_baseline_loss_fn():
         # Widen unsigned dtypes so mx.where(..., -100, ...) and the
         # `targets != -100` compare both see signed int64.
         targets = _normalize_cce_label_dtype(labels[:, 1:])
-        logits = model(inputs)
+        model_kwargs = _text_model_extra_kwargs(model, extra, cce=False)
+        logits = model(inputs, **model_kwargs)
         steps = mx.arange(1, targets.shape[1] + 1)
         length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
         if labels is None:
             mask = length_mask.astype(mx.float32)
         else:
             mask = mx.logical_and(targets != -100, length_mask).astype(mx.float32)
+        target_attention_mask = _text_target_mask(extra, targets)
+        if target_attention_mask is not None:
+            mask = mx.logical_and(mask, target_attention_mask).astype(mx.float32)
         # Replace -100 with 0 before CE, MLX has no ignore_index;
         # the mask already zeros out these positions in the loss.
         safe_targets = mx.where(
@@ -3437,6 +3516,213 @@ def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
     )
 
 
+def _to_int_list(value):
+    if value is None:
+        return None
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    return [int(x) for x in list(value)]
+
+
+def _first_dataset_item(dataset):
+    if hasattr(dataset, "__len__") and len(dataset) > 0:
+        return dataset[0]
+    iterator = iter(dataset)
+    try:
+        return next(iterator)
+    except StopIteration:
+        return None
+
+
+def _has_pretokenized_text_rows(dataset):
+    first = _first_dataset_item(dataset)
+    return isinstance(first, dict) and "input_ids" in first
+
+
+def _prepare_pretokenized_text_rows(dataset, max_seq_length):
+    rows = []
+    for item in dataset:
+        if not isinstance(item, dict) or "input_ids" not in item:
+            raise ValueError(
+                "Unsloth MLX: pre-tokenized text datasets must provide "
+                "`input_ids` for every row."
+            )
+        input_ids = _to_int_list(item["input_ids"])[:max_seq_length]
+        if len(input_ids) < 2:
+            continue
+        attention_mask = _to_int_list(item.get("attention_mask"))
+        if attention_mask is not None:
+            attention_mask = attention_mask[:len(input_ids)]
+        rows.append({
+            "input_ids": input_ids,
+            "labels": None,
+            "attention_mask": attention_mask,
+        })
+    if not rows:
+        raise ValueError(
+            "Unsloth MLX: pre-tokenized dataset produced no trainable token "
+            "sequences (need at least two input_ids after truncation)."
+        )
+    return rows
+
+
+def _make_text_batch_tuple(batch_rows, max_seq_length, pad_id=0, pad_to_multiple=True):
+    max_len = min(max(len(row["input_ids"]) for row in batch_rows), max_seq_length)
+    if pad_to_multiple:
+        max_len = 1 + _PAD_MULTIPLE * ((max_len + _PAD_MULTIPLE - 1) // _PAD_MULTIPLE)
+        max_len = min(max_len, max_seq_length)
+
+    batch_ids = []
+    lengths = []
+    labels = []
+    has_labels = any(row.get("labels") is not None for row in batch_rows)
+    attention_masks = []
+    has_attention_mask = any(row.get("attention_mask") is not None for row in batch_rows)
+
+    for row in batch_rows:
+        ids = row["input_ids"][:max_len]
+        length = len(ids)
+        pad_len = max_len - length
+        batch_ids.append(ids + [pad_id] * pad_len)
+        lengths.append([0, length])
+
+        if has_labels:
+            row_labels = row.get("labels")
+            if row_labels is None:
+                row_labels = ids
+            row_labels = row_labels[:length]
+            labels.append(row_labels + [-100] * pad_len)
+
+        if has_attention_mask:
+            row_mask = row.get("attention_mask")
+            if row_mask is None:
+                row_mask = [1] * length
+            row_mask = row_mask[:length]
+            attention_masks.append(row_mask + [0] * pad_len)
+
+    result = [
+        mx.array(batch_ids),
+        mx.array(lengths),
+        mx.array(labels) if has_labels else None,
+    ]
+    extra = {}
+    if has_attention_mask:
+        extra["attention_mask"] = mx.array(attention_masks)
+    if extra:
+        result.append(extra)
+    return tuple(result)
+
+
+def _create_pretokenized_text_batches(rows, tokenizer, batch_size, max_seq_length,
+                                      num_batches=None, seed=42,
+                                      pad_to_multiple=True):
+    if len(rows) < batch_size:
+        raise ValueError(
+            f"Dataset must have at least batch_size={batch_size} examples "
+            f"but only has {len(rows)}."
+        )
+    ordered = sorted(rows, key=lambda row: len(row["input_ids"]))
+    batch_rows = [
+        ordered[i:i + batch_size]
+        for i in range(0, len(ordered) - batch_size + 1, batch_size)
+    ]
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = 0
+    rng = np.random.default_rng(_normalize_seed(seed))
+    batches = []
+    while True:
+        for batch_idx in rng.permutation(len(batch_rows)).tolist():
+            batches.append(_make_text_batch_tuple(
+                batch_rows[batch_idx],
+                max_seq_length,
+                pad_id=int(pad_id),
+                pad_to_multiple=pad_to_multiple,
+            ))
+            if num_batches is not None and len(batches) >= num_batches:
+                return batches
+        if num_batches is None:
+            return batches
+
+
+def _create_ordered_pretokenized_text_batches(
+    rows,
+    tokenizer,
+    batch_size,
+    max_seq_length,
+    num_batches=None,
+    seed=None,
+    dataset_order="sequential",
+    num_epochs=None,
+):
+    if not rows:
+        raise ValueError(
+            "Unsloth MLX: ordered pre-tokenized dataset produced no "
+            "trainable token sequences."
+        )
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = 0
+
+    def make_order(epoch):
+        base_seed = _normalize_seed(seed)
+        if dataset_order == "torch_randperm":
+            return _torch_randperm_order(len(rows), base_seed + epoch)
+        if dataset_order not in (None, "sequential"):
+            raise ValueError(f"Unsupported MLX dataset_order: {dataset_order!r}")
+        return list(range(len(rows)))
+
+    batches = []
+    epoch = 0
+    order = make_order(epoch)
+    order_pos = 0
+    seen = 0
+    target_items = (
+        len(rows) * (1 if num_epochs is None else int(num_epochs))
+        if num_batches is None else None
+    )
+    while num_batches is None or len(batches) < num_batches:
+        if order_pos >= len(order):
+            if num_batches is None and (target_items is None or seen >= target_items):
+                break
+            epoch += 1
+            order = make_order(epoch)
+            order_pos = 0
+
+        chunk = order[order_pos:order_pos + batch_size]
+        if not chunk:
+            break
+        order_pos += len(chunk)
+        seen += len(chunk)
+        if num_batches is None and target_items is not None and seen > target_items:
+            chunk = chunk[: len(chunk) - (seen - target_items)]
+            seen = target_items
+        batches.append(_make_text_batch_tuple(
+            [rows[i] for i in chunk],
+            max_seq_length,
+            pad_id=int(pad_id),
+            pad_to_multiple=False,
+        ))
+        if num_batches is None and target_items is not None and seen >= target_items:
+            break
+    return batches
+
+
+def _eval_text_batch_tensors(batches):
+    tensors = []
+    for batch in batches:
+        for value in batch[:3]:
+            if isinstance(value, mx.array):
+                tensors.append(value)
+        if len(batch) > 3 and isinstance(batch[3], dict):
+            tensors.extend(
+                value for value in batch[3].values()
+                if isinstance(value, mx.array)
+            )
+    if tensors:
+        mx.eval(tensors)
+
+
 def create_batches(dataset, tokenizer, batch_size, max_seq_length,
                    num_batches=None, seed=42, dataset_text_field="text",
                    formatting_func=None, chat_template=None,
@@ -3457,6 +3743,15 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
         with [offset, length] per sequence (from iterate_batches).
     """
     from mlx_lm.tuner.trainer import iterate_batches
+
+    if formatting_func is None and _has_pretokenized_text_rows(dataset):
+        rows = _prepare_pretokenized_text_rows(dataset, max_seq_length)
+        batch_pairs = _create_pretokenized_text_batches(
+            rows, tokenizer, batch_size, max_seq_length,
+            num_batches=num_batches, seed=seed,
+        )
+        _eval_text_batch_tensors(batch_pairs)
+        return batch_pairs
 
     ds = _prepare_dataset(
         dataset, tokenizer, dataset_text_field, formatting_func,
@@ -3509,6 +3804,16 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
     Studio uses this to mirror CUDA's effective sampler stream without
     changing generic mlx-lm batching behavior.
     """
+
+    if formatting_func is None and _has_pretokenized_text_rows(dataset):
+        rows = _prepare_pretokenized_text_rows(dataset, max_seq_length)
+        batch_pairs = _create_ordered_pretokenized_text_batches(
+            rows, tokenizer, batch_size, max_seq_length,
+            num_batches=num_batches, seed=seed,
+            dataset_order=dataset_order, num_epochs=num_epochs,
+        )
+        _eval_text_batch_tensors(batch_pairs)
+        return batch_pairs
 
     ds = _prepare_dataset(
         dataset, tokenizer, dataset_text_field, formatting_func,
@@ -3610,6 +3915,16 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
         (batch, lengths) tuples — same format as create_batches.
     """
     from mlx_lm.tuner.trainer import iterate_batches
+
+    if formatting_func is None and _has_pretokenized_text_rows(dataset):
+        rows = _prepare_pretokenized_text_rows(dataset, max_seq_length)
+        batches = _create_pretokenized_text_batches(
+            rows, tokenizer, batch_size, max_seq_length,
+            num_batches=None, seed=seed,
+        )
+        while True:
+            for batch in batches:
+                yield batch
 
     ds = _prepare_dataset(
         dataset, tokenizer, dataset_text_field, formatting_func,
