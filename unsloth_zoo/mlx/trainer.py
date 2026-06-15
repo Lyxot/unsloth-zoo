@@ -932,8 +932,7 @@ class MLXTrainer:
             if is_vlm:
                 loss, ntoks = loss_fn(self.model, batch_data)
             else:
-                batch, lengths, labels = batch_data
-                loss, ntoks = loss_fn(self.model, batch, lengths, labels)
+                loss, ntoks = loss_fn(self.model, *batch_data)
             all_losses += loss * ntoks
             ntokens += ntoks
             mx.eval(all_losses, ntokens)
@@ -1529,7 +1528,7 @@ class MLXTrainer:
             if isinstance(batch_data, dict):
                 (lvalue, toks), grad = loss_and_grad_fn(model, batch_data)
             else:
-                (lvalue, toks), grad = loss_and_grad_fn(model, batch_data[0], batch_data[1], batch_data[2])
+                (lvalue, toks), grad = loss_and_grad_fn(model, *batch_data)
 
             if _direct_single_step_update:
                 grad_norm = _apply_update_direct(grad)

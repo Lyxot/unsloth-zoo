@@ -342,6 +342,48 @@ def test_mlx_text_loss_masks_exclude_position_at_sequence_length():
     assert "steps < lengths[:, 1:]" in source
 
 
+def test_pretokenized_text_batches_preserve_attention_mask():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+    batches = create_ordered_batches(
+        [
+            {"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1]},
+            {"input_ids": [4, 5], "attention_mask": [1, 1]},
+        ],
+        Tokenizer(),
+        batch_size=2,
+        max_seq_length=8,
+        dataset_order="sequential",
+    )
+
+    batch, lengths, labels, extra = batches[0]
+    assert labels is None
+    assert batch.tolist() == [[1, 2, 3], [4, 5, 0]]
+    assert lengths.tolist() == [[0, 3], [0, 2]]
+    assert extra["attention_mask"].tolist() == [[1, 1, 1], [1, 1, 0]]
+
+
+def test_text_model_kwargs_forwards_attention_mask():
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.utils import _text_model_extra_kwargs
+
+    class Model:
+        def __call__(self, input_ids, attention_mask=None):
+            return input_ids
+
+    kwargs = _text_model_extra_kwargs(
+        Model(),
+        {"attention_mask": mx.array([[1, 1, 1, 0]])},
+        cce=False,
+    )
+
+    assert kwargs["attention_mask"].tolist() == [[1, 1, 1]]
+
+
 def test_train_on_responses_only_forwards_last_response_only(monkeypatch):
     import unsloth_zoo.dataset_utils as dataset_utils
     from unsloth_zoo.mlx.trainer import train_on_responses_only
