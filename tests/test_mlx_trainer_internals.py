@@ -384,6 +384,99 @@ def test_text_model_kwargs_forwards_attention_mask():
     assert kwargs["attention_mask"].tolist() == [[1, 1, 1]]
 
 
+def test_pretokenized_text_batches_preserve_token_type_ids():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+    batches = create_ordered_batches(
+        [
+            {
+                "input_ids": [1, 2, 3],
+                "attention_mask": [1, 1, 1],
+                "token_type_ids": [0, 1, 1],
+            },
+            {
+                "input_ids": [4, 5],
+                "attention_mask": [1, 1],
+                "token_type_ids": [0, 0],
+            },
+        ],
+        Tokenizer(),
+        batch_size=2,
+        max_seq_length=8,
+        dataset_order="sequential",
+    )
+
+    extra = batches[0][3]
+    assert extra["token_type_ids"].tolist() == [[0, 1, 1], [0, 0, 0]]
+
+
+def test_raw_text_batches_request_token_type_ids_when_requested():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    calls = []
+
+    class Tokenizer:
+        pad_token_id = 0
+        bos_token = None
+        chat_template = ""
+
+        def __call__(self, text, **kwargs):
+            calls.append(kwargs)
+            ids_by_text = {
+                "aa": [1, 2],
+                "bbb": [3, 4, 5],
+            }
+            token_types_by_text = {
+                "aa": [7, 8],
+                "bbb": [9, 10, 11],
+            }
+            return {
+                "input_ids": ids_by_text[text],
+                "attention_mask": [1] * len(ids_by_text[text]),
+                "token_type_ids": token_types_by_text[text],
+            }
+
+    batches = create_ordered_batches(
+        [{"text": "aa"}, {"text": "bbb"}],
+        Tokenizer(),
+        batch_size=2,
+        max_seq_length=8,
+        dataset_order="sequential",
+        append_eos=False,
+        return_token_type_ids=True,
+    )
+
+    assert all(call["return_token_type_ids"] is True for call in calls)
+    extra = batches[0][3]
+    assert extra["attention_mask"].tolist() == [[1, 1, 0], [1, 1, 1]]
+    assert extra["token_type_ids"].tolist() == [[7, 8, 0], [9, 10, 11]]
+
+
+def test_text_model_kwargs_forwards_token_type_ids():
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.utils import _text_model_extra_kwargs
+
+    class Model:
+        def __call__(self, input_ids, attention_mask=None, token_type_ids=None):
+            return input_ids
+
+    kwargs = _text_model_extra_kwargs(
+        Model(),
+        {
+            "attention_mask": mx.array([[1, 1, 1, 0]]),
+            "token_type_ids": mx.array([[0, 1, 1, 0]]),
+        },
+        cce=False,
+    )
+
+    assert kwargs["attention_mask"].tolist() == [[1, 1, 1]]
+    assert kwargs["token_type_ids"].tolist() == [[0, 1, 1]]
+
+
 def test_train_on_responses_only_forwards_last_response_only(monkeypatch):
     import unsloth_zoo.dataset_utils as dataset_utils
     from unsloth_zoo.mlx.trainer import train_on_responses_only
