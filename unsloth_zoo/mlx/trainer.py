@@ -142,6 +142,40 @@ def _resolve_response_mask_tokenizer(tokenizer):
     return tokenizer
 
 
+def _needs_cuda_text_token_type_ids(model, processing_class):
+    """Match CUDA's conditional token_type_ids request for text SFT rows."""
+    import sys as _sys
+
+    ccm_name = "create_" + "causal_mask_mapping"
+    for candidate in (model, getattr(model, "model", None)):
+        if candidate is None:
+            continue
+        module = _sys.modules.get(type(candidate).__module__)
+        if module is not None and hasattr(module, ccm_name):
+            return True
+
+    if processing_class is not None:
+        for base in type(processing_class).__mro__:
+            base_module = getattr(base, "__module__", "")
+            if "transformers.models." not in base_module:
+                continue
+            modeling_module = base_module.replace(".processing_", ".modeling_")
+            module = _sys.modules.get(modeling_module)
+            if module is not None and hasattr(module, ccm_name):
+                return True
+    return False
+
+
+def _text_completion_only_loss_arg(args):
+    """Preserve SFT's None default unless legacy args explicitly request it."""
+    value = getattr(args, "completion_only_loss", None)
+    if value is not None:
+        return value
+    if bool(getattr(args, "train_on_completions", False)):
+        return True
+    return None
+
+
 def _normalize_mlx_optimizer_name(name):
     opt_name = str(name or "adamw").strip().lower()
     if opt_name not in SUPPORTED_MLX_OPTIMIZERS:
@@ -472,6 +506,7 @@ class MLXTrainingConfig:
     packing: bool = False
     dataset_num_proc: int = 2
     chat_template: object = None  # Unsloth template name/tuple or raw Jinja string
+    completion_only_loss: bool | None = None
 
     # MLX-specific
     use_cce: bool = True
@@ -1162,6 +1197,7 @@ class MLXTrainer:
         # Pick loss function (returns (loss, ntoks))
         use_cce = args.use_cce
         _vlm_ignore_token_ids = None
+        text_completion_only_loss = _text_completion_only_loss_arg(args)
 
         if is_vlm:
             processor = self._resolve_vlm_processor()
@@ -1584,6 +1620,10 @@ class MLXTrainer:
             if _labeled_eval is not None:
                 eval_batches = _labeled_eval
             else:
+                text_return_token_type_ids = _needs_cuda_text_token_type_ids(
+                    self.model, self.tokenizer,
+                )
+
                 def _create_eval_batches(eval_dataset):
                     """Materialize eval batches for one dataset split."""
                     if is_vlm:
@@ -1617,6 +1657,8 @@ class MLXTrainer:
                             else None
                         ),
                         append_eos=bool(getattr(args, "append_eos", True)),
+                        completion_only_loss=text_completion_only_loss,
+                        return_token_type_ids=text_return_token_type_ids,
                     )
 
                 if isinstance(self.eval_dataset, dict):
@@ -2054,6 +2096,10 @@ class MLXTrainer:
                 return batches, None
         else:
             chat_tmpl = getattr(args, "chat_template", None)
+            text_completion_only_loss = _text_completion_only_loss_arg(args)
+            text_return_token_type_ids = _needs_cuda_text_token_type_ids(
+                self.model, self.tokenizer,
+            )
             if args.streaming:
                 # Streaming has no index space; refuse explicit order requests.
                 if (
@@ -2077,6 +2123,8 @@ class MLXTrainer:
                     model_name=model_name,
                     model_type=model_type,
                     append_eos=bool(getattr(args, "append_eos", True)),
+                    completion_only_loss=text_completion_only_loss,
+                    return_token_type_ids=text_return_token_type_ids,
                 )
             else:
                 batch_kwargs = dict(
@@ -2092,6 +2140,8 @@ class MLXTrainer:
                     model_name=model_name,
                     model_type=model_type,
                     append_eos=bool(getattr(args, "append_eos", True)),
+                    completion_only_loss=text_completion_only_loss,
+                    return_token_type_ids=text_return_token_type_ids,
                 )
                 if (
                     getattr(args, "preserve_dataset_order", False)

@@ -3547,6 +3547,47 @@ def _has_pretokenized_text_rows(dataset):
     return isinstance(first, dict) and "input_ids" in first
 
 
+def _is_pretokenized_text_item(item):
+    """Return whether a row is already tokenized text."""
+    return isinstance(item, dict) and "input_ids" in item
+
+
+def _is_prompt_completion_text_item(item):
+    """Return whether a row is a text prompt/completion example."""
+    return (
+        isinstance(item, dict)
+        and "prompt" in item
+        and "completion" in item
+    )
+
+
+def _prompt_completion_only_loss(completion_only_loss):
+    """Default prompt/completion datasets to SFT's completion-only loss."""
+    return True if completion_only_loss is None else bool(completion_only_loss)
+
+
+def _format_mlx_text_batch(formatting_func, items):
+    """Apply a CUDA/SFTTrainer-style batched formatting_func."""
+    if all(isinstance(item, dict) for item in items):
+        keys = []
+        seen = set()
+        for item in items:
+            for key in item:
+                if key not in seen:
+                    keys.append(key)
+                    seen.add(key)
+        examples = {key: [item.get(key) for item in items] for key in keys}
+    else:
+        examples = items
+
+    result = formatting_func(examples)
+    if not isinstance(result, list):
+        raise ValueError(
+            "Unsloth: The `formatting_func` should return a list of processed strings."
+        )
+    return result
+
+
 def _collect_text_strings(dataset, tokenizer, dataset_text_field="text",
                           formatting_func=None):
     """Render raw or formatting_func text rows before CUDA-style tokenization."""
@@ -3561,6 +3602,33 @@ def _collect_text_strings(dataset, tokenizer, dataset_text_field="text",
             if text:
                 texts.append(text)
     return texts
+
+
+def _has_prompt_completion_text_rows(dataset):
+    """Detect text prompt/completion datasets by their first row."""
+    first = _first_dataset_item(dataset)
+    return (
+        isinstance(first, dict)
+        and "prompt" in first
+        and "completion" in first
+    )
+
+
+def _is_prompt_completion_conversational_example(example):
+    """Mirror TRL's prompt/completion conversational row detection."""
+    if not isinstance(example, dict):
+        return False
+    for key in ("prompt", "completion", "messages"):
+        value = example.get(key)
+        if (
+            isinstance(value, list)
+            and value
+            and isinstance(value[0], dict)
+            and "role" in value[0]
+            and "content" in value[0]
+        ):
+            return True
+    return False
 
 
 def _cuda_text_add_special_tokens(processing_class, tokenizer, test_text, *, is_vlm=False):
@@ -3584,7 +3652,7 @@ def _cuda_text_add_special_tokens(processing_class, tokenizer, test_text, *, is_
 
 
 def _flatten_text_token_ids(value):
-    """Normalize tokenizer outputs to a flat int list."""
+    """Normalize tokenizer/apply_chat_template outputs to a flat int list."""
     if hasattr(value, "tolist"):
         value = value.tolist()
     if isinstance(value, dict):
@@ -3596,6 +3664,23 @@ def _flatten_text_token_ids(value):
     if value and isinstance(value[0], list):
         value = value[0]
     return [int(x) for x in list(value)]
+
+
+def _cuda_tokenize_text_input_ids(tokenizer, text, *, add_special_tokens=True):
+    """Tokenize raw text using CUDA SFT's tokenizer-call contract."""
+    try:
+        tokenized = tokenizer(text, add_special_tokens=add_special_tokens)
+    except TypeError:
+        try:
+            tokenized = tokenizer(text)
+        except TypeError:
+            try:
+                tokenized = tokenizer.encode(
+                    text, add_special_tokens=add_special_tokens,
+                )
+            except TypeError:
+                tokenized = tokenizer.encode(text)
+    return _flatten_text_token_ids(tokenized)
 
 
 def _callable_text_tokenizer(tokenizer):
@@ -3733,7 +3818,7 @@ def _prepare_tokenized_text_rows(
     return rows
 
 
-def _prepare_pretokenized_text_rows(dataset, max_seq_length):
+def _prepare_pretokenized_text_rows(dataset, max_seq_length, return_token_type_ids=False):
     rows = []
     for item in dataset:
         if not isinstance(item, dict) or "input_ids" not in item:
@@ -3767,7 +3852,10 @@ def _prepare_pretokenized_text_rows(dataset, max_seq_length):
                 label if idx < len(attention_mask) and attention_mask[idx] else -100
                 for idx, label in enumerate(labels)
             ]
-        token_type_ids = _to_int_list(item.get("token_type_ids"))
+        token_type_ids = (
+            _to_int_list(item.get("token_type_ids"))
+            if return_token_type_ids else None
+        )
         if token_type_ids is not None:
             token_type_ids = token_type_ids[:len(input_ids)]
         rows.append({
@@ -3782,6 +3870,109 @@ def _prepare_pretokenized_text_rows(dataset, max_seq_length):
         raise ValueError(
             "Unsloth MLX: pre-tokenized dataset produced no trainable token "
             "sequences (need at least two input_ids after truncation)."
+        )
+    return rows
+
+
+def _prepare_prompt_completion_text_rows(
+    dataset,
+    tokenizer,
+    max_seq_length,
+    chat_template=None,
+    model_name=None,
+    model_type=None,
+    completion_only_loss=None,
+    return_token_type_ids=False,
+):
+    """Tokenize prompt/completion rows using CUDA SFT preparation rules."""
+    tokenizer = normalize_mlx_chat_template(
+        tokenizer,
+        chat_template=chat_template,
+        model_name=model_name,
+        model_type=model_type,
+        is_vlm=False,
+        strict=False,
+    )
+    rows = []
+    items = list(dataset)
+    if not items:
+        raise ValueError(
+            "Unsloth MLX: prompt/completion dataset produced no trainable "
+            "token sequences."
+        )
+    if (
+        not isinstance(items[0], dict)
+        or "prompt" not in items[0]
+        or "completion" not in items[0]
+    ):
+        raise ValueError(
+            "Unsloth MLX: prompt/completion text datasets must provide "
+            "`prompt` and `completion` for every row."
+        )
+    is_conversational = _is_prompt_completion_conversational_example(items[0])
+    # CUDA prompt/completion preparation appends tokenizer.eos_token text here;
+    # the MLX append_eos flag only controls the raw-text mlx-lm path.
+    eos_token = getattr(tokenizer, "eos_token", None)
+    test_text = None if is_conversational else items[0]["prompt"]
+    add_special_tokens = _cuda_text_add_special_tokens(
+        tokenizer, tokenizer, test_text, is_vlm=False,
+    )
+
+    for item in items:
+        if not isinstance(item, dict) or "prompt" not in item or "completion" not in item:
+            raise ValueError(
+                "Unsloth MLX: prompt/completion text datasets must provide "
+                "`prompt` and `completion` for every row."
+            )
+        if is_conversational:
+            prompt_ids = tokenizer.apply_chat_template(
+                item["prompt"],
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=False,
+                tools=item.get("tools"),
+                **(item.get("chat_template_kwargs") or {}),
+            )
+            prompt_ids = _flatten_text_token_ids(prompt_ids)
+            pc_processed = tokenizer.apply_chat_template(
+                item["prompt"] + item["completion"],
+                return_dict=True,
+                tokenize=True,
+                tools=item.get("tools"),
+                **(item.get("chat_template_kwargs") or {}),
+            )
+            combined_ids = _flatten_text_token_ids(pc_processed)
+        else:
+            completion = item["completion"]
+            if eos_token and not completion.endswith(eos_token):
+                completion = completion + eos_token
+            prompt_ids = _cuda_tokenize_text_input_ids(
+                tokenizer,
+                item["prompt"],
+                add_special_tokens=add_special_tokens,
+            )
+            combined_ids = _cuda_tokenize_text_input_ids(
+                tokenizer,
+                item["prompt"] + completion,
+                add_special_tokens=add_special_tokens,
+            )
+        input_ids = list(combined_ids)[:max_seq_length]
+        if len(input_ids) < 2:
+            continue
+        labels = None
+        if _prompt_completion_only_loss(completion_only_loss):
+            prompt_len = min(len(prompt_ids), len(input_ids))
+            labels = [-100] * prompt_len + input_ids[prompt_len:]
+        rows.append({
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": [1] * len(input_ids),
+            "token_type_ids": [0] * len(input_ids) if return_token_type_ids else None,
+        })
+    if not rows:
+        raise ValueError(
+            "Unsloth MLX: prompt/completion dataset produced no trainable "
+            "token sequences."
         )
     return rows
 
@@ -3986,6 +4177,7 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
                    num_batches=None, seed=42, dataset_text_field="text",
                    formatting_func=None, chat_template=None,
                    model_name=None, model_type=None, append_eos=True,
+                   completion_only_loss=None,
                    return_token_type_ids=False):
     """Pre-tokenize and batch a HuggingFace dataset for MLX training.
 
@@ -4004,8 +4196,28 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
     """
     from mlx_lm.tuner.trainer import iterate_batches
 
-    if formatting_func is None and _has_pretokenized_text_rows(dataset):
-        rows = _prepare_pretokenized_text_rows(dataset, max_seq_length)
+    if _has_pretokenized_text_rows(dataset):
+        rows = _prepare_pretokenized_text_rows(
+            dataset, max_seq_length,
+            return_token_type_ids=return_token_type_ids,
+        )
+        batch_pairs = _create_pretokenized_text_batches(
+            rows, tokenizer, batch_size, max_seq_length,
+            num_batches=num_batches, seed=seed,
+        )
+        _eval_text_batch_tensors(batch_pairs)
+        return batch_pairs
+    if (
+        _has_prompt_completion_text_rows(dataset)
+    ):
+        rows = _prepare_prompt_completion_text_rows(
+            dataset, tokenizer, max_seq_length,
+            chat_template=chat_template,
+            model_name=model_name,
+            model_type=model_type,
+            completion_only_loss=completion_only_loss,
+            return_token_type_ids=return_token_type_ids,
+        )
         batch_pairs = _create_pretokenized_text_batches(
             rows, tokenizer, batch_size, max_seq_length,
             num_batches=num_batches, seed=seed,
@@ -4077,6 +4289,7 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
                            formatting_func=None, chat_template=None,
                            model_name=None, model_type=None,
                            num_epochs=None, append_eos=True,
+                           completion_only_loss=None,
                            return_token_type_ids=False):
     """Create text batches with an explicit dataset order.
 
@@ -4084,8 +4297,29 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
     changing generic mlx-lm batching behavior.
     """
 
-    if formatting_func is None and _has_pretokenized_text_rows(dataset):
-        rows = _prepare_pretokenized_text_rows(dataset, max_seq_length)
+    if _has_pretokenized_text_rows(dataset):
+        rows = _prepare_pretokenized_text_rows(
+            dataset, max_seq_length,
+            return_token_type_ids=return_token_type_ids,
+        )
+        batch_pairs = _create_ordered_pretokenized_text_batches(
+            rows, tokenizer, batch_size, max_seq_length,
+            num_batches=num_batches, seed=seed,
+            dataset_order=dataset_order, num_epochs=num_epochs,
+        )
+        _eval_text_batch_tensors(batch_pairs)
+        return batch_pairs
+    if (
+        _has_prompt_completion_text_rows(dataset)
+    ):
+        rows = _prepare_prompt_completion_text_rows(
+            dataset, tokenizer, max_seq_length,
+            chat_template=chat_template,
+            model_name=model_name,
+            model_type=model_type,
+            completion_only_loss=completion_only_loss,
+            return_token_type_ids=return_token_type_ids,
+        )
         batch_pairs = _create_ordered_pretokenized_text_batches(
             rows, tokenizer, batch_size, max_seq_length,
             num_batches=num_batches, seed=seed,
@@ -4203,7 +4437,8 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
                              seed=42, dataset_text_field="text",
                              formatting_func=None, chat_template=None,
                              model_name=None, model_type=None,
-                             append_eos=True, return_token_type_ids=False):
+                             append_eos=True, completion_only_loss=None,
+                             return_token_type_ids=False):
     """Streaming batch generator for MLX training.
 
     Wraps mlx-lm's iterate_batches(loop=True) as a generator, avoiding
@@ -4214,8 +4449,29 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
     """
     from mlx_lm.tuner.trainer import iterate_batches
 
-    if formatting_func is None and _has_pretokenized_text_rows(dataset):
-        rows = _prepare_pretokenized_text_rows(dataset, max_seq_length)
+    if _has_pretokenized_text_rows(dataset):
+        rows = _prepare_pretokenized_text_rows(
+            dataset, max_seq_length,
+            return_token_type_ids=return_token_type_ids,
+        )
+        batches = _create_pretokenized_text_batches(
+            rows, tokenizer, batch_size, max_seq_length,
+            num_batches=None, seed=seed,
+        )
+        while True:
+            for batch in batches:
+                yield batch
+    if (
+        _has_prompt_completion_text_rows(dataset)
+    ):
+        rows = _prepare_prompt_completion_text_rows(
+            dataset, tokenizer, max_seq_length,
+            chat_template=chat_template,
+            model_name=model_name,
+            model_type=model_type,
+            completion_only_loss=completion_only_loss,
+            return_token_type_ids=return_token_type_ids,
+        )
         batches = _create_pretokenized_text_batches(
             rows, tokenizer, batch_size, max_seq_length,
             num_batches=None, seed=seed,

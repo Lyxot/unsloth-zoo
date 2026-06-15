@@ -62,6 +62,7 @@ def test_mlx_training_config_is_dataclass_with_all_fields():
         "gradient_checkpointing",
         "dataset_order",
         "preserve_dataset_order",
+        "completion_only_loss",
     ):
         assert must_have in fields, f"missing field: {must_have}"
 
@@ -344,6 +345,28 @@ def test_pretokenized_text_batches_do_not_mask_zero_without_pad_token():
     assert batches[0][2].tolist() == [[0, 2]]
 
 
+def test_pretokenized_text_batches_ignore_formatting_func_like_cuda():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+    def formatting_func(_item):
+        raise AssertionError("CUDA ignores formatting_func for input_ids rows")
+
+    batches = create_ordered_batches(
+        [{"input_ids": [1, 2]}],
+        Tokenizer(),
+        batch_size=1,
+        max_seq_length=8,
+        dataset_order="sequential",
+        formatting_func=formatting_func,
+    )
+
+    assert batches[0][0].tolist() == [[1, 2]]
+    assert batches[0][2].tolist() == [[1, 2]]
+
+
 def test_text_model_kwargs_forwards_attention_mask():
     import mlx.core as mx
 
@@ -362,7 +385,30 @@ def test_text_model_kwargs_forwards_attention_mask():
     assert kwargs["attention_mask"].tolist() == [[1, 1, 1]]
 
 
-def test_pretokenized_text_batches_preserve_token_type_ids():
+def test_pretokenized_text_batches_drop_token_type_ids_by_default_like_cuda():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+    batches = create_ordered_batches(
+        [
+            {
+                "input_ids": [1, 2, 3],
+                "attention_mask": [1, 1, 1],
+                "token_type_ids": [0, 1, 1],
+            },
+        ],
+        Tokenizer(),
+        batch_size=1,
+        max_seq_length=8,
+        dataset_order="sequential",
+    )
+
+    assert "token_type_ids" not in batches[0][3]
+
+
+def test_pretokenized_text_batches_preserve_token_type_ids_when_requested():
     from unsloth_zoo.mlx.utils import create_ordered_batches
 
     class Tokenizer:
@@ -385,6 +431,7 @@ def test_pretokenized_text_batches_preserve_token_type_ids():
         batch_size=2,
         max_seq_length=8,
         dataset_order="sequential",
+        return_token_type_ids=True,
     )
 
     extra = batches[0][3]
@@ -478,6 +525,272 @@ def test_pretokenized_text_batches_convert_completion_mask_to_labels():
     ]
 
 
+def test_prompt_completion_text_batches_mask_prompt_when_requested():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+        eos_token = "<eos>"
+        eos_token_id = 9
+
+        def encode(self, text):
+            return {
+                "A": [1],
+                "AB<eos>": [1, 2, 9],
+                "C": [3],
+                "CD<eos>": [3, 4, 9],
+            }[text]
+
+        def __call__(self, text, add_special_tokens=True):
+            return {"input_ids": self.encode(text)}
+
+    batches = create_ordered_batches(
+        [
+            {"prompt": "A", "completion": "B"},
+            {"prompt": "C", "completion": "D"},
+        ],
+        Tokenizer(),
+        batch_size=2,
+        max_seq_length=8,
+        dataset_order="sequential",
+        completion_only_loss=True,
+        append_eos=False,
+    )
+
+    assert batches[0][0].tolist() == [[1, 2, 9], [3, 4, 9]]
+    assert batches[0][2].tolist() == [[-100, 2, 9], [-100, 4, 9]]
+
+
+def test_prompt_completion_text_batches_default_to_completion_only_loss():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+        eos_token = "<eos>"
+        eos_token_id = 9
+
+        def encode(self, text):
+            return {
+                "A": [1],
+                "AB<eos>": [1, 2, 9],
+                "C": [3],
+                "CD<eos>": [3, 4, 9],
+            }[text]
+
+        def __call__(self, text, add_special_tokens=True):
+            return {"input_ids": self.encode(text)}
+
+    batches = create_ordered_batches(
+        [
+            {"prompt": "A", "completion": "B"},
+            {"prompt": "C", "completion": "D"},
+        ],
+        Tokenizer(),
+        batch_size=2,
+        max_seq_length=8,
+        dataset_order="sequential",
+        append_eos=False,
+    )
+
+    assert batches[0][0].tolist() == [[1, 2, 9], [3, 4, 9]]
+    assert batches[0][2].tolist() == [[-100, 2, 9], [-100, 4, 9]]
+
+
+def test_prompt_completion_text_batches_keep_first_iterable_row():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+        eos_token = "<eos>"
+        eos_token_id = 9
+
+        def __call__(self, text, add_special_tokens=True):
+            return {
+                "input_ids": {
+                    "A": [1],
+                    "AB<eos>": [1, 2, 9],
+                    "C": [3],
+                    "CD<eos>": [3, 4, 9],
+                }[text]
+            }
+
+    dataset = (
+        row
+        for row in [
+            {"prompt": "A", "completion": "B"},
+            {"prompt": "C", "completion": "D"},
+        ]
+    )
+    batches = create_ordered_batches(
+        dataset,
+        Tokenizer(),
+        batch_size=2,
+        max_seq_length=8,
+        dataset_order="sequential",
+        completion_only_loss=True,
+        append_eos=False,
+    )
+
+    assert batches[0][0].tolist() == [[1, 2, 9], [3, 4, 9]]
+    assert batches[0][2].tolist() == [[-100, 2, 9], [-100, 4, 9]]
+
+
+def test_prompt_completion_text_batches_use_cuda_tokenization_without_completion_only_loss():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+        eos_token = "<eos>"
+        eos_token_id = 9
+
+        def encode(self, text):
+            return {
+                "A": [1],
+                "AB": [7],
+                "AB<eos>": [1, 2, 9],
+                "C": [3],
+                "CD": [8],
+                "CD<eos>": [3, 4, 9],
+            }[text]
+
+        def __call__(self, text, add_special_tokens=True):
+            return {"input_ids": self.encode(text)}
+
+    batches = create_ordered_batches(
+        [
+            {"prompt": "A", "completion": "B"},
+            {"prompt": "C", "completion": "D"},
+        ],
+        Tokenizer(),
+        batch_size=2,
+        max_seq_length=8,
+        dataset_order="sequential",
+        completion_only_loss=False,
+        append_eos=False,
+    )
+
+    batch, lengths, labels, extra = batches[0]
+    assert batch.tolist() == [[1, 2, 9], [3, 4, 9]]
+    assert lengths.tolist() == [[0, 3], [0, 3]]
+    assert labels is None
+    assert extra["attention_mask"].tolist() == [[1, 1, 1], [1, 1, 1]]
+
+
+def test_prompt_completion_text_batches_ignore_formatting_func_like_cuda():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+        eos_token = "<eos>"
+
+        def __call__(self, text, add_special_tokens=True):
+            return {"input_ids": {"A": [1], "AB<eos>": [1, 2, 9]}[text]}
+
+    def formatting_func(_item):
+        raise AssertionError("CUDA ignores formatting_func for prompt/completion rows")
+
+    batches = create_ordered_batches(
+        [{"prompt": "A", "completion": "B"}],
+        Tokenizer(),
+        batch_size=1,
+        max_seq_length=8,
+        dataset_order="sequential",
+        completion_only_loss=True,
+        formatting_func=formatting_func,
+    )
+
+    assert batches[0][0].tolist() == [[1, 2, 9]]
+    assert batches[0][2].tolist() == [[-100, 2, 9]]
+
+
+def test_prompt_completion_text_batches_use_cuda_chat_template_contract():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+        chat_template = None
+
+        def __init__(self):
+            self.calls = []
+
+        def apply_chat_template(self, messages, **kwargs):
+            assert self.chat_template == "{{ messages }}"
+            self.calls.append((messages, kwargs))
+            if kwargs.get("add_generation_prompt"):
+                assert kwargs["return_dict"] is False
+                return [10, 11]
+            assert kwargs["return_dict"] is True
+            return {"input_ids": [10, 11, 12, 13]}
+
+    tokenizer = Tokenizer()
+    batches = create_ordered_batches(
+        [
+            {
+                "prompt": [{"role": "user", "content": "Q"}],
+                "completion": [{"role": "assistant", "content": "A"}],
+                "tools": [{"type": "function"}],
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        ],
+        tokenizer,
+        batch_size=1,
+        max_seq_length=8,
+        dataset_order="sequential",
+        completion_only_loss=True,
+        chat_template="{{ messages }}",
+    )
+
+    assert batches[0][0].tolist() == [[10, 11, 12, 13]]
+    assert batches[0][2].tolist() == [[-100, -100, 12, 13]]
+    assert tokenizer.calls == [
+        (
+            [{"role": "user", "content": "Q"}],
+            {
+                "tokenize": True,
+                "add_generation_prompt": True,
+                "return_dict": False,
+                "tools": [{"type": "function"}],
+                "enable_thinking": False,
+            },
+        ),
+        (
+            [
+                {"role": "user", "content": "Q"},
+                {"role": "assistant", "content": "A"},
+            ],
+            {
+                "return_dict": True,
+                "tokenize": True,
+                "tools": [{"type": "function"}],
+                "enable_thinking": False,
+            },
+        ),
+    ]
+
+
+def test_prompt_completion_text_batches_add_cuda_token_type_ids_when_requested():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+        eos_token = "<eos>"
+
+        def __call__(self, text, add_special_tokens=True):
+            return {"input_ids": {"A": [1], "AB<eos>": [1, 2, 9]}[text]}
+
+    batches = create_ordered_batches(
+        [{"prompt": "A", "completion": "B"}],
+        Tokenizer(),
+        batch_size=1,
+        max_seq_length=8,
+        dataset_order="sequential",
+        completion_only_loss=True,
+        return_token_type_ids=True,
+    )
+
+    assert batches[0][3]["token_type_ids"].tolist() == [[0, 0, 0]]
+
+
 def test_raw_text_batches_request_token_type_ids_when_requested():
     from unsloth_zoo.mlx.utils import create_ordered_batches
 
@@ -518,28 +831,6 @@ def test_raw_text_batches_request_token_type_ids_when_requested():
     extra = batches[0][3]
     assert extra["attention_mask"].tolist() == [[1, 1, 0], [1, 1, 1]]
     assert extra["token_type_ids"].tolist() == [[7, 8, 0], [9, 10, 11]]
-
-
-def test_text_model_kwargs_forwards_token_type_ids():
-    import mlx.core as mx
-
-    from unsloth_zoo.mlx.utils import _text_model_extra_kwargs
-
-    class Model:
-        def __call__(self, input_ids, attention_mask=None, token_type_ids=None):
-            return input_ids
-
-    kwargs = _text_model_extra_kwargs(
-        Model(),
-        {
-            "attention_mask": mx.array([[1, 1, 1, 0]]),
-            "token_type_ids": mx.array([[0, 1, 1, 0]]),
-        },
-        cce=False,
-    )
-
-    assert kwargs["attention_mask"].tolist() == [[1, 1, 1]]
-    assert kwargs["token_type_ids"].tolist() == [[0, 1, 1]]
 
 
 def test_train_on_responses_only_forwards_last_response_only(monkeypatch):
@@ -607,6 +898,28 @@ def test_evaluate_dict_eval_datasets_records_split_metrics():
     assert trainer._last_eval_metrics["eval_large_loss"] == pytest.approx(3.0)
     assert trainer._last_eval_metrics["eval_loss"] == pytest.approx(2.5)
     assert trainer.model.modes == ["eval", "train"]
+
+
+def test_text_model_kwargs_forwards_token_type_ids():
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.utils import _text_model_extra_kwargs
+
+    class Model:
+        def __call__(self, input_ids, attention_mask=None, token_type_ids=None):
+            return input_ids
+
+    kwargs = _text_model_extra_kwargs(
+        Model(),
+        {
+            "attention_mask": mx.array([[1, 1, 1, 0]]),
+            "token_type_ids": mx.array([[0, 1, 1, 0]]),
+        },
+        cce=False,
+    )
+
+    assert kwargs["attention_mask"].tolist() == [[1, 1, 1]]
+    assert kwargs["token_type_ids"].tolist() == [[0, 1, 1]]
 
 
 def test_vlm_cce_prefers_collated_position_ids_for_cuda_parity():
