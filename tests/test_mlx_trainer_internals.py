@@ -360,10 +360,28 @@ def test_pretokenized_text_batches_preserve_attention_mask():
     )
 
     batch, lengths, labels, extra = batches[0]
-    assert labels is None
     assert batch.tolist() == [[1, 2, 3], [4, 5, 0]]
     assert lengths.tolist() == [[0, 3], [0, 2]]
+    assert labels.tolist() == [[1, 2, 3], [4, 5, -100]]
     assert extra["attention_mask"].tolist() == [[1, 1, 1], [1, 1, 0]]
+    assert extra["mask_loss_with_attention"] is False
+
+
+def test_pretokenized_text_batches_do_not_mask_zero_without_pad_token():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = None
+
+    batches = create_ordered_batches(
+        [{"input_ids": [0, 2]}],
+        Tokenizer(),
+        batch_size=1,
+        max_seq_length=8,
+        dataset_order="sequential",
+    )
+
+    assert batches[0][2].tolist() == [[0, 2]]
 
 
 def test_text_model_kwargs_forwards_attention_mask():
@@ -411,6 +429,93 @@ def test_pretokenized_text_batches_preserve_token_type_ids():
 
     extra = batches[0][3]
     assert extra["token_type_ids"].tolist() == [[0, 1, 1], [0, 0, 0]]
+
+
+def test_pretokenized_text_batches_preserve_labels():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+    batches = create_ordered_batches(
+        [
+            {"input_ids": [1, 2, 3], "labels": [-100, 2, 3]},
+            {"input_ids": [4, 5], "labels": [-100, 5]},
+        ],
+        Tokenizer(),
+        batch_size=2,
+        max_seq_length=8,
+        dataset_order="sequential",
+    )
+
+    assert batches[0][2].tolist() == [[-100, 2, 3], [-100, 5, -100]]
+
+
+def test_pretokenized_text_batches_preserve_explicit_labels_under_attention_mask():
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.utils import create_ordered_batches, _text_target_mask
+
+    class Tokenizer:
+        pad_token_id = 0
+
+    batches = create_ordered_batches(
+        [
+            {
+                "input_ids": [1, 2, 0],
+                "attention_mask": [1, 1, 0],
+                "labels": [1, 2, 0],
+            },
+            {
+                "input_ids": [3, 4],
+                "attention_mask": [1, 1],
+                "labels": [3, 4],
+            },
+        ],
+        Tokenizer(),
+        batch_size=2,
+        max_seq_length=8,
+        dataset_order="sequential",
+    )
+
+    batch, lengths, labels, extra = batches[0]
+    assert batch.tolist() == [[1, 2, 0], [3, 4, 0]]
+    assert lengths.tolist() == [[0, 3], [0, 2]]
+    assert labels.tolist() == [[1, 2, 0], [3, 4, -100]]
+    assert extra["attention_mask"].tolist() == [[1, 1, 0], [1, 1, 0]]
+    assert extra["mask_loss_with_attention"] is False
+    assert _text_target_mask(extra, mx.array([[2, 0], [4, -100]])) is None
+
+
+def test_pretokenized_text_batches_convert_completion_mask_to_labels():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+    batches = create_ordered_batches(
+        [
+            {
+                "input_ids": [1, 2, 3, 0],
+                "attention_mask": [1, 1, 1, 0],
+                "completion_mask": [0, 1, 1, 1],
+            },
+            {
+                "input_ids": [4, 5, 0],
+                "attention_mask": [1, 1, 0],
+                "completion_mask": [0, 1, 1],
+            },
+        ],
+        Tokenizer(),
+        batch_size=2,
+        max_seq_length=8,
+        dataset_order="sequential",
+    )
+
+    assert batches[0][2].tolist() == [
+        [-100, 2, 3, -100],
+        [-100, 5, -100, -100],
+    ]
 
 
 def test_raw_text_batches_request_token_type_ids_when_requested():

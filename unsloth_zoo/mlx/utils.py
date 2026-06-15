@@ -111,6 +111,8 @@ def _text_model_extra_kwargs(model, extra, *, cce=False):
 def _text_target_mask(extra, targets):
     """Return the shifted attention loss mask when this batch should use it."""
     extra = _text_batch_extra(extra)
+    if extra.get("mask_loss_with_attention", True) is False:
+        return None
     attention_mask = extra.get("attention_mask")
     if attention_mask is None:
         return None
@@ -3856,14 +3858,36 @@ def _prepare_pretokenized_text_rows(dataset, max_seq_length):
         attention_mask = _to_int_list(item.get("attention_mask"))
         if attention_mask is not None:
             attention_mask = attention_mask[:len(input_ids)]
+        labels = _to_int_list(item.get("labels"))
+        has_explicit_labels = labels is not None
+        labels_from_input_ids = False
+        mask_loss_with_attention = False
+        if labels is not None:
+            labels = labels[:len(input_ids)]
+        elif "completion_mask" in item:
+            completion_mask = _to_int_list(item.get("completion_mask"))[:len(input_ids)]
+            labels = [
+                token if idx < len(completion_mask) and completion_mask[idx] else -100
+                for idx, token in enumerate(input_ids)
+            ]
+            mask_loss_with_attention = True
+        else:
+            labels_from_input_ids = True
+        if labels is not None and attention_mask is not None and not has_explicit_labels:
+            labels = [
+                label if idx < len(attention_mask) and attention_mask[idx] else -100
+                for idx, label in enumerate(labels)
+            ]
         token_type_ids = _to_int_list(item.get("token_type_ids"))
         if token_type_ids is not None:
             token_type_ids = token_type_ids[:len(input_ids)]
         rows.append({
             "input_ids": input_ids,
-            "labels": None,
+            "labels": labels,
             "attention_mask": attention_mask,
             "token_type_ids": token_type_ids,
+            "labels_from_input_ids": labels_from_input_ids,
+            "mask_loss_with_attention": mask_loss_with_attention,
         })
     if not rows:
         raise ValueError(
@@ -3873,7 +3897,13 @@ def _prepare_pretokenized_text_rows(dataset, max_seq_length):
     return rows
 
 
-def _make_text_batch_tuple(batch_rows, max_seq_length, pad_id=0, pad_to_multiple=True):
+def _make_text_batch_tuple(
+    batch_rows,
+    max_seq_length,
+    pad_id=0,
+    pad_to_multiple=True,
+    label_pad_id=0,
+):
     max_len = min(max(len(row["input_ids"]) for row in batch_rows), max_seq_length)
     if pad_to_multiple:
         max_len = 1 + _PAD_MULTIPLE * ((max_len + _PAD_MULTIPLE - 1) // _PAD_MULTIPLE)
@@ -3882,11 +3912,17 @@ def _make_text_batch_tuple(batch_rows, max_seq_length, pad_id=0, pad_to_multiple
     batch_ids = []
     lengths = []
     labels = []
-    has_labels = any(row.get("labels") is not None for row in batch_rows)
+    has_labels = (
+        any(row.get("labels") is not None for row in batch_rows)
+        or any(row.get("labels_from_input_ids") for row in batch_rows)
+    )
     attention_masks = []
     has_attention_mask = any(row.get("attention_mask") is not None for row in batch_rows)
     token_type_ids = []
     has_token_type_ids = any(row.get("token_type_ids") is not None for row in batch_rows)
+    mask_loss_with_attention = all(
+        row.get("mask_loss_with_attention", True) for row in batch_rows
+    )
 
     for row in batch_rows:
         ids = row["input_ids"][:max_len]
@@ -3898,7 +3934,13 @@ def _make_text_batch_tuple(batch_rows, max_seq_length, pad_id=0, pad_to_multiple
         if has_labels:
             row_labels = row.get("labels")
             if row_labels is None:
-                row_labels = ids
+                if label_pad_id is None:
+                    row_labels = [int(token) for token in ids]
+                else:
+                    row_labels = [
+                        -100 if int(token) == int(label_pad_id) else int(token)
+                        for token in ids
+                    ]
             row_labels = row_labels[:length]
             labels.append(row_labels + [-100] * pad_len)
 
@@ -3926,6 +3968,8 @@ def _make_text_batch_tuple(batch_rows, max_seq_length, pad_id=0, pad_to_multiple
         extra["attention_mask"] = mx.array(attention_masks)
     if has_token_type_ids:
         extra["token_type_ids"] = mx.array(token_type_ids)
+    if not mask_loss_with_attention:
+        extra["mask_loss_with_attention"] = False
     if extra:
         result.append(extra)
     return tuple(result)
@@ -3945,6 +3989,7 @@ def _create_pretokenized_text_batches(rows, tokenizer, batch_size, max_seq_lengt
         for i in range(0, len(ordered) - batch_size + 1, batch_size)
     ]
     pad_id = getattr(tokenizer, "pad_token_id", None)
+    label_pad_id = pad_id
     if pad_id is None:
         pad_id = 0
     rng = np.random.default_rng(_normalize_seed(seed))
@@ -3955,6 +4000,9 @@ def _create_pretokenized_text_batches(rows, tokenizer, batch_size, max_seq_lengt
                 batch_rows[batch_idx],
                 max_seq_length,
                 pad_id=int(pad_id),
+                label_pad_id=(
+                    int(label_pad_id) if label_pad_id is not None else None
+                ),
                 pad_to_multiple=pad_to_multiple,
             ))
             if num_batches is not None and len(batches) >= num_batches:
@@ -3979,6 +4027,7 @@ def _create_ordered_pretokenized_text_batches(
             "trainable token sequences."
         )
     pad_id = getattr(tokenizer, "pad_token_id", None)
+    label_pad_id = pad_id
     if pad_id is None:
         pad_id = 0
 
@@ -4019,6 +4068,9 @@ def _create_ordered_pretokenized_text_batches(
             [rows[i] for i in chunk],
             max_seq_length,
             pad_id=int(pad_id),
+            label_pad_id=(
+                int(label_pad_id) if label_pad_id is not None else None
+            ),
             pad_to_multiple=False,
         ))
         if num_batches is None and target_items is not None and seen >= target_items:
