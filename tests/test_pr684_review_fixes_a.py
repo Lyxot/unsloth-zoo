@@ -57,6 +57,9 @@ class _SpaceTokenizer:
     def encode(self, text):
         return [int(part) for part in str(text).split()]
 
+    def __call__(self, text, **_kwargs):
+        return {"input_ids": self.encode(text)}
+
     def convert_tokens_to_ids(self, token):
         if isinstance(token, list):
             return [self.convert_tokens_to_ids(t) for t in token]
@@ -556,11 +559,7 @@ def test_thread5_noncallable_proxy_wrapper_unwraps_for_masking(monkeypatch):
     import unsloth_zoo.dataset_utils as dataset_utils
     import unsloth_zoo.mlx.trainer as trainer_mod
 
-    class _CallableTokenizer(_SpaceTokenizer):
-        def __call__(self, text, **kwargs):
-            return {"input_ids": self.encode(text)}
-
-    inner = _CallableTokenizer()
+    inner = _SpaceTokenizer()
 
     class _ProxyWrapper:
         """mlx-lm TokenizerWrapper shape: proxies attributes, not callable."""

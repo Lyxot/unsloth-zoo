@@ -40,9 +40,9 @@ from dataclasses import asdict, dataclass, is_dataclass
 import concurrent.futures
 import math
 import os
-import random
 import time
 
+import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
@@ -66,7 +66,10 @@ from .utils import (
     normalize_vlm_processor_chat_template,
     encode_mlx_text,
     _get_vlm_ignore_token_ids,
-    collect_mlx_texts,
+    _collect_text_strings,
+    _cuda_text_add_special_tokens,
+    _cuda_tokenize_text_with_metadata,
+    _to_int_list,
     save_lora_adapters,
     save_trainable_adapters,
     save_optimizer_state,
@@ -127,13 +130,7 @@ def _resolve_response_mask_tokenizer(tokenizer):
 
         break
 
-    if not (
-        callable(tokenizer)
-        or (
-            hasattr(tokenizer, "encode")
-            and hasattr(tokenizer, "convert_tokens_to_ids")
-        )
-    ):
+    if not callable(tokenizer):
         raise TypeError(
             "Unsloth MLX: train_on_responses_only requires a callable "
             "Hugging Face tokenizer or a processor/tokenizer wrapper that "
@@ -1639,14 +1636,16 @@ class MLXTrainer:
                             seed=args.seed,
                             response_mask_fn=_vlm_mask_fn,
                             formatting_func=self.formatting_func,
+                            dataset_order="sequential",
                             completion_only_loss=text_completion_only_loss,
                         )
-                    return create_batches(
+                    return create_ordered_batches(
                         dataset=eval_dataset,
                         tokenizer=self.tokenizer,
                         batch_size=args.per_device_train_batch_size,
                         max_seq_length=args.max_seq_length,
                         seed=args.seed,
+                        dataset_order="sequential",
                         dataset_text_field=args.dataset_text_field,
                         formatting_func=self.formatting_func,
                         chat_template=getattr(args, "chat_template", None),
@@ -1658,6 +1657,7 @@ class MLXTrainer:
                         ),
                         append_eos=bool(getattr(args, "append_eos", True)),
                         completion_only_loss=text_completion_only_loss,
+                        dataset_num_proc=getattr(args, "dataset_num_proc", None),
                         return_token_type_ids=text_return_token_type_ids,
                     )
 
@@ -2124,6 +2124,7 @@ class MLXTrainer:
                     model_type=model_type,
                     append_eos=bool(getattr(args, "append_eos", True)),
                     completion_only_loss=text_completion_only_loss,
+                    dataset_num_proc=getattr(args, "dataset_num_proc", None),
                     return_token_type_ids=text_return_token_type_ids,
                 )
             else:
@@ -2141,6 +2142,7 @@ class MLXTrainer:
                     model_type=model_type,
                     append_eos=bool(getattr(args, "append_eos", True)),
                     completion_only_loss=text_completion_only_loss,
+                    dataset_num_proc=getattr(args, "dataset_num_proc", None),
                     return_token_type_ids=text_return_token_type_ids,
                 )
                 if (
@@ -2305,22 +2307,27 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                             model_name=None, model_type=None,
                             append_eos=True, dataset_order="default",
                             preserve_dataset_order=False,
-                            num_epochs=None):
+                            num_epochs=None, dataset_num_proc=None,
+                            return_token_type_ids=False):
     """Create padded batches with label masks for train_on_responses_only.
 
     Tokenizes each dataset item, applies the masking closure to get labels,
-    sorts by length, and produces right-padded 3-tuple batches.
+    orders rows with the same sampler semantics as unlabeled text batches, and
+    produces right-padded text loss batches.
 
     Returns:
-        List of (batch, lengths, labels) tuples where:
-        - batch: mx.array (BS, padded_len) — input_ids padded with 0
+        List of (batch, lengths, labels[, extra]) tuples where:
+        - batch: mx.array (BS, padded_len) — input_ids padded with pad_token_id
         - lengths: mx.array of shape (BS, 2) holding [1, actual_len]
-          per sequence. Right-half-open `[start, end)` matching the
-          exclusive-end loss masks in `utils.py:360`, `:393`, `:429`,
-          `:439`.
+          per sequence. Right-half-open `[start, end)` matching the text
+          loss helpers' exclusive-end masks.
         - labels: mx.array (BS, padded_len) — labels padded with -100
     """
-    eos_id = tokenizer.eos_token_id
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = 0
+    pad_id = int(pad_id)
     tokenizer = normalize_mlx_chat_template(
         tokenizer,
         chat_template=chat_template,
@@ -2330,40 +2337,81 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         strict=False,
     )
 
-    # 1. Gather all text strings (serial, fast)
-    all_texts = []
-    for item in dataset:
-        if formatting_func is not None:
-            result = formatting_func(item)
-            texts = collect_mlx_texts(
-                tokenizer, result, dataset_text_field=dataset_text_field,
-                is_vlm=False,
-            )
-        else:
-            texts = collect_mlx_texts(
-                tokenizer, item, dataset_text_field=dataset_text_field,
-                is_vlm=False,
-            )
+    dataset_items = list(dataset)
+    first_item = dataset_items[0] if dataset_items else None
+    is_pretokenized = isinstance(first_item, dict) and "input_ids" in first_item
 
-        for text in texts:
-            if text:
-                all_texts.append(text)
+    raw_text_add_special_tokens = None
 
-    # 2. Tokenize + mask in parallel (HF fast tokenizers are thread-safe).
     def _process_text(text):
-        encoded = encode_mlx_text(tokenizer, text)
-        # Mirror `_prepare_dataset`'s EOS contract; mismatch desyncs labeled vs unlabeled.
-        if append_eos and eos_id is not None and (not encoded or encoded[-1] != eos_id):
-            encoded.append(eos_id)
-        if len(encoded) > max_seq_length:
-            encoded = encoded[:max_seq_length]
+        extra = None
+        if return_token_type_ids:
+            tokenized = _cuda_tokenize_text_with_metadata(
+                tokenizer,
+                text,
+                max_seq_length,
+                add_special_tokens=raw_text_add_special_tokens,
+                append_eos=append_eos,
+                return_token_type_ids=return_token_type_ids,
+            )
+            encoded = tokenized["input_ids"]
+            extra = {
+                "attention_mask": tokenized.get("attention_mask"),
+                "token_type_ids": tokenized.get("token_type_ids"),
+            }
+        else:
+            encoded = encode_mlx_text(tokenizer, text)
+            # Mirror `_prepare_dataset`'s EOS contract; mismatch desyncs labeled vs unlabeled.
+            if append_eos and eos_id is not None and (not encoded or encoded[-1] != eos_id):
+                encoded.append(eos_id)
+            if len(encoded) > max_seq_length:
+                encoded = encoded[:max_seq_length]
         if len(encoded) < 2:
             return None
         result = mask_fn({"input_ids": [encoded]})
         labels = result["labels"]
         if hasattr(labels, "tolist"):
             labels = labels.tolist()
-        return (encoded, labels[0])
+        if extra is not None:
+            extra = {key: value for key, value in extra.items() if value is not None}
+        return (encoded, labels[0], extra or None)
+
+    def _process_pretokenized_item(item):
+        """Apply CUDA response masking directly to an input_ids dataset row."""
+        if not isinstance(item, dict) or "input_ids" not in item:
+            raise ValueError(
+                "Unsloth MLX: pre-tokenized response-mask datasets must "
+                "provide `input_ids` for every row."
+            )
+        encoded = _to_int_list(item["input_ids"])
+        labels = item.get("labels")
+        if labels is not None:
+            labels = _to_int_list(labels)
+            if len(labels) != len(encoded):
+                raise AssertionError("input_ids and labels must be the same length")
+        encoded = encoded[:max_seq_length]
+        if len(encoded) < 2:
+            return None
+        batch = {"input_ids": [encoded]}
+        if labels is not None:
+            batch["labels"] = np.array([labels[:len(encoded)]], dtype=np.int64)
+        result = mask_fn(batch)
+        result_labels = result["labels"]
+        if hasattr(result_labels, "tolist"):
+            result_labels = result_labels.tolist()
+        extra = {}
+        attention_mask = _to_int_list(item.get("attention_mask"))
+        if attention_mask is not None:
+            extra["attention_mask"] = attention_mask[:len(encoded)]
+            # CUDA's loss is label-driven; attention_mask is only a model kwarg.
+            extra["mask_loss_with_attention"] = False
+        token_type_ids = (
+            _to_int_list(item.get("token_type_ids"))
+            if return_token_type_ids else None
+        )
+        if token_type_ids is not None:
+            extra["token_type_ids"] = token_type_ids[:len(encoded)]
+        return (encoded, result_labels[0], extra or None)
 
     # Filter out samples where all labels are -100 (no valid training signal).
     # This can happen when truncation cuts off the response_part entirely,
@@ -2373,18 +2421,50 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         """Return whether a response-masked row still has trainable labels."""
         return any(label != -100 for label in labels)
 
-    max_workers = min(4, os.cpu_count() or 1)
+    try:
+        max_workers = int(dataset_num_proc)
+    except (TypeError, ValueError):
+        max_workers = 4
+    max_workers = min(max(1, max_workers), os.cpu_count() or 1)
     all_items = []
     n_before_filter = 0
     n_removed = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for result in executor.map(_process_text, all_texts):
-            if result is not None:
-                n_before_filter += 1
-                if _has_valid_labels(result[1]):
-                    all_items.append(result)
-                else:
-                    n_removed += 1
+
+    def _append_processed_result(result):
+        """Keep only processed rows that still have supervised labels."""
+        nonlocal n_before_filter, n_removed
+        if result is None:
+            return
+        n_before_filter += 1
+        if _has_valid_labels(result[1]):
+            all_items.append(result)
+        else:
+            n_removed += 1
+
+    if is_pretokenized:
+        for result in map(_process_pretokenized_item, dataset_items):
+            _append_processed_result(result)
+    else:
+        # 1. Gather all text strings using the same raw formatting path as
+        # unlabeled text batching.
+        all_texts = _collect_text_strings(
+            dataset_items,
+            tokenizer,
+            dataset_text_field=dataset_text_field,
+            formatting_func=formatting_func,
+            dataset_num_proc=dataset_num_proc,
+        )
+        if return_token_type_ids and all_texts:
+            raw_text_add_special_tokens = _cuda_text_add_special_tokens(
+                tokenizer, tokenizer, all_texts[0], is_vlm=False,
+            )
+
+        # 2. Tokenize + mask in parallel (HF fast tokenizers are thread-safe).
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers,
+        ) as executor:
+            for result in executor.map(_process_text, all_texts):
+                _append_processed_result(result)
 
     if n_removed > 0:
         print(
@@ -2400,11 +2480,8 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             "Check your dataset and formatting_func."
         )
 
-    # 2. Sample order; must agree with unlabeled `create_ordered_batches`
-    # (utils.py:2845-2849) so `train_on_responses_only` sees the same stream.
-    _order_requested = preserve_dataset_order or (
-        dataset_order not in (None, "default")
-    )
+    # 2. Sample order; must agree with unlabeled `create_batches` unless an
+    # explicit sequential order is requested.
     if dataset_order not in (None, "default", "sequential", "torch_randperm"):
         raise ValueError(
             f"Unsloth MLX: unsupported dataset_order={dataset_order!r}. "
@@ -2415,7 +2492,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
     def _order_samples_for_epoch(items, epoch_idx):
         if preserve_dataset_order or dataset_order == "sequential":
             return list(items)
-        if dataset_order == "torch_randperm":
+        if dataset_order in (None, "default", "torch_randperm"):
             from .utils import _torch_randperm_order, _normalize_seed
             # Reseed per epoch (matches `create_ordered_batches`). Normalize a
             # None seed first so seed=None does not raise on the int add.
@@ -2423,14 +2500,11 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                 len(items), _normalize_seed(seed) + epoch_idx
             )
             return [items[i] for i in order]
-        # legacy default: length-sort once
-        return sorted(items, key=lambda x: len(x[0]))
 
     # 3. Build `num_epochs` blocks so `batches[i % len]` cycle reseeds correctly.
     _n_epochs_materialize = (
         max(1, int(num_epochs)) if num_epochs is not None else 1
     )
-    rng = random.Random(seed)
     batches = []
     for epoch_idx in range(_n_epochs_materialize):
         epoch_items = _order_samples_for_epoch(all_items, epoch_idx)
@@ -2439,7 +2513,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             batch_items = epoch_items[start:start + batch_size]
             if not batch_items:
                 continue
-            max_len = max(len(ids) for ids, _ in batch_items)
+            max_len = max(len(ids) for ids, _, _ in batch_items)
             # +1 for autoregressive shift (mlx-lm iterate_batches parity).
             padded_len = 1 + ((max_len + _PAD_MULTIPLE - 1) // _PAD_MULTIPLE) * _PAD_MULTIPLE
             padded_len = min(padded_len, max_seq_length)
@@ -2447,23 +2521,61 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             batch_ids = []
             batch_labels = []
             batch_lengths = []
-            for ids, lbls in batch_items:
+            batch_attention_masks = []
+            batch_token_type_ids = []
+            has_attention_mask = any(
+                extra is not None and extra.get("attention_mask") is not None
+                for _, _, extra in batch_items
+            )
+            has_token_type_ids = any(
+                extra is not None and extra.get("token_type_ids") is not None
+                for _, _, extra in batch_items
+            )
+            mask_loss_with_attention = all(
+                extra is None or extra.get("mask_loss_with_attention", True)
+                for _, _, extra in batch_items
+            )
+            for ids, lbls, extra in batch_items:
                 L = min(len(ids), padded_len)
                 pad_len = padded_len - L
-                batch_ids.append(ids[:L] + [0] * pad_len)
+                batch_ids.append(ids[:L] + [pad_id] * pad_len)
                 batch_labels.append(lbls[:L] + [-100] * pad_len)
-                # [start, end) matches loss masks in utils.py:360/:393/:429/:439.
+                # [start, end) matches the text loss helpers' half-open masks.
                 batch_lengths.append([1, L])
 
-            epoch_batches.append((
+                if has_attention_mask:
+                    row_mask = (
+                        extra.get("attention_mask")
+                        if extra is not None else None
+                    )
+                    if row_mask is None:
+                        row_mask = [1] * L
+                    batch_attention_masks.append(row_mask[:L] + [0] * pad_len)
+                if has_token_type_ids:
+                    row_token_types = (
+                        extra.get("token_type_ids")
+                        if extra is not None else None
+                    )
+                    if row_token_types is None:
+                        row_token_types = [0] * L
+                    batch_token_type_ids.append(row_token_types[:L] + [0] * pad_len)
+
+            batch_tuple = [
                 mx.array(batch_ids),
                 mx.array(batch_lengths),
                 mx.array(batch_labels),
-            ))
+            ]
+            batch_extra = {}
+            if has_attention_mask:
+                batch_extra["attention_mask"] = mx.array(batch_attention_masks)
+            if has_token_type_ids:
+                batch_extra["token_type_ids"] = mx.array(batch_token_type_ids)
+            if not mask_loss_with_attention:
+                batch_extra["mask_loss_with_attention"] = False
+            if batch_extra:
+                batch_tuple.append(batch_extra)
+            epoch_batches.append(tuple(batch_tuple))
 
-        # 4. Legacy length-sort: shuffle batches so adjacent steps differ.
-        if not _order_requested:
-            rng.shuffle(epoch_batches)
         batches.extend(epoch_batches)
 
     # Limit if needed
@@ -2472,8 +2584,13 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
 
     # Evaluate all tensors
     all_tensors = []
-    for batch_arr, lengths_arr, labels_arr in batches:
+    for batch_arr, lengths_arr, labels_arr, *rest in batches:
         all_tensors.extend([batch_arr, lengths_arr, labels_arr])
+        if rest and isinstance(rest[0], dict):
+            all_tensors.extend(
+                value for value in rest[0].values()
+                if isinstance(value, mx.array)
+            )
     mx.eval(all_tensors)
 
     return batches
@@ -2485,7 +2602,8 @@ def _check_all_masked(batches, max_check=100):
     seen_bad = 0
     seen_good = 0
     checked = 0
-    for batch_ids, batch_lengths, batch_labels in batches:
+    for batch in batches:
+        batch_labels = batch[2]
         labels_list = batch_labels.tolist()
         for row in labels_list:
             unique = set(row)
@@ -2637,6 +2755,9 @@ def train_on_responses_only(
     else:
         # Text path: tokenize, mask, and create batches now
         args = trainer.args
+        effective_num_proc = num_proc
+        if effective_num_proc is None:
+            effective_num_proc = getattr(args, "dataset_num_proc", None)
         total_batches_needed = (
             args.max_steps * args.gradient_accumulation_steps
             if args.max_steps > 0 else None
@@ -2670,6 +2791,10 @@ def train_on_responses_only(
             dataset_order=getattr(args, "dataset_order", "default"),
             preserve_dataset_order=bool(getattr(args, "preserve_dataset_order", False)),
             num_epochs=labeled_num_epochs,
+            dataset_num_proc=effective_num_proc,
+            return_token_type_ids=_needs_cuda_text_token_type_ids(
+                trainer.model, _tokenizer,
+            ),
         )
 
         # Safety check: detect all-masked labels early
@@ -2700,8 +2825,12 @@ def train_on_responses_only(
                         else None
                     ),
                     append_eos=bool(getattr(args, "append_eos", True)),
-                    dataset_order=getattr(args, "dataset_order", "default"),
-                    preserve_dataset_order=bool(getattr(args, "preserve_dataset_order", False)),
+                    dataset_order="sequential",
+                    preserve_dataset_order=True,
+                    dataset_num_proc=effective_num_proc,
+                    return_token_type_ids=_needs_cuda_text_token_type_ids(
+                        trainer.model, _tokenizer,
+                    ),
                 )
 
             if isinstance(trainer.eval_dataset, dict):
