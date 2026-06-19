@@ -28,6 +28,7 @@ import mlx.utils
 import copy
 import inspect
 import importlib
+import itertools
 import json
 import numpy as np
 import os
@@ -3643,19 +3644,22 @@ def _to_int_list(value):
     return [int(x) for x in list(value)]
 
 
-def _first_dataset_item(dataset):
-    if hasattr(dataset, "__len__") and len(dataset) > 0:
-        return dataset[0]
+def _peek_dataset_item(dataset):
+    """Peek one row without dropping it from one-shot iterable datasets."""
+    if hasattr(dataset, "__len__"):
+        first = dataset[0] if len(dataset) > 0 else None
+        return first, dataset
     iterator = iter(dataset)
     try:
-        return next(iterator)
+        first = next(iterator)
     except StopIteration:
-        return None
+        return None, []
+    return first, itertools.chain([first], iterator)
 
 
-def _has_pretokenized_text_rows(dataset):
-    first = _first_dataset_item(dataset)
-    return isinstance(first, dict) and "input_ids" in first
+def _is_pretokenized_text_item(item):
+    """Return whether a row is already tokenized text."""
+    return isinstance(item, dict) and "input_ids" in item
 
 
 def _collect_text_strings(dataset, tokenizer, dataset_text_field="text",
@@ -4115,7 +4119,8 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
     """
     from mlx_lm.tuner.trainer import iterate_batches
 
-    if formatting_func is None and _has_pretokenized_text_rows(dataset):
+    first_item, dataset = _peek_dataset_item(dataset)
+    if formatting_func is None and _is_pretokenized_text_item(first_item):
         rows = _prepare_pretokenized_text_rows(dataset, max_seq_length)
         batch_pairs = _create_pretokenized_text_batches(
             rows, tokenizer, batch_size, max_seq_length,
@@ -4195,7 +4200,8 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
     changing generic mlx-lm batching behavior.
     """
 
-    if formatting_func is None and _has_pretokenized_text_rows(dataset):
+    first_item, dataset = _peek_dataset_item(dataset)
+    if formatting_func is None and _is_pretokenized_text_item(first_item):
         rows = _prepare_pretokenized_text_rows(dataset, max_seq_length)
         batch_pairs = _create_ordered_pretokenized_text_batches(
             rows, tokenizer, batch_size, max_seq_length,
@@ -4325,7 +4331,8 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
     """
     from mlx_lm.tuner.trainer import iterate_batches
 
-    if formatting_func is None and _has_pretokenized_text_rows(dataset):
+    first_item, dataset = _peek_dataset_item(dataset)
+    if formatting_func is None and _is_pretokenized_text_item(first_item):
         rows = _prepare_pretokenized_text_rows(dataset, max_seq_length)
         batches = _create_pretokenized_text_batches(
             rows, tokenizer, batch_size, max_seq_length,

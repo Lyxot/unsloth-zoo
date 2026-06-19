@@ -367,6 +367,25 @@ def test_pretokenized_text_batches_preserve_attention_mask():
     assert extra["mask_loss_with_attention"] is False
 
 
+def test_pretokenized_text_batches_keep_first_iterable_row():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+    dataset = ({"input_ids": ids} for ids in ([1, 2], [3, 4]))
+    batches = create_ordered_batches(
+        dataset,
+        Tokenizer(),
+        batch_size=2,
+        max_seq_length=8,
+        dataset_order="sequential",
+    )
+
+    assert batches[0][0].tolist() == [[1, 2], [3, 4]]
+    assert batches[0][2].tolist() == [[1, 2], [3, 4]]
+
+
 def test_pretokenized_text_batches_do_not_mask_zero_without_pad_token():
     from unsloth_zoo.mlx.utils import create_ordered_batches
 
