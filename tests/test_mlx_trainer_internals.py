@@ -519,7 +519,7 @@ def test_pretokenized_text_batches_preserve_explicit_labels_under_attention_mask
     assert _text_target_mask(extra, mx.array([[2, 0], [4, -100]])) is None
 
 
-def test_pretokenized_text_batches_convert_completion_mask_to_labels():
+def test_pretokenized_text_batches_ignore_completion_mask():
     from unsloth_zoo.mlx.utils import create_ordered_batches
 
     class Tokenizer:
@@ -545,8 +545,8 @@ def test_pretokenized_text_batches_convert_completion_mask_to_labels():
     )
 
     assert batches[0][2].tolist() == [
-        [-100, 2, 3, -100],
-        [-100, 5, -100, -100],
+        [1, 2, 3, -100],
+        [4, 5, -100, -100],
     ]
 
 

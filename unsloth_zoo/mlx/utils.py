@@ -3692,6 +3692,19 @@ def _is_pretokenized_text_item(item):
     return isinstance(item, dict) and "input_ids" in item
 
 
+def _aligned_text_field(item, key, length):
+    """Read a sequence field that must align with truncated input_ids."""
+    value = _to_int_list(item.get(key))
+    if value is None:
+        return None
+    if len(value) < length:
+        raise ValueError(
+            f"Unsloth MLX: pre-tokenized text field `{key}` must have at "
+            "least the same length as `input_ids` after truncation."
+        )
+    return value[:length]
+
+
 def _collect_text_strings(dataset, tokenizer, dataset_text_field="text",
                           formatting_func=None):
     """Render raw or formatting_func text rows before CUDA-style tokenization."""
@@ -3875,7 +3888,11 @@ def _prepare_tokenized_text_rows(
     return rows
 
 
-def _prepare_pretokenized_text_rows(dataset, max_seq_length):
+def _prepare_pretokenized_text_rows(
+    dataset,
+    max_seq_length,
+):
+    """Normalize pre-tokenized text rows with SFT collator label semantics."""
     rows = []
     for item in dataset:
         if not isinstance(item, dict) or "input_ids" not in item:
@@ -3886,39 +3903,16 @@ def _prepare_pretokenized_text_rows(dataset, max_seq_length):
         input_ids = _to_int_list(item["input_ids"])[:max_seq_length]
         if len(input_ids) < 2:
             continue
-        attention_mask = _to_int_list(item.get("attention_mask"))
-        if attention_mask is not None:
-            attention_mask = attention_mask[:len(input_ids)]
-        labels = _to_int_list(item.get("labels"))
-        has_explicit_labels = labels is not None
-        labels_from_input_ids = False
-        mask_loss_with_attention = False
-        if labels is not None:
-            labels = labels[:len(input_ids)]
-        elif "completion_mask" in item:
-            completion_mask = _to_int_list(item.get("completion_mask"))[:len(input_ids)]
-            labels = [
-                token if idx < len(completion_mask) and completion_mask[idx] else -100
-                for idx, token in enumerate(input_ids)
-            ]
-            mask_loss_with_attention = True
-        else:
-            labels_from_input_ids = True
-        if labels is not None and attention_mask is not None and not has_explicit_labels:
-            labels = [
-                label if idx < len(attention_mask) and attention_mask[idx] else -100
-                for idx, label in enumerate(labels)
-            ]
-        token_type_ids = _to_int_list(item.get("token_type_ids"))
-        if token_type_ids is not None:
-            token_type_ids = token_type_ids[:len(input_ids)]
+        attention_mask = _aligned_text_field(item, "attention_mask", len(input_ids))
+        labels = _aligned_text_field(item, "labels", len(input_ids))
+        token_type_ids = _aligned_text_field(item, "token_type_ids", len(input_ids))
         rows.append({
             "input_ids": input_ids,
             "labels": labels,
             "attention_mask": attention_mask,
             "token_type_ids": token_type_ids,
-            "labels_from_input_ids": labels_from_input_ids,
-            "mask_loss_with_attention": mask_loss_with_attention,
+            "labels_from_input_ids": labels is None,
+            "mask_loss_with_attention": False,
         })
     if not rows:
         raise ValueError(
@@ -4229,7 +4223,10 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
 
     first_item, dataset = _peek_dataset_item(dataset)
     if formatting_func is None and _is_pretokenized_text_item(first_item):
-        rows = _prepare_pretokenized_text_rows(dataset, max_seq_length)
+        rows = _prepare_pretokenized_text_rows(
+            dataset,
+            max_seq_length,
+        )
         batch_pairs = _create_ordered_pretokenized_text_batches(
             rows, tokenizer, batch_size, max_seq_length,
             num_batches=num_batches, seed=seed,
