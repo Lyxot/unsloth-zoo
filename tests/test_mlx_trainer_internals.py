@@ -88,7 +88,8 @@ def test_text_return_token_type_ids_for_gemma3_text():
     from unsloth_zoo.mlx.trainer import _text_return_token_type_ids
 
     class Model:
-        _config = {"model_type": "gemma3_text"}
+        class language_model:
+            _config = {"model_type": "gemma3_text"}
 
     class OtherModel:
         _config = {"model_type": "qwen3"}
@@ -399,6 +400,143 @@ def test_pretokenized_text_batches_keep_first_iterable_row():
     assert batches[0][2].tolist() == [[1, 2], [3, 4]]
 
 
+def test_pretokenized_text_batches_keep_partial_default_batch():
+    from unsloth_zoo.mlx.utils import create_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+    batches = create_batches(
+        [
+            {"input_ids": [1, 2, 3]},
+            {"input_ids": [4, 5]},
+        ],
+        Tokenizer(),
+        batch_size=4,
+        max_seq_length=8,
+        num_batches=None,
+    )
+
+    assert len(batches) == 1
+    assert batches[0][0].tolist() == [[1, 2, 3], [4, 5, 0]]
+
+
+def test_pretokenized_text_batches_use_cuda_randperm_order():
+    from unsloth_zoo.mlx.utils import create_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+    seed = 123
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    order = torch.randperm(4, generator=generator).tolist()
+
+    batches = create_batches(
+        [{"input_ids": [10 + i, 99]} for i in range(4)],
+        Tokenizer(),
+        batch_size=2,
+        max_seq_length=8,
+        seed=seed,
+        dataset_order="torch_randperm",
+    )
+
+    assert [row[0] for row in batches[0][0].tolist()] == [
+        10 + idx for idx in order[:2]
+    ]
+
+
+def test_streaming_pretokenized_text_batches_accept_dataset_order():
+    from unsloth_zoo.mlx.utils import iterate_training_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+    dataset = [{"input_ids": [10 + i, 99]} for i in range(4)]
+    seed = 123
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    order = torch.randperm(4, generator=generator).tolist()
+
+    default_batches = iterate_training_batches(
+        dataset,
+        Tokenizer(),
+        batch_size=2,
+        max_seq_length=8,
+        seed=seed,
+    )
+    cuda_order_batches = iterate_training_batches(
+        dataset,
+        Tokenizer(),
+        batch_size=2,
+        max_seq_length=8,
+        seed=seed,
+        dataset_order="torch_randperm",
+    )
+
+    assert [row[0] for row in next(default_batches)[0].tolist()] == [10, 11]
+    assert [row[0] for row in next(cuda_order_batches)[0].tolist()] == [
+        10 + idx for idx in order[:2]
+    ]
+
+
+def test_streaming_raw_text_batches_reject_explicit_dataset_order():
+    from unsloth_zoo.mlx.utils import iterate_training_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+        bos_token = None
+        chat_template = ""
+
+        def encode(self, text):
+            return [ord(ch) for ch in text]
+
+    batches = iterate_training_batches(
+        [{"text": "ab"}],
+        Tokenizer(),
+        batch_size=1,
+        max_seq_length=8,
+        dataset_order="torch_randperm",
+    )
+
+    with pytest.raises(ValueError, match="metadata-aware streaming"):
+        next(batches)
+
+
+def test_pretokenized_text_batches_return_stable_metadata_tuple():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+    batches = create_ordered_batches(
+        [{"input_ids": [1, 2]}, {"input_ids": [3, 4]}],
+        Tokenizer(),
+        batch_size=2,
+        max_seq_length=8,
+        dataset_order="sequential",
+    )
+
+    assert len(batches[0]) == 4
+    assert batches[0][3] == {}
+
+
+def test_pretokenized_text_batches_reject_short_metadata():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+    with pytest.raises(ValueError, match="attention_mask"):
+        create_ordered_batches(
+            [{"input_ids": [1, 2, 3], "attention_mask": [1, 1]}],
+            Tokenizer(),
+            batch_size=1,
+            max_seq_length=8,
+            dataset_order="sequential",
+        )
+
+
 def test_pretokenized_text_batches_do_not_mask_zero_without_pad_token():
     from unsloth_zoo.mlx.utils import create_ordered_batches
 
@@ -463,6 +601,24 @@ def test_pretokenized_text_batches_preserve_token_type_ids():
     assert extra["token_type_ids"].tolist() == [[0, 1, 1], [0, 0, 0]]
 
 
+def test_pretokenized_text_batches_synthesize_gemma_token_type_ids():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+    batches = create_ordered_batches(
+        [{"input_ids": [1, 2, 3]}, {"input_ids": [4, 5]}],
+        Tokenizer(),
+        batch_size=2,
+        max_seq_length=8,
+        dataset_order="sequential",
+        return_token_type_ids=True,
+    )
+
+    assert batches[0][3]["token_type_ids"].tolist() == [[0, 0, 0], [0, 0, 0]]
+
+
 def test_pretokenized_text_batches_preserve_labels():
     from unsloth_zoo.mlx.utils import create_ordered_batches
 
@@ -484,9 +640,7 @@ def test_pretokenized_text_batches_preserve_labels():
 
 
 def test_pretokenized_text_batches_preserve_explicit_labels_under_attention_mask():
-    import mlx.core as mx
-
-    from unsloth_zoo.mlx.utils import create_ordered_batches, _text_target_mask
+    from unsloth_zoo.mlx.utils import create_ordered_batches
 
     class Tokenizer:
         pad_token_id = 0
@@ -516,10 +670,18 @@ def test_pretokenized_text_batches_preserve_explicit_labels_under_attention_mask
     assert labels.tolist() == [[1, 2, 0], [3, 4, -100]]
     assert extra["attention_mask"].tolist() == [[1, 1, 0], [1, 1, 0]]
     assert extra["mask_loss_with_attention"] is False
-    assert _text_target_mask(extra, mx.array([[2, 0], [4, -100]])) is None
 
 
-def test_pretokenized_text_batches_ignore_completion_mask():
+@pytest.mark.parametrize(
+    ("completion_only_loss", "expected"),
+    [
+        (False, [[1, 2, 3, -100], [4, 5, -100, -100]]),
+        (True, [[-100, 2, 3, -100], [-100, 5, -100, -100]]),
+    ],
+)
+def test_pretokenized_text_batches_apply_completion_mask_when_requested(
+    completion_only_loss, expected,
+):
     from unsloth_zoo.mlx.utils import create_ordered_batches
 
     class Tokenizer:
@@ -542,12 +704,10 @@ def test_pretokenized_text_batches_ignore_completion_mask():
         batch_size=2,
         max_seq_length=8,
         dataset_order="sequential",
+        completion_only_loss=completion_only_loss,
     )
 
-    assert batches[0][2].tolist() == [
-        [1, 2, 3, -100],
-        [4, 5, -100, -100],
-    ]
+    assert batches[0][2].tolist() == expected
 
 
 def test_raw_text_batches_request_token_type_ids_when_requested():
