@@ -145,6 +145,30 @@ def _text_completion_only_loss_arg(args):
     return None
 
 
+def _text_return_token_type_ids(model):
+    """Return whether text batching should request token type ids."""
+    for candidate in (
+        model,
+        getattr(model, "model", None),
+        getattr(model, "language_model", None),
+    ):
+        if candidate is None:
+            continue
+        config = getattr(candidate, "_config", None)
+        if config is None:
+            config = getattr(candidate, "config", None)
+        if config is None:
+            config = getattr(candidate, "args", None)
+        model_type = (
+            config.get("model_type")
+            if isinstance(config, dict)
+            else getattr(config, "model_type", None)
+        )
+        if model_type in {"gemma3", "gemma3_text"}:
+            return True
+    return False
+
+
 def _normalize_mlx_optimizer_name(name):
     opt_name = str(name or "adamw").strip().lower()
     if opt_name not in SUPPORTED_MLX_OPTIMIZERS:

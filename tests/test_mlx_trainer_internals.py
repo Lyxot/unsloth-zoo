@@ -84,6 +84,19 @@ def test_mlx_training_config_exposes_completion_only_loss():
     ) is True
 
 
+def test_text_return_token_type_ids_for_gemma3_text():
+    from unsloth_zoo.mlx.trainer import _text_return_token_type_ids
+
+    class Model:
+        _config = {"model_type": "gemma3_text"}
+
+    class OtherModel:
+        _config = {"model_type": "qwen3"}
+
+    assert _text_return_token_type_ids(Model()) is True
+    assert _text_return_token_type_ids(OtherModel()) is False
+
+
 @pytest.mark.parametrize("optim_name", ["adamw", "adam", "sgd", "adafactor"])
 def test_mlx_training_config_each_optim(optim_name):
     """Every supported optim string constructs cleanly in config."""
@@ -599,6 +612,34 @@ def test_text_model_kwargs_forwards_token_type_ids():
 
     assert kwargs["attention_mask"].tolist() == [[1, 1, 1]]
     assert kwargs["token_type_ids"].tolist() == [[0, 1, 1]]
+
+
+def test_text_model_kwargs_gates_cce_token_type_ids_to_gemma():
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.utils import _text_model_extra_kwargs
+
+    class GemmaModel:
+        _config = {"model_type": "gemma3_text"}
+
+    class QwenModel:
+        _config = {"model_type": "qwen3"}
+
+    extra = {
+        "attention_mask": mx.array([[1, 1, 1, 0]]),
+        "token_type_ids": mx.array([[0, 1, 1, 0]]),
+    }
+
+    assert "token_type_ids" in _text_model_extra_kwargs(
+        GemmaModel(),
+        extra,
+        cce=True,
+    )
+    assert "token_type_ids" not in _text_model_extra_kwargs(
+        QwenModel(),
+        extra,
+        cce=True,
+    )
 
 
 def test_train_on_responses_only_forwards_last_response_only(monkeypatch):

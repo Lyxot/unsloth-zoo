@@ -85,6 +85,34 @@ def _filter_call_kwargs(callable_obj, kwargs):
     return {key: value for key, value in kwargs.items() if key in allowed}
 
 
+def _model_type_from_config(obj):
+    """Read a model_type value from MLX/HF-style config carriers."""
+    config = getattr(obj, "_config", None)
+    if config is None:
+        config = getattr(obj, "config", None)
+    if config is None:
+        config = getattr(obj, "args", None)
+    if isinstance(config, dict):
+        return config.get("model_type")
+    return getattr(config, "model_type", None)
+
+
+def _text_uses_gemma_token_type_mask(model):
+    """Return whether CCE should build Gemma image-style token type masks."""
+    language_model = getattr(model, "language_model", None)
+    candidates = (
+        model,
+        getattr(model, "model", None),
+        language_model,
+        getattr(language_model, "model", None),
+    )
+    return any(
+        candidate is not None
+        and _model_type_from_config(candidate) in {"gemma3", "gemma3_text"}
+        for candidate in candidates
+    )
+
+
 def _text_model_extra_kwargs(model, extra, *, cce=False):
     """Prepare attention/token-type kwargs for text model forward parity."""
     extra = _text_batch_extra(extra)
@@ -100,7 +128,9 @@ def _text_model_extra_kwargs(model, extra, *, cce=False):
         else:
             kwargs["attention_mask"] = input_attention_mask
     token_type_ids = extra.get("token_type_ids")
-    if token_type_ids is not None:
+    if token_type_ids is not None and (
+        not cce or _text_uses_gemma_token_type_mask(model)
+    ):
         kwargs["token_type_ids"] = token_type_ids[:, :-1]
         if cce and input_attention_mask is not None:
             kwargs["attention_mask"] = input_attention_mask
@@ -3740,16 +3770,13 @@ def _cuda_tokenize_text_with_metadata(
             "Unsloth MLX: raw text token_type_ids require a callable "
             "Hugging Face tokenizer or tokenizer wrapper."
         )
-    try:
-        tokenized = tokenizer(
-            text,
-            truncation=True,
-            max_length=max_seq_length,
-            return_token_type_ids=return_token_type_ids,
-            add_special_tokens=add_special_tokens,
-        )
-    except TypeError:
-        tokenized = tokenizer(text, add_special_tokens=add_special_tokens)
+    tokenized = tokenizer(
+        text,
+        truncation=True,
+        max_length=max_seq_length,
+        return_token_type_ids=return_token_type_ids,
+        add_special_tokens=add_special_tokens,
+    )
 
     input_ids = _flatten_text_token_ids(tokenized)
     attention_mask = None
