@@ -78,6 +78,7 @@ from .utils import (
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
     _is_vlm_model,
+    _model_type_from_config,
 )
 from .compile import (
     build_compile_policy,
@@ -147,24 +148,17 @@ def _text_completion_only_loss_arg(args):
 
 def _text_return_token_type_ids(model):
     """Return whether text batching should request token type ids."""
+    language_model = getattr(model, "language_model", None)
     for candidate in (
         model,
         getattr(model, "model", None),
-        getattr(model, "language_model", None),
+        language_model,
+        getattr(language_model, "model", None),
     ):
-        if candidate is None:
-            continue
-        config = getattr(candidate, "_config", None)
-        if config is None:
-            config = getattr(candidate, "config", None)
-        if config is None:
-            config = getattr(candidate, "args", None)
-        model_type = (
-            config.get("model_type")
-            if isinstance(config, dict)
-            else getattr(config, "model_type", None)
-        )
-        if model_type in {"gemma3", "gemma3_text"}:
+        if (
+            candidate is not None
+            and _model_type_from_config(candidate) in {"gemma3", "gemma3_text"}
+        ):
             return True
     return False
 
@@ -1641,6 +1635,9 @@ class MLXTrainer:
         # Prepare eval batches
         eval_batches = None
         text_completion_only_loss = _text_completion_only_loss_arg(args)
+        text_return_token_type_ids = (
+            False if is_vlm else _text_return_token_type_ids(self.model)
+        )
         if args.eval_steps > 0 and self.eval_dataset is not None:
             # Use pre-built labeled eval batches if available
             _labeled_eval = getattr(self, '_eval_batches_labeled', None)
@@ -1680,6 +1677,8 @@ class MLXTrainer:
                             else None
                         ),
                         append_eos=bool(getattr(args, "append_eos", True)),
+                        return_token_type_ids=text_return_token_type_ids,
+                        completion_only_loss=text_completion_only_loss,
                     )
 
                 if isinstance(self.eval_dataset, dict):
@@ -2070,6 +2069,9 @@ class MLXTrainer:
             if args.max_steps > 0 else None
         )
         text_completion_only_loss = _text_completion_only_loss_arg(args)
+        text_return_token_type_ids = (
+            False if is_vlm else _text_return_token_type_ids(self.model)
+        )
 
         if is_vlm:
             _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
@@ -2122,16 +2124,6 @@ class MLXTrainer:
         else:
             chat_tmpl = getattr(args, "chat_template", None)
             if args.streaming:
-                # Streaming has no index space; refuse explicit order requests.
-                if (
-                    getattr(args, "preserve_dataset_order", False)
-                    or getattr(args, "dataset_order", "default") != "default"
-                ):
-                    raise ValueError(
-                        "Unsloth MLX: preserve_dataset_order / dataset_order is not "
-                        "supported with streaming=True for text training. Disable "
-                        "streaming or materialize batches."
-                    )
                 return None, iterate_training_batches(
                     dataset=self.train_dataset,
                     tokenizer=self.tokenizer,
@@ -2144,6 +2136,13 @@ class MLXTrainer:
                     model_name=model_name,
                     model_type=model_type,
                     append_eos=bool(getattr(args, "append_eos", True)),
+                    return_token_type_ids=text_return_token_type_ids,
+                    dataset_order=(
+                        "sequential"
+                        if getattr(args, "preserve_dataset_order", False)
+                        else getattr(args, "dataset_order", "default")
+                    ),
+                    completion_only_loss=text_completion_only_loss,
                 )
             else:
                 batch_kwargs = dict(
@@ -2159,6 +2158,8 @@ class MLXTrainer:
                     model_name=model_name,
                     model_type=model_type,
                     append_eos=bool(getattr(args, "append_eos", True)),
+                    return_token_type_ids=text_return_token_type_ids,
+                    completion_only_loss=text_completion_only_loss,
                 )
                 if (
                     getattr(args, "preserve_dataset_order", False)
