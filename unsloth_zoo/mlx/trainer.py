@@ -2660,6 +2660,17 @@ def train_on_responses_only(
         train_on_responses_only as _hf_train_on_responses_only,
     )
 
+    if (
+        not return_function
+        and trainer is not None
+        and getattr(trainer, "data_collator", None) is not None
+    ):
+        raise ValueError(
+            "Unsloth MLX: train_on_responses_only cannot be combined with a "
+            "custom data_collator yet. Apply response masks before creating "
+            "the trainer, or remove the custom data_collator."
+        )
+
     # Resolve tokenizer: kwarg > trainer.tokenizer
     _tokenizer = tokenizer
     if _tokenizer is None and trainer is not None:
@@ -2691,12 +2702,6 @@ def train_on_responses_only(
             "trainer is required when return_function=False. "
             "Pass return_function=True to get the masking closure, "
             "or provide an MLXTrainer instance."
-        )
-    if getattr(trainer, "data_collator", None) is not None:
-        raise ValueError(
-            "Unsloth MLX: train_on_responses_only is not supported with a "
-            "custom data_collator yet. Apply response masks before passing "
-            "the dataset, or disable the custom collator."
         )
 
     if trainer._is_vlm:

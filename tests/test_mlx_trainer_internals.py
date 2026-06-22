@@ -848,6 +848,7 @@ def test_custom_text_collator_keeps_truncated_examples_for_collator():
             {
                 "input_ids": torch.tensor([1, 2, 3, 4]),
                 "custom_mask": torch.tensor([5, 6, 7, 8]),
+                "same_length_metadata": ["a", "b", "c", "d"],
                 "metadata": ["still", "metadata"],
             },
         ],
@@ -859,6 +860,7 @@ def test_custom_text_collator_keeps_truncated_examples_for_collator():
 
     assert [example["input_ids"] for example in seen] == [[9], [1, 2, 3]]
     assert [example["custom_mask"] for example in seen] == [[1], [5, 6, 7]]
+    assert seen[1]["same_length_metadata"] == ["a", "b", "c"]
     assert [example["metadata"] for example in seen] == [
         ["keep", "all"],
         ["still", "metadata"],
@@ -1348,12 +1350,9 @@ def test_train_on_responses_only_rejects_custom_collator(monkeypatch):
     import unsloth_zoo.dataset_utils as dataset_utils
     from unsloth_zoo.mlx.trainer import train_on_responses_only
 
-    class CallableTokenizer:
-        def __call__(self, text, **kwargs):
-            return {"input_ids": [1, 2, 3]}
-
     class Trainer:
         data_collator = object()
+        tokenizer = object()
 
     monkeypatch.setattr(
         dataset_utils,
@@ -1366,7 +1365,6 @@ def test_train_on_responses_only_rejects_custom_collator(monkeypatch):
             Trainer(),
             instruction_part="<user>",
             response_part="<assistant>",
-            tokenizer=CallableTokenizer(),
         )
 
 
