@@ -3641,11 +3641,11 @@ def _prepare_pretokenized_text_rows(dataset, max_seq_length, completion_only_los
     return rows
 
 
-def _truncate_token_aligned_custom_field(value, input_length, max_seq_length):
-    """Truncate sequence fields that align with input_ids."""
+def _truncate_custom_collator_field(value, max_seq_length):
+    """Truncate list-like fields the same way TRL truncates datasets."""
     if hasattr(value, "tolist"):
         value = value.tolist()
-    if isinstance(value, (list, tuple)) and len(value) == input_length:
+    if isinstance(value, (list, tuple)):
         return list(value)[:max_seq_length]
     return value
 
@@ -3674,20 +3674,12 @@ def _prepare_custom_collator_text_examples(dataset, max_seq_length):
                 "`seq_lengths` are not supported with custom data_collator "
                 "yet."
             )
-        input_length = len(item["input_ids"])
         example = dict(item)
         for field, value in item.items():
-            example[field] = _truncate_token_aligned_custom_field(
-                value, input_length, max_seq_length,
-            )
+            example[field] = _truncate_custom_collator_field(value, max_seq_length)
         example["input_ids"] = _to_int_list(item["input_ids"])[:max_seq_length]
         examples.append(example)
 
-    if not examples:
-        raise ValueError(
-            "Unsloth MLX: no tokenized text examples were available for "
-            "custom data_collator batching."
-        )
     return examples
 
 
@@ -3869,12 +3861,30 @@ def _collator_output_to_text_batch(output, max_seq_length):
     )
 
 
-def _collate_text_examples_with_custom_collator(examples, data_collator, max_seq_length):
-    """Run a user collator and return an MLX text batch."""
-    return _collator_output_to_text_batch(
-        data_collator(examples),
-        max_seq_length,
-    )
+class _LazyCollatedTextBatches:
+    """List-like text batches that call the user collator on access."""
+
+    def __init__(self, examples, chunks, data_collator, max_seq_length):
+        self._examples = examples
+        self._chunks = chunks
+        self._data_collator = data_collator
+        self._max_seq_length = max_seq_length
+
+    def __len__(self):
+        return len(self._chunks)
+
+    def __iter__(self):
+        for index in range(len(self)):
+            yield self[index]
+
+    def __getitem__(self, index):
+        if index < 0:
+            index += len(self)
+        batch_examples = [self._examples[i] for i in self._chunks[index]]
+        return _collator_output_to_text_batch(
+            self._data_collator(batch_examples),
+            self._max_seq_length,
+        )
 
 
 def create_collated_text_batches(
@@ -3889,29 +3899,21 @@ def create_collated_text_batches(
 ):
     """Create text batches with a user-provided data_collator."""
     examples = _prepare_custom_collator_text_examples(dataset, max_seq_length)
-    batches = _create_ordered_text_batches(
+    chunks = []
+    target_epochs = 1 if num_batches is None and num_epochs is None else num_epochs
+    for chunk in _iter_text_index_chunks(
         examples,
         batch_size,
-        lambda batch_examples: _collate_text_examples_with_custom_collator(
-            batch_examples, data_collator, max_seq_length,
-        ),
-        num_batches=num_batches,
         seed=seed,
         dataset_order=dataset_order,
-        num_epochs=num_epochs,
-        empty_message=(
-            "Unsloth MLX: no trainable token sequences were available after "
-            "custom data_collator batching."
-        ),
+        num_epochs=target_epochs,
+    ):
+        chunks.append(list(chunk))
+        if num_batches is not None and len(chunks) >= num_batches:
+            break
+    return _LazyCollatedTextBatches(
+        examples, chunks, data_collator, max_seq_length,
     )
-    tensors = []
-    for batch, lengths, labels in batches:
-        tensors.extend([batch, lengths])
-        if labels is not None:
-            tensors.append(labels)
-    if tensors:
-        mx.eval(tensors)
-    return batches
 
 
 def _prompt_completion_text_parts(tokenizer, item, dataset_text_field):

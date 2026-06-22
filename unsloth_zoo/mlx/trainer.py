@@ -576,20 +576,6 @@ class MLXTrainer:
         if packing is not None:
             self.args.packing = packing
 
-        if self.data_collator is not None and self.args.packing:
-            raise ValueError(
-                "Unsloth MLX: custom data_collator cannot be used with "
-                "packing=True yet. Set packing=False, or remove the custom "
-                "data_collator."
-            )
-        if self.data_collator is not None and self.formatting_func is not None:
-            raise ValueError(
-                "Unsloth MLX: custom data_collator requires an already "
-                "tokenized text dataset with input_ids. Apply formatting_func "
-                "before creating the trainer, or remove the custom "
-                "data_collator."
-            )
-
         if self.args.packing:
             print(
                 "Unsloth: packing=True is not yet supported on MLX. "
