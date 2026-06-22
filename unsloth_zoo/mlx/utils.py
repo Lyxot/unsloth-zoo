@@ -3644,7 +3644,7 @@ def _prepare_pretokenized_text_rows(dataset, max_seq_length, completion_only_los
 def _prepare_custom_collator_text_examples(dataset, max_seq_length):
     """Prepare tokenized text examples for a user-provided collator."""
     first_item, replay_dataset = _peek_dataset(dataset)
-    if not isinstance(first_item, dict) or first_item.get("input_ids") is None:
+    if not isinstance(first_item, Mapping) or first_item.get("input_ids") is None:
         raise ValueError(
             "Unsloth MLX: custom data_collator requires a tokenized text "
             "dataset with `input_ids`. Raw text, VLM, streaming, packing, "
@@ -3654,7 +3654,7 @@ def _prepare_custom_collator_text_examples(dataset, max_seq_length):
 
     examples = []
     for item in replay_dataset:
-        if not isinstance(item, dict) or item.get("input_ids") is None:
+        if not isinstance(item, Mapping) or item.get("input_ids") is None:
             raise ValueError(
                 "Unsloth MLX: every example passed to custom data_collator "
                 "must contain `input_ids`."
@@ -3665,9 +3665,10 @@ def _prepare_custom_collator_text_examples(dataset, max_seq_length):
                 "`seq_lengths` are not supported with custom data_collator "
                 "yet."
             )
+        input_length = len(item["input_ids"])
         example = dict(item)
         for field, value in item.items():
-            if isinstance(value, list):
+            if isinstance(value, list) and len(value) == input_length:
                 example[field] = value[:max_seq_length]
         example["input_ids"] = _to_int_list(item["input_ids"])[:max_seq_length]
         examples.append(example)
@@ -3758,6 +3759,14 @@ def _trim_custom_collator_ignored_tail(
     seq_len = input_ids_np.shape[1]
     if seq_len <= max_seq_length:
         return input_ids_np, labels_np, attention_mask_np
+    if attention_mask_np is not None:
+        tail_mask = attention_mask_np[:, max_seq_length:seq_len]
+        if np.any(tail_mask != 0):
+            raise ValueError(
+                "Unsloth MLX: custom data_collator returned active "
+                "attention_mask values past max_seq_length. Truncate or mask "
+                "those tokens before returning the batch."
+            )
     tail_labels = labels_np[:, max_seq_length:seq_len]
     if not np.all(tail_labels == -100):
         raise ValueError(
