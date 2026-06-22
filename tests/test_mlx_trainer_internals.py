@@ -565,6 +565,27 @@ def test_custom_text_collator_output_normalizes_to_mlx_batch():
     assert labels.tolist() == [[-100, 1, 2, 3], [4, 5, -100, -100]]
 
 
+def test_custom_text_collator_widens_unsigned_labels():
+    from unsloth_zoo.mlx.utils import create_collated_text_batches
+
+    def collator(_examples):
+        return {
+            "input_ids": torch.tensor([[1, 2, 3]], dtype=torch.int64),
+            "labels": torch.tensor([[1, 2, 3]], dtype=torch.uint8),
+        }
+
+    _batch, _lengths, labels = create_collated_text_batches(
+        [{"input_ids": [1, 2, 3]}],
+        data_collator=collator,
+        batch_size=1,
+        max_seq_length=8,
+        dataset_order="sequential",
+    )[0]
+
+    assert str(labels.dtype).endswith("int64")
+    assert labels.tolist() == [[1, 2, 3]]
+
+
 @pytest.mark.parametrize("seed", [0, 7])
 def test_custom_text_collator_preserves_default_order(seed):
     from unsloth_zoo.mlx.utils import create_collated_text_batches
@@ -665,6 +686,19 @@ def test_custom_text_collator_requires_prepared_dataset():
             batch_size=1,
             max_seq_length=8,
         )
+
+
+def test_custom_text_collator_eval_is_explicitly_deferred():
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    source = inspect.getsource(MLXTrainer._train_inner)
+    eval_start = source.index("if args.eval_steps > 0 and self.eval_dataset is not None:")
+    custom_guard = source.index("custom data_collator eval batching", eval_start)
+    eval_batcher = source.index("def _create_eval_batches", eval_start)
+
+    assert custom_guard < eval_batcher
 
 
 def test_pretokenized_text_streaming_yields_labeled_batches():

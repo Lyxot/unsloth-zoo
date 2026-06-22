@@ -1621,6 +1621,12 @@ class MLXTrainer:
         eval_batches = None
         text_completion_only_loss = _text_completion_only_loss_arg(args)
         if args.eval_steps > 0 and self.eval_dataset is not None:
+            if self.data_collator is not None:
+                raise ValueError(
+                    "Unsloth MLX: custom data_collator eval batching is not "
+                    "implemented yet. Disable eval or use the built-in MLX "
+                    "batcher until shared collator eval normalization lands."
+                )
             # Use pre-built labeled eval batches if available
             _labeled_eval = getattr(self, '_eval_batches_labeled', None)
             if _labeled_eval is not None:

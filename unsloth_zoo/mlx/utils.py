@@ -3760,7 +3760,7 @@ def _collator_output_to_text_batch(output, max_seq_length):
                 f"{labels_np.shape[1]} is shorter than input_ids sequence "
                 f"length {seq_len}."
             )
-        labels = mx.array(labels_np[:, :seq_len])
+        labels = _normalize_cce_label_dtype(mx.array(labels_np[:, :seq_len]))
 
     return (
         mx.array(input_ids_np).astype(mx.int32),
