@@ -3660,7 +3660,7 @@ _SFT_TEXT_SIGNATURE_COLUMNS = frozenset((
 
 
 def _prepare_custom_collator_text_examples(dataset, max_seq_length):
-    """Prepare tokenized text examples for a user-provided collator."""
+    """Prepare tokenized text examples with SFTTrainer text columns."""
     first_item, replay_dataset = _peek_dataset(dataset)
     if not isinstance(first_item, Mapping) or first_item.get("input_ids") is None:
         raise ValueError(
@@ -3683,7 +3683,7 @@ def _prepare_custom_collator_text_examples(dataset, max_seq_length):
         )
         example = {}
         for field, value in item.items():
-            if field in _SFT_TEXT_SIGNATURE_COLUMNS:
+            if field in _SFT_TEXT_SIGNATURE_COLUMNS and value is not None:
                 example[field] = _truncate_custom_collator_field(
                     value, max_seq_length,
                 )
@@ -3903,7 +3903,11 @@ def create_collated_text_batches(
     dataset_order="default",
     num_epochs=None,
 ):
-    """Create lazy text batches that run the user collator on access."""
+    """Create lazy text batches that run the user collator on access.
+
+    Input examples are pruned to SFTTrainer's default text signature columns
+    before the collator runs.
+    """
     examples = _prepare_custom_collator_text_examples(dataset, max_seq_length)
     chunks = []
     target_epochs = 1 if num_batches is None and num_epochs is None else num_epochs
@@ -3913,6 +3917,7 @@ def create_collated_text_batches(
         seed=seed,
         dataset_order=dataset_order,
         num_epochs=target_epochs,
+        drop_last_default=False,
     ):
         chunks.append(list(chunk))
         if num_batches is not None and len(chunks) >= num_batches:
@@ -4150,7 +4155,14 @@ def _text_item_length(item):
     return len(item)
 
 
-def _iter_text_index_chunks(items, batch_size, seed, dataset_order, num_epochs=None):
+def _iter_text_index_chunks(
+    items,
+    batch_size,
+    seed,
+    dataset_order,
+    num_epochs=None,
+    drop_last_default=True,
+):
     """Yield text batch index chunks using mlx-lm/default or explicit ordering."""
     if dataset_order not in (None, "default", "sequential", "torch_randperm"):
         raise ValueError(f"Unsupported MLX dataset_order: {dataset_order!r}")
@@ -4164,9 +4176,10 @@ def _iter_text_index_chunks(items, batch_size, seed, dataset_order, num_epochs=N
     while num_epochs is None or epoch < int(num_epochs):
         if dataset_order in (None, "default"):
             ordered = sorted(range(length), key=lambda idx: _text_item_length(items[idx]))
+            stop = length - batch_size + 1 if drop_last_default else length
             chunks = [
                 ordered[start:start + batch_size]
-                for start in range(0, length - batch_size + 1, batch_size)
+                for start in range(0, stop, batch_size)
             ]
             if not chunks:
                 raise ValueError(

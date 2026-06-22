@@ -856,6 +856,68 @@ def test_custom_text_collator_prunes_and_truncates_sft_fields():
     ]
 
 
+def test_custom_text_collator_skips_none_sft_fields():
+    from trl.trainer.sft_trainer import DataCollatorForLanguageModeling
+
+    from unsloth_zoo.mlx.utils import create_collated_text_batches
+
+    batch, lengths, labels = create_collated_text_batches(
+        [
+            {
+                "input_ids": [1, 2, 3],
+                "labels": None,
+                "completion_mask": None,
+                "assistant_masks": None,
+            },
+        ],
+        data_collator=DataCollatorForLanguageModeling(pad_token_id=0),
+        batch_size=1,
+        max_seq_length=8,
+        dataset_order="sequential",
+    )[0]
+
+    assert batch.tolist() == [[1, 2, 3]]
+    assert lengths.tolist() == [[0, 3]]
+    assert labels.tolist() == [[1, 2, 3]]
+
+
+def test_custom_text_collator_default_order_includes_partial_batch():
+    from unsloth_zoo.mlx.utils import create_collated_text_batches
+
+    observed = []
+
+    def collator(examples):
+        lengths = [len(example["input_ids"]) for example in examples]
+        observed.append(lengths)
+        max_len = max(lengths)
+        return {
+            "input_ids": torch.tensor([
+                example["input_ids"] + [0] * (max_len - len(example["input_ids"]))
+                for example in examples
+            ]),
+            "labels": torch.tensor([
+                example["input_ids"] + [-100] * (max_len - len(example["input_ids"]))
+                for example in examples
+            ]),
+        }
+
+    rows = [
+        {"input_ids": [1] * length}
+        for length in [5, 2, 3]
+    ]
+    list(create_collated_text_batches(
+        rows,
+        data_collator=collator,
+        batch_size=2,
+        max_seq_length=8,
+        seed=0,
+        dataset_order="default",
+    ))
+
+    assert sorted(length for batch in observed for length in batch) == [2, 3, 5]
+    assert sorted(len(batch) for batch in observed) == [1, 2]
+
+
 def test_custom_text_collator_requires_labels():
     from unsloth_zoo.mlx.utils import create_collated_text_batches
 
