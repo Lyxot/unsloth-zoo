@@ -3756,6 +3756,18 @@ def _custom_collator_labels_have_targets(labels_np, lengths_np):
     return bool(np.any((targets != -100) & length_mask))
 
 
+def _validate_custom_collator_masked_labels(labels_np, attention_mask_np):
+    """Reject supervised shifted targets outside the attention mask."""
+    if labels_np.shape[1] <= 1:
+        return
+    masked_targets = (attention_mask_np[:, 1:] == 0) & (labels_np[:, 1:] != -100)
+    if np.any(masked_targets):
+        raise ValueError(
+            "Unsloth MLX: custom data_collator labels must be -100 wherever "
+            "the shifted attention_mask is 0."
+        )
+
+
 def _trim_custom_collator_ignored_tail(
     input_ids_np, labels_np, attention_mask_np, max_seq_length,
 ):
@@ -3851,6 +3863,8 @@ def _collator_output_to_text_batch(output, max_seq_length, expected_batch_size=N
     lengths_np = _lengths_from_collator_attention(
         attention_mask_np, batch_size, seq_len,
     )
+    if attention_mask_np is not None:
+        _validate_custom_collator_masked_labels(labels_np, attention_mask_np)
     if not _custom_collator_labels_have_targets(labels_np, lengths_np):
         raise ValueError(
             "Unsloth MLX: custom data_collator produced a batch with no "

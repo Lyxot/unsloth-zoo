@@ -689,6 +689,23 @@ def test_custom_text_collator_rejects_active_attention_tail():
         )[0]
 
 
+def test_custom_text_collator_rejects_masked_supervised_targets():
+    from unsloth_zoo.mlx.utils import create_collated_text_batches
+
+    with pytest.raises(ValueError, match="shifted attention_mask is 0"):
+        create_collated_text_batches(
+            [{"input_ids": [1, 2, 3]}],
+            data_collator=lambda _examples: {
+                "input_ids": torch.tensor([[1, 2, 0]]),
+                "attention_mask": torch.tensor([[1, 1, 0]]),
+                "labels": torch.tensor([[1, 2, 0]]),
+            },
+            batch_size=1,
+            max_seq_length=8,
+            dataset_order="sequential",
+        )[0]
+
+
 def test_custom_text_collator_rejects_1d_multi_example_outputs():
     from unsloth_zoo.mlx.utils import create_collated_text_batches
 
