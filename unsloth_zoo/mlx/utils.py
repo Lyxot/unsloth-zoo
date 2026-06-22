@@ -3641,6 +3641,15 @@ def _prepare_pretokenized_text_rows(dataset, max_seq_length, completion_only_los
     return rows
 
 
+def _truncate_token_aligned_custom_field(value, input_length, max_seq_length):
+    """Truncate sequence fields that align with input_ids."""
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)) and len(value) == input_length:
+        return list(value)[:max_seq_length]
+    return value
+
+
 def _prepare_custom_collator_text_examples(dataset, max_seq_length):
     """Prepare tokenized text examples for a user-provided collator."""
     first_item, replay_dataset = _peek_dataset(dataset)
@@ -3668,8 +3677,9 @@ def _prepare_custom_collator_text_examples(dataset, max_seq_length):
         input_length = len(item["input_ids"])
         example = dict(item)
         for field, value in item.items():
-            if isinstance(value, list) and len(value) == input_length:
-                example[field] = value[:max_seq_length]
+            example[field] = _truncate_token_aligned_custom_field(
+                value, input_length, max_seq_length,
+            )
         example["input_ids"] = _to_int_list(item["input_ids"])[:max_seq_length]
         examples.append(example)
 

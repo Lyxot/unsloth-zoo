@@ -2692,6 +2692,12 @@ def train_on_responses_only(
             "Pass return_function=True to get the masking closure, "
             "or provide an MLXTrainer instance."
         )
+    if getattr(trainer, "data_collator", None) is not None:
+        raise ValueError(
+            "Unsloth MLX: train_on_responses_only is not supported with a "
+            "custom data_collator yet. Apply response masks before passing "
+            "the dataset, or disable the custom collator."
+        )
 
     if trainer._is_vlm:
         # VLM path: store mask_fn for application during batch creation

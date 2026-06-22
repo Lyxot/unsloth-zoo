@@ -840,10 +840,14 @@ def test_custom_text_collator_keeps_truncated_examples_for_collator():
 
     create_collated_text_batches(
         [
-            {"input_ids": [9], "custom_mask": [1], "metadata": ["keep", "all"]},
             {
-                "input_ids": [1, 2, 3, 4],
-                "custom_mask": [5, 6, 7, 8],
+                "input_ids": torch.tensor([9]),
+                "custom_mask": torch.tensor([1]),
+                "metadata": ["keep", "all"],
+            },
+            {
+                "input_ids": torch.tensor([1, 2, 3, 4]),
+                "custom_mask": torch.tensor([5, 6, 7, 8]),
                 "metadata": ["still", "metadata"],
             },
         ],
@@ -1338,6 +1342,32 @@ def test_train_on_responses_only_forwards_last_response_only(monkeypatch):
     )
 
     assert received["last_response_only"] is True
+
+
+def test_train_on_responses_only_rejects_custom_collator(monkeypatch):
+    import unsloth_zoo.dataset_utils as dataset_utils
+    from unsloth_zoo.mlx.trainer import train_on_responses_only
+
+    class CallableTokenizer:
+        def __call__(self, text, **kwargs):
+            return {"input_ids": [1, 2, 3]}
+
+    class Trainer:
+        data_collator = object()
+
+    monkeypatch.setattr(
+        dataset_utils,
+        "train_on_responses_only",
+        lambda *args, **kwargs: lambda batch: batch,
+    )
+
+    with pytest.raises(ValueError, match="custom data_collator"):
+        train_on_responses_only(
+            Trainer(),
+            instruction_part="<user>",
+            response_part="<assistant>",
+            tokenizer=CallableTokenizer(),
+        )
 
 
 def test_response_mask_tokenizer_rejects_encode_only_tokenizer():
