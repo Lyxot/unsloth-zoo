@@ -3650,10 +3650,9 @@ def _truncate_custom_collator_field(value, max_seq_length):
     return value
 
 
-_SFT_TEXT_SIGNATURE_COLUMNS = frozenset((
+_CUSTOM_COLLATOR_TEXT_COLUMNS = frozenset((
     "input_ids",
     "labels",
-    "seq_lengths",
     "completion_mask",
     "assistant_masks",
 ))
@@ -3683,7 +3682,7 @@ def _prepare_custom_collator_text_examples(dataset, max_seq_length):
         )
         example = {}
         for field, value in item.items():
-            if field in _SFT_TEXT_SIGNATURE_COLUMNS and value is not None:
+            if field in _CUSTOM_COLLATOR_TEXT_COLUMNS and value is not None:
                 example[field] = _truncate_custom_collator_field(
                     value, max_seq_length,
                 )
