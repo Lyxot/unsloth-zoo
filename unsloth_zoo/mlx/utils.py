@@ -3657,6 +3657,13 @@ _CUSTOM_COLLATOR_TEXT_COLUMNS = frozenset((
     "assistant_masks",
 ))
 
+_CUSTOM_COLLATOR_OUTPUT_KEYS = frozenset((
+    "input_ids",
+    "labels",
+    "attention_mask",
+))
+
+
 def _prepare_custom_collator_text_examples(dataset, max_seq_length):
     """Prepare tokenized text examples before user collation."""
     first_item, replay_dataset = _peek_dataset(dataset)
@@ -3812,6 +3819,14 @@ def _collator_output_to_text_batch(output, max_seq_length, expected_batch_size=N
         raise ValueError(
             "Unsloth MLX: custom data_collator outputs with `position_ids` "
             "or `seq_lengths` are not supported yet."
+        )
+    unsupported_keys = set(output.keys()) - _CUSTOM_COLLATOR_OUTPUT_KEYS
+    if unsupported_keys:
+        unsupported = ", ".join(f"`{key}`" for key in sorted(unsupported_keys))
+        raise ValueError(
+            "Unsloth MLX: custom data_collator returned unsupported output "
+            f"key(s): {unsupported}. Supported output keys are `input_ids`, "
+            "`labels`, and `attention_mask`."
         )
     input_ids_np = _collator_value_to_numpy(
         output["input_ids"], "input_ids",

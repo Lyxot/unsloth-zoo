@@ -994,6 +994,23 @@ def test_custom_text_collator_rejects_position_ids_outputs():
         )[0]
 
 
+def test_custom_text_collator_rejects_unsupported_output_keys():
+    from unsloth_zoo.mlx.utils import create_collated_text_batches
+
+    with pytest.raises(ValueError, match="unsupported output key"):
+        create_collated_text_batches(
+            [{"input_ids": [1, 2, 3]}],
+            data_collator=lambda _examples: {
+                "input_ids": torch.tensor([[1, 2, 3]]),
+                "labels": torch.tensor([[1, 2, 3]]),
+                "token_type_ids": torch.tensor([[0, 0, 1]]),
+            },
+            batch_size=1,
+            max_seq_length=8,
+            dataset_order="sequential",
+        )[0]
+
+
 def test_custom_text_collator_rejects_packed_examples():
     from unsloth_zoo.mlx.utils import create_collated_text_batches
 
