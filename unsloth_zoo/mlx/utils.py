@@ -3657,9 +3657,8 @@ _CUSTOM_COLLATOR_TEXT_COLUMNS = frozenset((
     "assistant_masks",
 ))
 
-
 def _prepare_custom_collator_text_examples(dataset, max_seq_length):
-    """Prepare tokenized text examples with SFTTrainer text columns."""
+    """Prepare tokenized text examples before user collation."""
     first_item, replay_dataset = _peek_dataset(dataset)
     if not isinstance(first_item, Mapping) or first_item.get("input_ids") is None:
         raise ValueError(
@@ -3724,45 +3723,42 @@ def _collator_value_to_numpy(value, field, expected_batch_size=None):
     return array
 
 
-def _lengths_from_collator_attention(attention_mask, batch_size, seq_len):
-    """Build MLX [start, end) lengths from a right-padded attention mask."""
-    if attention_mask is None:
-        return np.array([[0, seq_len] for _ in range(batch_size)], dtype=np.int32)
+def _lengths_from_collator_attention(attention_mask):
+    """Build MLX lengths from right-padded custom-collator masks."""
     lengths = []
     for row in attention_mask:
         active = np.flatnonzero(row)
         if len(active) == 0:
             lengths.append([0, 0])
         else:
-            if active[0] != 0:
+            if active[0] != 0 or active[-1] - active[0] + 1 != len(active):
                 raise ValueError(
-                    "Unsloth MLX: custom data_collator attention_mask must "
-                    "use right padding. Left padding is not supported on MLX "
-                    "custom collator batches yet."
+                    "Unsloth MLX: custom data_collator attention_mask outputs "
+                    "must use contiguous right padding. Left padding, holes, "
+                    "and padding-free masks are not supported yet."
                 )
-            if active[-1] - active[0] + 1 != len(active):
-                raise ValueError(
-                    "Unsloth MLX: custom data_collator attention_mask must "
-                    "contain only contiguous right padding."
-                )
-            lengths.append([int(active[0]), int(active[-1]) + 1])
+            lengths.append([0, int(active[-1]) + 1])
     return np.asarray(lengths, dtype=np.int32)
 
 
-def _validate_custom_collator_shifted_targets(labels_np, lengths_np, attention_mask_np=None):
-    """Validate shifted custom-collator labels against mask and target rules."""
-    if labels_np.shape[1] <= 1:
-        raise ValueError(
-            "Unsloth MLX: custom data_collator produced a batch with no "
-            "supervised target tokens."
-        )
+def _full_collator_lengths(input_ids_np):
+    """Build full-sequence lengths when no attention mask is returned."""
+    return np.tile(
+        np.array([[0, input_ids_np.shape[1]]], dtype=np.int32),
+        (input_ids_np.shape[0], 1),
+    )
+
+
+def _validate_custom_collator_targets(labels_np, lengths_np, attention_mask_np=None):
+    """Validate custom-collator labels after causal shifting."""
     if attention_mask_np is not None:
         masked_targets = (attention_mask_np[:, 1:] == 0) & (labels_np[:, 1:] != -100)
         if np.any(masked_targets):
             raise ValueError(
-                "Unsloth MLX: custom data_collator labels must be -100 wherever "
-                "the shifted attention_mask is 0."
+                "Unsloth MLX: custom data_collator labels must be -100 "
+                "wherever the shifted attention_mask is 0."
             )
+
     targets = labels_np[:, 1:]
     steps = np.arange(1, labels_np.shape[1], dtype=np.int32)
     length_mask = (
@@ -3771,8 +3767,8 @@ def _validate_custom_collator_shifted_targets(labels_np, lengths_np, attention_m
     )
     if not bool(np.any((targets != -100) & length_mask)):
         raise ValueError(
-            "Unsloth MLX: custom data_collator produced a batch with no "
-            "supervised target tokens."
+            "Unsloth MLX: custom data_collator produced no supervised "
+            "target tokens after causal shifting."
         )
 
 
@@ -3785,19 +3781,19 @@ def _trim_custom_collator_ignored_tail(
         return input_ids_np, labels_np, attention_mask_np
     if attention_mask_np is not None:
         tail_mask = attention_mask_np[:, max_seq_length:seq_len]
-        if np.any(tail_mask != 0):
-            raise ValueError(
-                "Unsloth MLX: custom data_collator returned active "
-                "attention_mask values past max_seq_length. Truncate or mask "
-                "those tokens before returning the batch."
-            )
+    if attention_mask_np is not None and np.any(tail_mask != 0):
+        raise ValueError(
+            "Unsloth MLX: custom data_collator returned active "
+            "attention_mask values past max_seq_length. Truncate or mask "
+            "those tokens before returning the batch."
+        )
     tail_labels = labels_np[:, max_seq_length:seq_len]
     if not np.all(tail_labels == -100):
         raise ValueError(
             "Unsloth MLX: custom data_collator returned supervised labels "
             "past max_seq_length. Truncate or set those labels to -100 before "
             "returning the batch."
-        )
+    )
     input_ids_np = input_ids_np[:, :max_seq_length]
     labels_np = labels_np[:, :max_seq_length]
     if attention_mask_np is not None:
@@ -3821,7 +3817,6 @@ def _collator_output_to_text_batch(output, max_seq_length, expected_batch_size=N
         output["input_ids"], "input_ids",
         expected_batch_size=expected_batch_size,
     )
-    batch_size, seq_len = input_ids_np.shape
 
     if output.get("labels") is None:
         raise ValueError(
@@ -3829,51 +3824,32 @@ def _collator_output_to_text_batch(output, max_seq_length, expected_batch_size=N
             "ignored tokens can be masked correctly."
         )
     labels_np = _collator_value_to_numpy(output["labels"], "labels")
-    if labels_np.shape[0] != batch_size:
+    if labels_np.shape != input_ids_np.shape:
         raise ValueError(
-            "Unsloth MLX: custom data_collator labels batch size "
-            f"{labels_np.shape[0]} does not match input_ids batch size "
-            f"{batch_size}."
-        )
-    if labels_np.shape[1] < seq_len:
-        raise ValueError(
-            "Unsloth MLX: custom data_collator labels sequence length "
-            f"{labels_np.shape[1]} is shorter than input_ids sequence "
-            f"length {seq_len}."
-        )
-    if labels_np.shape[1] > seq_len:
-        raise ValueError(
-            "Unsloth MLX: custom data_collator labels sequence length "
-            f"{labels_np.shape[1]} does not match input_ids sequence length "
-            f"{seq_len}."
+            "Unsloth MLX: custom data_collator labels shape "
+            f"{labels_np.shape} does not match input_ids shape "
+            f"{input_ids_np.shape}."
         )
     attention_mask_np = None
     if output.get("attention_mask") is not None:
         attention_mask_np = _collator_value_to_numpy(
             output["attention_mask"], "attention_mask",
         )
-        if attention_mask_np.shape[0] != batch_size:
+        if attention_mask_np.shape != input_ids_np.shape:
             raise ValueError(
-                "Unsloth MLX: custom data_collator attention_mask batch size "
-                f"{attention_mask_np.shape[0]} does not match input_ids "
-                f"batch size {batch_size}."
-            )
-        if attention_mask_np.shape[1] != seq_len:
-            raise ValueError(
-                "Unsloth MLX: custom data_collator attention_mask sequence "
-                f"length {attention_mask_np.shape[1]} does not match input_ids "
-                f"sequence length {seq_len}."
+                "Unsloth MLX: custom data_collator attention_mask shape "
+                f"{attention_mask_np.shape} does not match input_ids shape "
+                f"{input_ids_np.shape}."
             )
     input_ids_np, labels_np, attention_mask_np = _trim_custom_collator_ignored_tail(
         input_ids_np, labels_np, attention_mask_np, max_seq_length,
     )
-    batch_size, seq_len = input_ids_np.shape
-    lengths_np = _lengths_from_collator_attention(
-        attention_mask_np, batch_size, seq_len,
+    lengths_np = (
+        _lengths_from_collator_attention(attention_mask_np)
+        if attention_mask_np is not None
+        else _full_collator_lengths(input_ids_np)
     )
-    _validate_custom_collator_shifted_targets(
-        labels_np, lengths_np, attention_mask_np,
-    )
+    _validate_custom_collator_targets(labels_np, lengths_np, attention_mask_np)
     labels = _normalize_cce_label_dtype(mx.array(labels_np))
 
     return (
@@ -3900,9 +3876,8 @@ class _LazyCollatedTextBatches:
             yield self[index]
 
     def __getitem__(self, index):
-        if index < 0:
-            index += len(self)
-        batch_examples = [self._examples[i] for i in self._chunks[index]]
+        chunk = self._chunks[index]
+        batch_examples = [self._examples[i] for i in chunk]
         return _collator_output_to_text_batch(
             self._data_collator(batch_examples),
             self._max_seq_length,
@@ -3922,8 +3897,8 @@ def create_collated_text_batches(
 ):
     """Create text batches that call the user collator on batch access.
 
-    Input examples are pruned to SFTTrainer's default text signature columns
-    before the collator runs.
+    Tokenized examples are truncated before the collator runs. Packed
+    ``seq_lengths`` / padding-free outputs are rejected by this MLX path.
     """
     examples = _prepare_custom_collator_text_examples(dataset, max_seq_length)
     chunks = []
