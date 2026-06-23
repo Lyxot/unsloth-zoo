@@ -745,6 +745,46 @@ def test_custom_text_collator_rejects_wrong_2d_batch_size():
         )[0]
 
 
+@pytest.mark.parametrize(
+    ("field", "output"),
+    [
+        (
+            "input_ids",
+            {
+                "input_ids": torch.tensor([[1.2, 2.0, 3.0]]),
+                "labels": torch.tensor([[1, 2, 3]]),
+            },
+        ),
+        (
+            "attention_mask",
+            {
+                "input_ids": torch.tensor([[1, 2, 3]]),
+                "attention_mask": torch.tensor([[1.0, 1.0, 0.0]]),
+                "labels": torch.tensor([[1, 2, -100]]),
+            },
+        ),
+        (
+            "labels",
+            {
+                "input_ids": torch.tensor([[1, 2, 3]]),
+                "labels": torch.tensor([[1.0, 2.0, 3.0]]),
+            },
+        ),
+    ],
+)
+def test_custom_text_collator_rejects_invalid_dtypes(field, output):
+    from unsloth_zoo.mlx.utils import create_collated_text_batches
+
+    with pytest.raises(ValueError, match=field):
+        create_collated_text_batches(
+            [{"input_ids": [1, 2, 3]}],
+            data_collator=lambda _examples: output,
+            batch_size=1,
+            max_seq_length=8,
+            dataset_order="sequential",
+        )[0]
+
+
 @pytest.mark.parametrize("seed", [0, 7])
 def test_custom_text_collator_preserves_default_order(seed):
     from unsloth_zoo.mlx.utils import create_collated_text_batches

@@ -3727,6 +3727,27 @@ def _collator_value_to_numpy(value, field, expected_batch_size=None):
     return array
 
 
+def _require_collator_integer_dtype(array, field):
+    """Reject custom-collator arrays that would be silently truncated."""
+    if not np.issubdtype(array.dtype, np.integer):
+        raise ValueError(
+            f"Unsloth MLX: custom data_collator field `{field}` must use "
+            f"an integer dtype, got {array.dtype}."
+        )
+
+
+def _require_collator_mask_dtype(array, field):
+    """Reject custom-collator masks that are not bool or integer arrays."""
+    if not (
+        np.issubdtype(array.dtype, np.bool_)
+        or np.issubdtype(array.dtype, np.integer)
+    ):
+        raise ValueError(
+            f"Unsloth MLX: custom data_collator field `{field}` must use "
+            f"a bool or integer dtype, got {array.dtype}."
+        )
+
+
 def _lengths_from_collator_attention(attention_mask):
     """Build MLX lengths from right-padded custom-collator masks."""
     lengths = []
@@ -3813,6 +3834,7 @@ def _collator_output_to_text_batch(output, max_seq_length, expected_batch_size=N
         output["input_ids"], "input_ids",
         expected_batch_size=expected_batch_size,
     )
+    _require_collator_integer_dtype(input_ids_np, "input_ids")
 
     if output.get("labels") is None:
         raise ValueError(
@@ -3820,6 +3842,7 @@ def _collator_output_to_text_batch(output, max_seq_length, expected_batch_size=N
             "ignored tokens can be masked correctly."
         )
     labels_np = _collator_value_to_numpy(output["labels"], "labels")
+    _require_collator_integer_dtype(labels_np, "labels")
     if labels_np.shape != input_ids_np.shape:
         raise ValueError(
             "Unsloth MLX: custom data_collator labels shape "
@@ -3831,6 +3854,7 @@ def _collator_output_to_text_batch(output, max_seq_length, expected_batch_size=N
         attention_mask_np = _collator_value_to_numpy(
             output["attention_mask"], "attention_mask",
         )
+        _require_collator_mask_dtype(attention_mask_np, "attention_mask")
         if attention_mask_np.shape != input_ids_np.shape:
             raise ValueError(
                 "Unsloth MLX: custom data_collator attention_mask shape "
