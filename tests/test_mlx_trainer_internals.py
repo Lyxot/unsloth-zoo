@@ -710,7 +710,7 @@ def test_custom_text_collator_rejects_active_attention_tail():
         )[0]
 
 
-def test_custom_text_collator_ignores_masked_supervised_targets():
+def test_custom_text_collator_masks_inactive_targets():
     from unsloth_zoo.mlx.utils import create_collated_text_batches
 
     batch, lengths, labels = create_collated_text_batches(
@@ -727,7 +727,7 @@ def test_custom_text_collator_ignores_masked_supervised_targets():
 
     assert batch.tolist() == [[1, 2, 0]]
     assert lengths.tolist() == [[0, 2]]
-    assert labels.tolist() == [[1, 2, 0]]
+    assert labels.tolist() == [[1, 2, -100]]
 
 
 def test_custom_text_collator_rejects_1d_multi_example_outputs():

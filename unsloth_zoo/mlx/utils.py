@@ -3866,6 +3866,8 @@ def _collator_output_to_text_batch(output, max_seq_length, expected_batch_size=N
     input_ids_np, labels_np, attention_mask_np = _trim_custom_collator_ignored_tail(
         input_ids_np, labels_np, attention_mask_np, max_seq_length,
     )
+    if attention_mask_np is not None:
+        labels_np = np.where(attention_mask_np != 0, labels_np, -100)
     lengths_np = (
         _lengths_from_collator_attention(attention_mask_np)
         if attention_mask_np is not None
