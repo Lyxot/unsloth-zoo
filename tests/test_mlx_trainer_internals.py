@@ -1031,33 +1031,27 @@ def test_custom_text_collator_skips_none_sft_fields():
     assert labels.tolist() == [[1, 2, 3]]
 
 
-def test_custom_text_collator_filters_fully_masked_prepared_rows():
+def test_custom_text_collator_lets_collator_own_completion_mask_policy():
     from trl.trainer.sft_trainer import DataCollatorForLanguageModeling
 
     from unsloth_zoo.mlx.utils import create_collated_text_batches
 
-    seen = []
-
-    class RecordingCollator(DataCollatorForLanguageModeling):
-        def __call__(self, examples, *args, **kwargs):
-            seen.extend(examples)
-            return super().__call__(examples, *args, **kwargs)
-
     batch, lengths, labels = create_collated_text_batches(
         [
             {"input_ids": [1, 2, 3], "completion_mask": [0, 0, 0]},
-            {"input_ids": [4, 5, 6], "completion_mask": [0, 1, 1]},
         ],
-        data_collator=RecordingCollator(pad_token_id=0),
+        data_collator=DataCollatorForLanguageModeling(
+            pad_token_id=0,
+            completion_only_loss=False,
+        ),
         batch_size=1,
         max_seq_length=8,
         dataset_order="sequential",
     )[0]
 
-    assert seen == [{"input_ids": [4, 5, 6], "completion_mask": [0, 1, 1]}]
-    assert batch.tolist() == [[4, 5, 6]]
+    assert batch.tolist() == [[1, 2, 3]]
     assert lengths.tolist() == [[0, 3]]
-    assert labels.tolist() == [[-100, 5, 6]]
+    assert labels.tolist() == [[1, 2, 3]]
 
 
 def test_custom_text_collator_requires_labels():

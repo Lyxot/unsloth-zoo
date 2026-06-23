@@ -3691,15 +3691,8 @@ def _prepare_custom_collator_text_examples(dataset, max_seq_length):
                     value, max_seq_length,
                 )
         example["input_ids"] = _to_int_list(item["input_ids"])[:max_seq_length]
-        if not _labeled_text_row_has_supervised_targets(example):
-            continue
         examples.append(example)
 
-    if not examples:
-        raise ValueError(
-            "Unsloth MLX: custom data_collator dataset produced no "
-            "trainable token sequences."
-        )
     return examples
 
 
