@@ -665,7 +665,7 @@ def test_custom_text_collator_trims_masked_tail_after_truncation():
         data_collator=lambda _examples: {
             "input_ids": torch.tensor([[1, 2, 3, 99]]),
             "attention_mask": torch.tensor([[1, 1, 1, 0]]),
-            "labels": torch.tensor([[1, 2, 3, 99]]),
+            "labels": torch.tensor([[1, 2, 3, -100]]),
         },
         batch_size=1,
         max_seq_length=3,
@@ -675,6 +675,23 @@ def test_custom_text_collator_trims_masked_tail_after_truncation():
     assert batch.tolist() == [[1, 2, 3]]
     assert lengths.tolist() == [[0, 3]]
     assert labels.tolist() == [[1, 2, 3]]
+
+
+def test_custom_text_collator_rejects_masked_tail_labels():
+    from unsloth_zoo.mlx.utils import create_collated_text_batches
+
+    with pytest.raises(ValueError, match="attention_mask is 0"):
+        create_collated_text_batches(
+            [{"input_ids": [1, 2, 3]}],
+            data_collator=lambda _examples: {
+                "input_ids": torch.tensor([[1, 2, 3, 99]]),
+                "attention_mask": torch.tensor([[1, 1, 1, 0]]),
+                "labels": torch.tensor([[1, 2, 3, 99]]),
+            },
+            batch_size=1,
+            max_seq_length=3,
+            dataset_order="sequential",
+        )[0]
 
 
 def test_custom_text_collator_rejects_supervised_tail_without_mask():
@@ -710,24 +727,21 @@ def test_custom_text_collator_rejects_active_attention_tail():
         )[0]
 
 
-def test_custom_text_collator_masks_inactive_targets():
+def test_custom_text_collator_rejects_masked_active_targets():
     from unsloth_zoo.mlx.utils import create_collated_text_batches
 
-    batch, lengths, labels = create_collated_text_batches(
-        [{"input_ids": [1, 2, 3]}],
-        data_collator=lambda _examples: {
-            "input_ids": torch.tensor([[1, 2, 0]]),
-            "attention_mask": torch.tensor([[1, 1, 0]]),
-            "labels": torch.tensor([[1, 2, 0]]),
-        },
-        batch_size=1,
-        max_seq_length=8,
-        dataset_order="sequential",
-    )[0]
-
-    assert batch.tolist() == [[1, 2, 0]]
-    assert lengths.tolist() == [[0, 2]]
-    assert labels.tolist() == [[1, 2, -100]]
+    with pytest.raises(ValueError, match="attention_mask is 0"):
+        create_collated_text_batches(
+            [{"input_ids": [1, 2, 3]}],
+            data_collator=lambda _examples: {
+                "input_ids": torch.tensor([[1, 2, 0]]),
+                "attention_mask": torch.tensor([[1, 1, 0]]),
+                "labels": torch.tensor([[1, 2, 0]]),
+            },
+            batch_size=1,
+            max_seq_length=8,
+            dataset_order="sequential",
+        )[0]
 
 
 def test_custom_text_collator_rejects_1d_multi_example_outputs():
@@ -747,21 +761,24 @@ def test_custom_text_collator_rejects_1d_multi_example_outputs():
         )[0]
 
 
-def test_custom_text_collator_rejects_wrong_2d_batch_size():
+def test_custom_text_collator_accepts_filtered_output_batch_size():
     from unsloth_zoo.mlx.utils import create_collated_text_batches
 
-    with pytest.raises(ValueError, match="does not match the 2 selected examples"):
-        create_collated_text_batches(
-            [{"input_ids": [1, 2, 3]}, {"input_ids": [4, 5, 6]}],
-            data_collator=lambda _examples: {
-                "input_ids": torch.tensor([[1, 2, 3]]),
-                "attention_mask": torch.tensor([[1, 1, 1]]),
-                "labels": torch.tensor([[1, 2, 3]]),
-            },
-            batch_size=2,
-            max_seq_length=8,
-            dataset_order="sequential",
-        )[0]
+    batch, lengths, labels = create_collated_text_batches(
+        [{"input_ids": [1, 2, 3]}, {"input_ids": [4, 5, 6]}],
+        data_collator=lambda _examples: {
+            "input_ids": torch.tensor([[4, 5, 6]]),
+            "attention_mask": torch.tensor([[1, 1, 1]]),
+            "labels": torch.tensor([[4, 5, 6]]),
+        },
+        batch_size=2,
+        max_seq_length=8,
+        dataset_order="sequential",
+    )[0]
+
+    assert batch.tolist() == [[4, 5, 6]]
+    assert lengths.tolist() == [[0, 3]]
+    assert labels.tolist() == [[4, 5, 6]]
 
 
 @pytest.mark.parametrize(
@@ -772,14 +789,6 @@ def test_custom_text_collator_rejects_wrong_2d_batch_size():
             {
                 "input_ids": torch.tensor([[1.2, 2.0, 3.0]]),
                 "labels": torch.tensor([[1, 2, 3]]),
-            },
-        ),
-        (
-            "attention_mask",
-            {
-                "input_ids": torch.tensor([[1, 2, 3]]),
-                "attention_mask": torch.tensor([[1.0, 1.0, 0.0]]),
-                "labels": torch.tensor([[1, 2, -100]]),
             },
         ),
         (
@@ -798,6 +807,43 @@ def test_custom_text_collator_rejects_invalid_dtypes(field, output):
         create_collated_text_batches(
             [{"input_ids": [1, 2, 3]}],
             data_collator=lambda _examples: output,
+            batch_size=1,
+            max_seq_length=8,
+            dataset_order="sequential",
+        )[0]
+
+
+def test_custom_text_collator_accepts_float_attention_mask():
+    from unsloth_zoo.mlx.utils import create_collated_text_batches
+
+    batch, lengths, labels = create_collated_text_batches(
+        [{"input_ids": [1, 2, 3]}],
+        data_collator=lambda _examples: {
+            "input_ids": torch.tensor([[1, 2, 0]]),
+            "attention_mask": torch.tensor([[1.0, 1.0, 0.0]], dtype=torch.float32),
+            "labels": torch.tensor([[1, 2, -100]]),
+        },
+        batch_size=1,
+        max_seq_length=8,
+        dataset_order="sequential",
+    )[0]
+
+    assert batch.tolist() == [[1, 2, 0]]
+    assert lengths.tolist() == [[0, 2]]
+    assert labels.tolist() == [[1, 2, -100]]
+
+
+def test_custom_text_collator_rejects_non_binary_float_attention_mask():
+    from unsloth_zoo.mlx.utils import create_collated_text_batches
+
+    with pytest.raises(ValueError, match="0/1 values"):
+        create_collated_text_batches(
+            [{"input_ids": [1, 2, 3]}],
+            data_collator=lambda _examples: {
+                "input_ids": torch.tensor([[1, 2, 0]]),
+                "attention_mask": torch.tensor([[1.0, 0.5, 0.0]]),
+                "labels": torch.tensor([[1, 2, -100]]),
+            },
             batch_size=1,
             max_seq_length=8,
             dataset_order="sequential",
@@ -983,6 +1029,35 @@ def test_custom_text_collator_skips_none_sft_fields():
     assert batch.tolist() == [[1, 2, 3]]
     assert lengths.tolist() == [[0, 3]]
     assert labels.tolist() == [[1, 2, 3]]
+
+
+def test_custom_text_collator_filters_fully_masked_prepared_rows():
+    from trl.trainer.sft_trainer import DataCollatorForLanguageModeling
+
+    from unsloth_zoo.mlx.utils import create_collated_text_batches
+
+    seen = []
+
+    class RecordingCollator(DataCollatorForLanguageModeling):
+        def __call__(self, examples, *args, **kwargs):
+            seen.extend(examples)
+            return super().__call__(examples, *args, **kwargs)
+
+    batch, lengths, labels = create_collated_text_batches(
+        [
+            {"input_ids": [1, 2, 3], "completion_mask": [0, 0, 0]},
+            {"input_ids": [4, 5, 6], "completion_mask": [0, 1, 1]},
+        ],
+        data_collator=RecordingCollator(pad_token_id=0),
+        batch_size=1,
+        max_seq_length=8,
+        dataset_order="sequential",
+    )[0]
+
+    assert seen == [{"input_ids": [4, 5, 6], "completion_mask": [0, 1, 1]}]
+    assert batch.tolist() == [[4, 5, 6]]
+    assert lengths.tolist() == [[0, 3]]
+    assert labels.tolist() == [[-100, 5, 6]]
 
 
 def test_custom_text_collator_requires_labels():

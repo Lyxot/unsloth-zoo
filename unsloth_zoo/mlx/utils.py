@@ -3657,6 +3657,7 @@ _CUSTOM_COLLATOR_TEXT_COLUMNS = frozenset((
     "assistant_masks",
 ))
 
+
 def _prepare_custom_collator_text_examples(dataset, max_seq_length):
     """Keep/truncate CUDA SFT text columns before user collation.
 
@@ -3690,8 +3691,15 @@ def _prepare_custom_collator_text_examples(dataset, max_seq_length):
                     value, max_seq_length,
                 )
         example["input_ids"] = _to_int_list(item["input_ids"])[:max_seq_length]
+        if not _labeled_text_row_has_supervised_targets(example):
+            continue
         examples.append(example)
 
+    if not examples:
+        raise ValueError(
+            "Unsloth MLX: custom data_collator dataset produced no "
+            "trainable token sequences."
+        )
     return examples
 
 
@@ -3718,12 +3726,6 @@ def _collator_value_to_numpy(value, field, expected_batch_size=None):
             f"Unsloth MLX: custom data_collator field `{field}` must be a "
             f"1D or 2D tensor/array, got shape {array.shape}."
         )
-    if expected_batch_size is not None and array.shape[0] != expected_batch_size:
-        raise ValueError(
-            f"Unsloth MLX: custom data_collator field `{field}` batch size "
-            f"{array.shape[0]} does not match the {expected_batch_size} "
-            "selected examples."
-        )
     return array
 
 
@@ -3737,15 +3739,27 @@ def _require_collator_integer_dtype(array, field):
 
 
 def _require_collator_mask_dtype(array, field):
-    """Reject custom-collator masks that are not bool or integer arrays."""
+    """Accept bool, integer, or 0/1 float custom-collator masks."""
     if not (
         np.issubdtype(array.dtype, np.bool_)
         or np.issubdtype(array.dtype, np.integer)
+        or np.issubdtype(array.dtype, np.floating)
     ):
         raise ValueError(
             f"Unsloth MLX: custom data_collator field `{field}` must use "
-            f"a bool or integer dtype, got {array.dtype}."
+            f"a bool, integer, or floating dtype, got {array.dtype}."
         )
+    if np.issubdtype(array.dtype, np.floating):
+        if not np.all(np.isfinite(array)):
+            raise ValueError(
+                f"Unsloth MLX: custom data_collator field `{field}` must "
+                "contain finite values."
+            )
+        if not np.all((array == 0) | (array == 1)):
+            raise ValueError(
+                f"Unsloth MLX: custom data_collator field `{field}` must use "
+                "0/1 values when returned with a floating dtype."
+            )
 
 
 def _lengths_from_collator_attention(attention_mask):
@@ -3805,8 +3819,6 @@ def _trim_custom_collator_ignored_tail(
             "those tokens before returning the batch."
         )
     tail_labels = labels_np[:, max_seq_length:seq_len]
-    if attention_mask_np is not None:
-        tail_labels = np.where(tail_mask != 0, tail_labels, -100)
     if not np.all(tail_labels == -100):
         raise ValueError(
             "Unsloth MLX: custom data_collator returned supervised labels "
@@ -3818,6 +3830,18 @@ def _trim_custom_collator_ignored_tail(
     if attention_mask_np is not None:
         attention_mask_np = attention_mask_np[:, :max_seq_length]
     return input_ids_np, labels_np, attention_mask_np
+
+
+def _validate_custom_collator_masked_labels(labels_np, attention_mask_np):
+    """Require ignored attention positions to already use ignored labels."""
+    if attention_mask_np is None:
+        return
+    masked_labels = labels_np[attention_mask_np == 0]
+    if np.any(masked_labels != -100):
+        raise ValueError(
+            "Unsloth MLX: custom data_collator labels must be -100 wherever "
+            "attention_mask is 0."
+        )
 
 
 def _collator_output_to_text_batch(output, max_seq_length, expected_batch_size=None):
@@ -3863,11 +3887,10 @@ def _collator_output_to_text_batch(output, max_seq_length, expected_batch_size=N
                 f"{attention_mask_np.shape} does not match input_ids shape "
                 f"{input_ids_np.shape}."
             )
+    _validate_custom_collator_masked_labels(labels_np, attention_mask_np)
     input_ids_np, labels_np, attention_mask_np = _trim_custom_collator_ignored_tail(
         input_ids_np, labels_np, attention_mask_np, max_seq_length,
     )
-    if attention_mask_np is not None:
-        labels_np = np.where(attention_mask_np != 0, labels_np, -100)
     lengths_np = (
         _lengths_from_collator_attention(attention_mask_np)
         if attention_mask_np is not None
