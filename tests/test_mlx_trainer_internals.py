@@ -722,6 +722,23 @@ def test_custom_text_collator_rejects_1d_multi_example_outputs():
         )[0]
 
 
+def test_custom_text_collator_rejects_wrong_2d_batch_size():
+    from unsloth_zoo.mlx.utils import create_collated_text_batches
+
+    with pytest.raises(ValueError, match="does not match the 2 selected examples"):
+        create_collated_text_batches(
+            [{"input_ids": [1, 2, 3]}, {"input_ids": [4, 5, 6]}],
+            data_collator=lambda _examples: {
+                "input_ids": torch.tensor([[1, 2, 3]]),
+                "attention_mask": torch.tensor([[1, 1, 1]]),
+                "labels": torch.tensor([[1, 2, 3]]),
+            },
+            batch_size=2,
+            max_seq_length=8,
+            dataset_order="sequential",
+        )[0]
+
+
 @pytest.mark.parametrize("seed", [0, 7])
 def test_custom_text_collator_preserves_default_order(seed):
     from unsloth_zoo.mlx.utils import create_collated_text_batches

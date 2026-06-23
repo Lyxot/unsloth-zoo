@@ -3715,6 +3715,12 @@ def _collator_value_to_numpy(value, field, expected_batch_size=None):
             f"Unsloth MLX: custom data_collator field `{field}` must be a "
             f"1D or 2D tensor/array, got shape {array.shape}."
         )
+    if expected_batch_size is not None and array.shape[0] != expected_batch_size:
+        raise ValueError(
+            f"Unsloth MLX: custom data_collator field `{field}` batch size "
+            f"{array.shape[0]} does not match the {expected_batch_size} "
+            "selected examples."
+        )
     return array
 
 
