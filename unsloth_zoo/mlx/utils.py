@@ -3805,6 +3805,8 @@ def _trim_custom_collator_ignored_tail(
             "those tokens before returning the batch."
         )
     tail_labels = labels_np[:, max_seq_length:seq_len]
+    if attention_mask_np is not None:
+        tail_labels = np.where(tail_mask != 0, tail_labels, -100)
     if not np.all(tail_labels == -100):
         raise ValueError(
             "Unsloth MLX: custom data_collator returned supervised labels "
