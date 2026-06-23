@@ -3665,7 +3665,11 @@ _CUSTOM_COLLATOR_OUTPUT_KEYS = frozenset((
 
 
 def _prepare_custom_collator_text_examples(dataset, max_seq_length):
-    """Prepare tokenized text examples before user collation."""
+    """Keep/truncate CUDA SFT text columns before user collation.
+
+    Only ``input_ids``, ``labels``, ``completion_mask``, and
+    ``assistant_masks`` are forwarded; other dataset columns are dropped.
+    """
     first_item, replay_dataset = _peek_dataset(dataset)
     if not isinstance(first_item, Mapping) or first_item.get("input_ids") is None:
         raise ValueError(
