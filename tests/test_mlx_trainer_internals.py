@@ -691,21 +691,24 @@ def test_custom_text_collator_rejects_active_attention_tail():
         )[0]
 
 
-def test_custom_text_collator_rejects_masked_supervised_targets():
+def test_custom_text_collator_ignores_masked_supervised_targets():
     from unsloth_zoo.mlx.utils import create_collated_text_batches
 
-    with pytest.raises(ValueError, match="shifted attention_mask is 0"):
-        create_collated_text_batches(
-            [{"input_ids": [1, 2, 3]}],
-            data_collator=lambda _examples: {
-                "input_ids": torch.tensor([[1, 2, 0]]),
-                "attention_mask": torch.tensor([[1, 1, 0]]),
-                "labels": torch.tensor([[1, 2, 0]]),
-            },
-            batch_size=1,
-            max_seq_length=8,
-            dataset_order="sequential",
-        )[0]
+    batch, lengths, labels = create_collated_text_batches(
+        [{"input_ids": [1, 2, 3]}],
+        data_collator=lambda _examples: {
+            "input_ids": torch.tensor([[1, 2, 0]]),
+            "attention_mask": torch.tensor([[1, 1, 0]]),
+            "labels": torch.tensor([[1, 2, 0]]),
+        },
+        batch_size=1,
+        max_seq_length=8,
+        dataset_order="sequential",
+    )[0]
+
+    assert batch.tolist() == [[1, 2, 0]]
+    assert lengths.tolist() == [[0, 2]]
+    assert labels.tolist() == [[1, 2, 0]]
 
 
 def test_custom_text_collator_rejects_1d_multi_example_outputs():
@@ -771,7 +774,7 @@ def test_custom_text_collator_preserves_default_order(seed):
 
     rows = [
         {"input_ids": [length] * length}
-        for length in [7, 2, 6, 3, 5, 4, 8]
+        for length in [7, 2, 6, 3, 5, 4]
     ]
     list(create_collated_text_batches(
         rows,
@@ -782,30 +785,10 @@ def test_custom_text_collator_preserves_default_order(seed):
         dataset_order="default",
     ))
 
-    sorted_lengths = [2, 3, 4, 5, 6, 7, 8]
+    sorted_lengths = [2, 3, 4, 5, 6, 7]
     groups = [sorted_lengths[i:i + 2] for i in range(0, len(sorted_lengths), 2)]
     expected = [groups[i] for i in np.random.RandomState(seed).permutation(len(groups))]
     assert observed == expected
-    assert sorted(len(batch) for batch in observed) == [1, 2, 2, 2]
-
-
-def test_custom_text_collator_negative_index_bounds():
-    from unsloth_zoo.mlx.utils import create_collated_text_batches
-
-    batches = create_collated_text_batches(
-        [{"input_ids": [1, 2, 3]}],
-        data_collator=lambda _examples: {
-            "input_ids": torch.tensor([[1, 2, 3]]),
-            "labels": torch.tensor([[1, 2, 3]]),
-        },
-        batch_size=1,
-        max_seq_length=8,
-        dataset_order="sequential",
-    )
-
-    assert batches[-1][0].tolist() == [[1, 2, 3]]
-    with pytest.raises(IndexError):
-        batches[-2]
 
 
 def test_mlx_trainer_routes_tokenized_text_data_collator(monkeypatch):
@@ -994,21 +977,24 @@ def test_custom_text_collator_rejects_position_ids_outputs():
         )[0]
 
 
-def test_custom_text_collator_rejects_unsupported_output_keys():
+def test_custom_text_collator_ignores_extra_output_keys():
     from unsloth_zoo.mlx.utils import create_collated_text_batches
 
-    with pytest.raises(ValueError, match="unsupported output key"):
-        create_collated_text_batches(
-            [{"input_ids": [1, 2, 3]}],
-            data_collator=lambda _examples: {
-                "input_ids": torch.tensor([[1, 2, 3]]),
-                "labels": torch.tensor([[1, 2, 3]]),
-                "token_type_ids": torch.tensor([[0, 0, 1]]),
-            },
-            batch_size=1,
-            max_seq_length=8,
-            dataset_order="sequential",
-        )[0]
+    batch, lengths, labels = create_collated_text_batches(
+        [{"input_ids": [1, 2, 3]}],
+        data_collator=lambda _examples: {
+            "input_ids": torch.tensor([[1, 2, 3]]),
+            "labels": torch.tensor([[1, 2, 3]]),
+            "token_type_ids": torch.tensor([[0, 0, 1]]),
+        },
+        batch_size=1,
+        max_seq_length=8,
+        dataset_order="sequential",
+    )[0]
+
+    assert batch.tolist() == [[1, 2, 3]]
+    assert lengths.tolist() == [[0, 3]]
+    assert labels.tolist() == [[1, 2, 3]]
 
 
 def test_custom_text_collator_rejects_packed_examples():

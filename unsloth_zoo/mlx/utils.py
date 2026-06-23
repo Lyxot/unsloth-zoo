@@ -3657,13 +3657,6 @@ _CUSTOM_COLLATOR_TEXT_COLUMNS = frozenset((
     "assistant_masks",
 ))
 
-_CUSTOM_COLLATOR_OUTPUT_KEYS = frozenset((
-    "input_ids",
-    "labels",
-    "attention_mask",
-))
-
-
 def _prepare_custom_collator_text_examples(dataset, max_seq_length):
     """Keep/truncate CUDA SFT text columns before user collation.
 
@@ -3760,16 +3753,8 @@ def _full_collator_lengths(input_ids_np):
     )
 
 
-def _validate_custom_collator_targets(labels_np, lengths_np, attention_mask_np=None):
+def _validate_custom_collator_targets(labels_np, lengths_np):
     """Validate custom-collator labels after causal shifting."""
-    if attention_mask_np is not None:
-        masked_targets = (attention_mask_np[:, 1:] == 0) & (labels_np[:, 1:] != -100)
-        if np.any(masked_targets):
-            raise ValueError(
-                "Unsloth MLX: custom data_collator labels must be -100 "
-                "wherever the shifted attention_mask is 0."
-            )
-
     targets = labels_np[:, 1:]
     steps = np.arange(1, labels_np.shape[1], dtype=np.int32)
     length_mask = (
@@ -3824,14 +3809,6 @@ def _collator_output_to_text_batch(output, max_seq_length, expected_batch_size=N
             "Unsloth MLX: custom data_collator outputs with `position_ids` "
             "or `seq_lengths` are not supported yet."
         )
-    unsupported_keys = set(output.keys()) - _CUSTOM_COLLATOR_OUTPUT_KEYS
-    if unsupported_keys:
-        unsupported = ", ".join(f"`{key}`" for key in sorted(unsupported_keys))
-        raise ValueError(
-            "Unsloth MLX: custom data_collator returned unsupported output "
-            f"key(s): {unsupported}. Supported output keys are `input_ids`, "
-            "`labels`, and `attention_mask`."
-        )
     input_ids_np = _collator_value_to_numpy(
         output["input_ids"], "input_ids",
         expected_batch_size=expected_batch_size,
@@ -3868,7 +3845,7 @@ def _collator_output_to_text_batch(output, max_seq_length, expected_batch_size=N
         if attention_mask_np is not None
         else _full_collator_lengths(input_ids_np)
     )
-    _validate_custom_collator_targets(labels_np, lengths_np, attention_mask_np)
+    _validate_custom_collator_targets(labels_np, lengths_np)
     labels = _normalize_cce_label_dtype(mx.array(labels_np))
 
     return (
@@ -3928,7 +3905,6 @@ def create_collated_text_batches(
         seed=seed,
         dataset_order=dataset_order,
         num_epochs=target_epochs,
-        drop_last_default=False,
     ):
         chunks.append(list(chunk))
         if num_batches is not None and len(chunks) >= num_batches:
@@ -4172,7 +4148,6 @@ def _iter_text_index_chunks(
     seed,
     dataset_order,
     num_epochs=None,
-    drop_last_default=True,
 ):
     """Yield text batch index chunks using mlx-lm/default or explicit ordering."""
     if dataset_order not in (None, "default", "sequential", "torch_randperm"):
@@ -4187,10 +4162,9 @@ def _iter_text_index_chunks(
     while num_epochs is None or epoch < int(num_epochs):
         if dataset_order in (None, "default"):
             ordered = sorted(range(length), key=lambda idx: _text_item_length(items[idx]))
-            stop = length - batch_size + 1 if drop_last_default else length
             chunks = [
                 ordered[start:start + batch_size]
-                for start in range(0, stop, batch_size)
+                for start in range(0, length - batch_size + 1, batch_size)
             ]
             if not chunks:
                 raise ValueError(
