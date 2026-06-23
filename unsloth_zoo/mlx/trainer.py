@@ -2615,7 +2615,7 @@ def train_on_responses_only(
     """Mask instruction tokens from loss — train only on assistant responses.
 
     Call after MLXTrainer(...), before trainer.train(). Works for text and
-    VLM models; mirrors the HF/unsloth API.
+    VLM models without custom data_collator; mirrors the HF/unsloth API.
 
     Args:
         trainer: MLXTrainer (may be None when return_function=True and a

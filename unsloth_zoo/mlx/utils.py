@@ -3749,28 +3749,30 @@ def _lengths_from_collator_attention(attention_mask, batch_size, seq_len):
     return np.asarray(lengths, dtype=np.int32)
 
 
-def _custom_collator_labels_have_targets(labels_np, lengths_np):
-    """Return whether shifted labels contain at least one supervised token."""
+def _validate_custom_collator_shifted_targets(labels_np, lengths_np, attention_mask_np=None):
+    """Validate shifted custom-collator labels against mask and target rules."""
     if labels_np.shape[1] <= 1:
-        return False
+        raise ValueError(
+            "Unsloth MLX: custom data_collator produced a batch with no "
+            "supervised target tokens."
+        )
+    if attention_mask_np is not None:
+        masked_targets = (attention_mask_np[:, 1:] == 0) & (labels_np[:, 1:] != -100)
+        if np.any(masked_targets):
+            raise ValueError(
+                "Unsloth MLX: custom data_collator labels must be -100 wherever "
+                "the shifted attention_mask is 0."
+            )
     targets = labels_np[:, 1:]
     steps = np.arange(1, labels_np.shape[1], dtype=np.int32)
     length_mask = (
         (steps[None, :] >= lengths_np[:, 0:1])
         & (steps[None, :] < lengths_np[:, 1:2])
     )
-    return bool(np.any((targets != -100) & length_mask))
-
-
-def _validate_custom_collator_masked_labels(labels_np, attention_mask_np):
-    """Reject supervised shifted targets outside the attention mask."""
-    if labels_np.shape[1] <= 1:
-        return
-    masked_targets = (attention_mask_np[:, 1:] == 0) & (labels_np[:, 1:] != -100)
-    if np.any(masked_targets):
+    if not bool(np.any((targets != -100) & length_mask)):
         raise ValueError(
-            "Unsloth MLX: custom data_collator labels must be -100 wherever "
-            "the shifted attention_mask is 0."
+            "Unsloth MLX: custom data_collator produced a batch with no "
+            "supervised target tokens."
         )
 
 
@@ -3869,13 +3871,9 @@ def _collator_output_to_text_batch(output, max_seq_length, expected_batch_size=N
     lengths_np = _lengths_from_collator_attention(
         attention_mask_np, batch_size, seq_len,
     )
-    if attention_mask_np is not None:
-        _validate_custom_collator_masked_labels(labels_np, attention_mask_np)
-    if not _custom_collator_labels_have_targets(labels_np, lengths_np):
-        raise ValueError(
-            "Unsloth MLX: custom data_collator produced a batch with no "
-            "supervised target tokens."
-        )
+    _validate_custom_collator_shifted_targets(
+        labels_np, lengths_np, attention_mask_np,
+    )
     labels = _normalize_cce_label_dtype(mx.array(labels_np))
 
     return (
@@ -3922,7 +3920,7 @@ def create_collated_text_batches(
     dataset_order="default",
     num_epochs=None,
 ):
-    """Create lazy text batches that run the user collator on access.
+    """Create text batches that call the user collator on batch access.
 
     Input examples are pruned to SFTTrainer's default text signature columns
     before the collator runs.
