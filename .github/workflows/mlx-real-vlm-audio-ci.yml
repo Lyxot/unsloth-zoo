@@ -4,8 +4,6 @@
 name: MLX Real VLM and Audio Smoke
 
 on:
-  push:
-    branches: [ci/gemma4-vlm-real-smoke]
   pull_request:
     types: [opened, synchronize, reopened]
   workflow_dispatch:
