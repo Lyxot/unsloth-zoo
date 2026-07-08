@@ -22,6 +22,7 @@ No GPU deps: uses mlx-lm (text) and mlx-vlm (VLM) instead of unsloth.models
 
 import gc
 import json
+import functools
 import importlib
 import inspect
 import math
@@ -66,6 +67,7 @@ import threading
 _HF_TOKEN_ENV_LOCK = threading.RLock()
 _LOAD_WEIGHTS_PATCH_LOCK = threading.RLock()
 _PROCESSOR_COMPONENT_PATCH_LOCK = threading.RLock()
+_MLX_VLM_INPUTS_PATCH_LOCK = threading.RLock()
 _STANDARD_TOKEN_KWARGS = {
     "bos_token",
     "eos_token",
@@ -1413,6 +1415,144 @@ def _repair_degraded_vlm_processor(
         repaired.chat_template = chat_template
     _copy_vlm_processor_runtime_attrs(processor, repaired)
     return repaired
+
+
+def _is_processor_return_tensors_backend_error(exc):
+    message = str(exc).lower()
+    return (
+        "only returning pytorch tensors" in message
+        or "only returning pytorch tensor" in message
+        or "unsupported return_tensors" in message
+        or "unsupported return tensor" in message
+    )
+
+
+def _ensure_mlx_vlm_input_tensor_compat():
+    """Patch mlx-vlm input prep for processors that only emit torch tensors."""
+    with _MLX_VLM_INPUTS_PATCH_LOCK:
+        try:
+            import contextvars
+            import mlx_vlm.utils as vlm_utils
+        except Exception:
+            return
+
+        current = getattr(vlm_utils, "process_inputs_with_fallback", None)
+        if getattr(current, "_unsloth_tensor_compat_patched", False):
+            return
+
+        original_process_inputs = getattr(vlm_utils, "process_inputs", None)
+        original_process_inputs_with_fallback = current
+        original_prepare_inputs = getattr(vlm_utils, "prepare_inputs", None)
+        if (
+            original_process_inputs is None
+            or original_process_inputs_with_fallback is None
+            or original_prepare_inputs is None
+        ):
+            return
+
+        requested_return_tensors = contextvars.ContextVar(
+            "unsloth_mlx_vlm_requested_return_tensors",
+            default=None,
+        )
+
+        def patched_process_inputs_with_fallback(
+            processor,
+            prompts,
+            images,
+            audio,
+            add_special_tokens=False,
+            return_tensors="mlx",
+            **kwargs,
+        ):
+            requested = requested_return_tensors.get()
+            if requested is not None and return_tensors == "mlx":
+                return_tensors = requested
+            try:
+                return original_process_inputs(
+                    processor,
+                    prompts=prompts,
+                    images=images,
+                    audio=audio,
+                    add_special_tokens=add_special_tokens,
+                    return_tensors=return_tensors,
+                    **kwargs,
+                )
+            except Exception as exc:
+                if (
+                    return_tensors != "pt"
+                    and _is_processor_return_tensors_backend_error(exc)
+                ):
+                    try:
+                        return original_process_inputs(
+                            processor,
+                            prompts=prompts,
+                            images=images,
+                            audio=audio,
+                            add_special_tokens=add_special_tokens,
+                            return_tensors="pt",
+                            **kwargs,
+                        )
+                    except Exception as retry_exc:
+                        raise ValueError(
+                            f"Failed to process inputs with error: {retry_exc}"
+                        ) from retry_exc
+                raise ValueError(
+                    f"Failed to process inputs with error: {exc}"
+                ) from exc
+
+        original_prepare_inputs_signature = inspect.signature(original_prepare_inputs)
+
+        def _prepare_inputs_return_tensors(args, kwargs):
+            if "return_tensors" in kwargs:
+                return kwargs["return_tensors"]
+            try:
+                bound = original_prepare_inputs_signature.bind_partial(
+                    *args, **kwargs
+                )
+            except TypeError:
+                return None
+            if "return_tensors" in bound.arguments:
+                return bound.arguments["return_tensors"]
+            param = original_prepare_inputs_signature.parameters.get(
+                "return_tensors"
+            )
+            if param is not None and param.default is not inspect._empty:
+                return param.default
+            return None
+
+        @functools.wraps(original_prepare_inputs)
+        def patched_prepare_inputs(*args, **kwargs):
+            return_tensors = _prepare_inputs_return_tensors(args, kwargs)
+            token = requested_return_tensors.set(return_tensors)
+            try:
+                return original_prepare_inputs(*args, **kwargs)
+            finally:
+                requested_return_tensors.reset(token)
+
+        patched_process_inputs_with_fallback._unsloth_tensor_compat_patched = True
+        patched_process_inputs_with_fallback._unsloth_original = (
+            original_process_inputs_with_fallback
+        )
+        patched_prepare_inputs._unsloth_tensor_compat_patched = True
+        patched_prepare_inputs._unsloth_original = original_prepare_inputs
+        patched_prepare_inputs.__signature__ = original_prepare_inputs_signature
+
+        vlm_utils.process_inputs_with_fallback = patched_process_inputs_with_fallback
+        vlm_utils.prepare_inputs = patched_prepare_inputs
+
+        for module_name, module in tuple(sys.modules.items()):
+            if module is None or not str(module_name).startswith("mlx_vlm"):
+                continue
+            if getattr(module, "prepare_inputs", None) is original_prepare_inputs:
+                module.prepare_inputs = patched_prepare_inputs
+            if (
+                hasattr(module, "process_inputs_with_fallback")
+                and getattr(module, "process_inputs_with_fallback", None)
+                is original_process_inputs_with_fallback
+            ):
+                module.process_inputs_with_fallback = (
+                    patched_process_inputs_with_fallback
+                )
 
 
 def _build_vlm_model_types():
@@ -5885,6 +6025,7 @@ class FastMLXModel:
             if patch_mode == "patched":
                 install_mlx_compile_patches()
             _ensure_vlm_prompt_utils_patched()
+            _ensure_mlx_vlm_input_tensor_compat()
             _ensure_audio_conv_sanitize(model_type)
 
             quant_state = _ensure_quantization_compatible(

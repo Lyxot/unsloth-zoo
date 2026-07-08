@@ -11,7 +11,10 @@ if "mlx_simulation" in str(getattr(mx, "__file__", "")):
 
 
 class _FakeTokenizer:
+    pad_token = "<pad>"
+    eos_token = "</s>"
     pad_token_id = 0
+    eos_token_id = 2
     unk_token_id = -1
     image_token = "<image>"
 
@@ -86,6 +89,49 @@ class _VisionFeatureProcessor:
             "pixel_values": np.ones((len(text), 2), dtype=np.float32),
             "image_grid_thw": np.ones((len(text), 3), dtype=np.int32),
         }
+
+
+class _TorchOnlyTensorProcessor:
+    __module__ = "mlx_vlm.models.qwen3_vl.processing_qwen3_vl"
+
+    tokenizer = _FakeTokenizer()
+    image_processor = object()
+    chat_template = "{{ messages }}"
+
+    def __init__(self):
+        self.calls = []
+        self.images_seen = []
+        self.audio_seen = []
+        self.kwargs_seen = []
+
+    def __call__(self, text, images=None, audio=None, return_tensors=None, **_kwargs):
+        self.calls.append(return_tensors)
+        self.images_seen.append(images)
+        self.audio_seen.append(audio)
+        self.kwargs_seen.append(dict(_kwargs))
+        if return_tensors != "pt":
+            raise ValueError("Only returning PyTorch tensors is currently supported.")
+        torch = pytest.importorskip("torch")
+        output = {
+            "input_ids": torch.tensor([[101, 200, 102]], dtype=torch.long),
+            "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
+            "pixel_values": torch.ones((1, 2), dtype=torch.float32),
+            "image_grid_thw": torch.ones((1, 3), dtype=torch.long),
+        }
+        if _kwargs.get("return_mm_token_type_ids"):
+            output["mm_token_type_ids"] = torch.tensor([[0, 1, 0]], dtype=torch.long)
+        return output
+
+
+class _TorchOnlyAudiosTensorProcessor(_TorchOnlyTensorProcessor):
+    def __call__(self, text, images=None, audios=None, return_tensors=None, **_kwargs):
+        return super().__call__(
+            text,
+            images=images,
+            audio=audios,
+            return_tensors=return_tensors,
+            **_kwargs,
+        )
 
 
 class _PromptCompletionProcessor:
@@ -188,6 +234,147 @@ def test_vlm_collate_creates_sft_labels_and_masks_special_tokens():
         [101, 10, -100, 11, -100],
         [101, 12, 13, -100, -100],
     ]
+
+
+def test_vlm_processor_inputs_retry_torch_only_tensor_processors():
+    from unsloth_zoo.mlx.utils import _processor_vlm_inputs, _to_mx_vlm_batch
+
+    processor = _TorchOnlyTensorProcessor()
+    inputs = _processor_vlm_inputs(
+        processor,
+        ["<image><image>\nWhat is this?"],
+        [["image-a", "image-b"]],
+        max_seq_length=16,
+    )
+    batch = _to_mx_vlm_batch(inputs)
+
+    assert processor.calls == ["np", "pt"]
+    assert processor.images_seen == [["image-a", "image-b"], ["image-a", "image-b"]]
+    assert [
+        kwargs.get("return_mm_token_type_ids")
+        for kwargs in processor.kwargs_seen
+    ] == [True, True]
+    assert batch["input_ids"].tolist() == [[101, 200, 102]]
+    assert batch["mm_token_type_ids"].tolist() == [[0, 1, 0]]
+    assert batch["pixel_values"].shape == (1, 2)
+    assert batch["image_grid_thw"].shape == (1, 3)
+
+
+def test_mlx_vlm_prepare_inputs_patch_forwards_and_fallbacks_tensor_backend(tmp_path):
+    from PIL import Image
+    import importlib
+    import inspect
+    import wave
+
+    from unsloth_zoo.mlx.loader import _ensure_mlx_vlm_input_tensor_compat
+
+    vlm_utils = importlib.import_module("mlx_vlm.utils")
+    vlm_generate = importlib.import_module("mlx_vlm.generate")
+    try:
+        vlm_video_generate = importlib.import_module("mlx_vlm.video_generate")
+    except ImportError:
+        vlm_video_generate = None
+    if not hasattr(vlm_utils, "prepare_inputs"):
+        pytest.skip("requires real mlx_vlm.prepare_inputs, not the MLX test shim")
+    _ensure_mlx_vlm_input_tensor_compat()
+
+    processor = _TorchOnlyTensorProcessor()
+    image = Image.new("RGB", (16, 16), color=(10, 20, 30))
+    original_prepare = getattr(vlm_utils.prepare_inputs, "_unsloth_original", None)
+    positional_values = {
+        "processor": processor,
+        "images": [image],
+        "audio": None,
+        "videos": None,
+        "prompts": ["<image>\nWhat is this?"],
+        "image_token_index": None,
+        "resize_shape": None,
+        "add_special_tokens": False,
+        "padding": True,
+        "padding_side": "left",
+        "pad_to_uniform_size": False,
+        "return_tensors": "pt",
+    }
+    positional_args = [
+        positional_values[name]
+        for name in inspect.signature(original_prepare).parameters
+        if name in positional_values
+    ]
+    inputs = vlm_utils.prepare_inputs(*positional_args)
+
+    assert processor.calls == ["pt"]
+    assert inputs["input_ids"].tolist() == [[101, 200, 102]]
+
+    processor = _TorchOnlyTensorProcessor()
+    inputs = vlm_utils.prepare_inputs(
+        processor,
+        images=[image],
+        prompts=["<image>\nWhat is this?"],
+        return_tensors="pt",
+    )
+
+    assert processor.calls == ["pt"]
+    assert inputs["input_ids"].tolist() == [[101, 200, 102]]
+    assert inputs["pixel_values"].shape == (1, 2)
+    assert getattr(vlm_generate, "prepare_inputs", None) is vlm_utils.prepare_inputs
+    if vlm_video_generate is not None and hasattr(
+        vlm_video_generate, "process_inputs_with_fallback"
+    ):
+        assert (
+            vlm_video_generate.process_inputs_with_fallback
+            is vlm_utils.process_inputs_with_fallback
+        )
+
+    processor = _TorchOnlyTensorProcessor()
+    inputs = vlm_utils.prepare_inputs(
+        processor,
+        images=[image],
+        prompts=["<image>\nWhat is this?"],
+        return_tensors="mlx",
+    )
+
+    assert processor.calls == ["mlx", "pt"]
+    assert processor.images_seen == [[image], [image]]
+    assert inputs["image_grid_thw"].shape == (1, 3)
+
+    processor = _TorchOnlyTensorProcessor()
+    audio_inputs = vlm_utils.process_inputs_with_fallback(
+        processor,
+        prompts=["Transcribe this."],
+        images=None,
+        audio=["audio"],
+        return_tensors="mlx",
+    )
+
+    assert processor.calls == ["mlx", "pt"]
+    assert processor.audio_seen == [["audio"], ["audio"]]
+    assert audio_inputs["input_ids"].shape == (1, 3)
+
+    audio_path = tmp_path / "audio.wav"
+    with wave.open(str(audio_path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(np.zeros(160, dtype=np.int16).tobytes())
+    processor = _TorchOnlyTensorProcessor()
+    vlm_utils.prepare_inputs(
+        processor,
+        audio=[str(audio_path)],
+        prompts=["Transcribe this."],
+        return_tensors="mlx",
+    )
+    assert processor.calls == ["mlx", "pt"]
+    assert len(processor.audio_seen[0]) == 1
+
+    processor = _TorchOnlyAudiosTensorProcessor()
+    vlm_utils.process_inputs_with_fallback(
+        processor,
+        prompts=["Transcribe this."],
+        images=None,
+        audio=["audio"],
+        return_tensors="mlx",
+    )
+    assert processor.audio_seen == [["audio"], ["audio"]]
 
 
 def test_vlm_response_mask_reapplies_special_token_masks():

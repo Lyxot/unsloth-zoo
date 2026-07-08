@@ -3696,6 +3696,30 @@ def _to_mx_vlm_batch(inputs):
     return batch
 
 
+def _is_processor_return_tensors_backend_error(exc):
+    message = str(exc).lower()
+    return (
+        "only returning pytorch tensors" in message
+        or "only returning pytorch tensor" in message
+        or "unsupported return_tensors" in message
+        or "unsupported return tensor" in message
+    )
+
+
+def _call_vlm_processor_with_tensor_fallback(processor, proc_kwargs):
+    try:
+        return processor(**proc_kwargs)
+    except Exception as exc:
+        if (
+            proc_kwargs.get("return_tensors") != "pt"
+            and _is_processor_return_tensors_backend_error(exc)
+        ):
+            retry_kwargs = dict(proc_kwargs)
+            retry_kwargs["return_tensors"] = "pt"
+            return processor(**retry_kwargs)
+        raise
+
+
 def _processor_vlm_inputs(
     processor,
     texts,
@@ -3747,7 +3771,9 @@ def _processor_vlm_inputs(
                 image_layout=image_layout,
             )
         try:
-            return processor(**proc_kwargs)
+            return _call_vlm_processor_with_tensor_fallback(
+                processor, proc_kwargs
+            )
         except TypeError as exc:
             if (
                 "add_special_tokens" in str(exc)
@@ -3756,7 +3782,9 @@ def _processor_vlm_inputs(
             ):
                 proc_kwargs.pop("add_special_tokens", None)
                 try:
-                    return processor(**proc_kwargs)
+                    return _call_vlm_processor_with_tensor_fallback(
+                        processor, proc_kwargs
+                    )
                 except Exception as retry_exc:
                     if first_error is None:
                         first_error = retry_exc
@@ -3766,7 +3794,9 @@ def _processor_vlm_inputs(
             if "padding_side" in str(exc) and "padding_side" in proc_kwargs:
                 proc_kwargs.pop("padding_side", None)
                 try:
-                    return processor(**proc_kwargs)
+                    return _call_vlm_processor_with_tensor_fallback(
+                        processor, proc_kwargs
+                    )
                 except Exception as retry_exc:
                     if first_error is None:
                         first_error = retry_exc
