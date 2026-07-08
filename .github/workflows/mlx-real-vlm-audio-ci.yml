@@ -91,7 +91,7 @@ jobs:
             large_models: "true"
     env:
       HF_HUB_DISABLE_XET: "1"
-      HF_HOME: ${{ runner.temp }}/hf-${{ matrix.shard }}
+      HF_HOME: /tmp/unsloth-hf-${{ matrix.shard }}
       PIP_NO_CACHE_DIR: "1"
       TOKENIZERS_PARALLELISM: "false"
       UNSLOTH_MLX_REAL_SHARD: ${{ matrix.shard }}
