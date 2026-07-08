@@ -20,10 +20,6 @@ permissions:
 jobs:
   real-vlm-audio:
     name: Real MLX VLM/audio chat (${{ matrix.shard }})
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.head_ref == 'ci/gemma4-vlm-real-smoke' ||
-      github.ref_name == 'ci/gemma4-vlm-real-smoke'
     runs-on: macos-14
     timeout-minutes: 180
     strategy:
