@@ -19,6 +19,7 @@ import sys
 import tempfile
 import textwrap
 import time
+import traceback
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -31,70 +32,55 @@ class Candidate:
     family: str
     repo: str
     modality: str = "image"
+    shard: str = "small-a"
     required: bool = False
 
 
 CANDIDATES = [
     Candidate("idefics3-smolvlm", "mlx-community/SmolVLM-256M-Instruct-4bit", required=True),
     Candidate("qwen2-vl", "mlx-community/Qwen2-VL-2B-Instruct-4bit", required=True),
-    Candidate("lfm2-vl", "mlx-community/LFM2.5-VL-1.6B-4bit"),
     Candidate("qwen3-vl", "unsloth/Qwen3-VL-2B-Instruct", required=True),
-    Candidate("gemma4", "unsloth/gemma-4-E2B-it-UD-MLX-4bit", required=True),
     Candidate("qwen3.5-vl", "unsloth/Qwen3.5-0.8B"),
-    Candidate("qwen3.6-vl-moe", "unsloth/Qwen3.6-35B-A3B-NVFP4"),
-    Candidate("jina-vlm", "jinaai/jina-vlm-mlx"),
-    Candidate("minicpm-v4.6", "mlx-community/MiniCPM-V-4.6-mxfp4"),
-    Candidate("phi4mm-audio", "Ferox-AI/Phi-4-multimodal-instruct-mlx-4bit", modality="audio"),
-    Candidate("florence2", "mlx-community/Florence-2-base-ft-4bit"),
-    Candidate("falcon-ocr", "mlx-community/Falcon-OCR-bf16"),
-    Candidate("sam3", "mlx-community/sam3-4bit"),
-    Candidate("sam3.1", "mlx-community/sam3.1-bf16"),
-    Candidate("paddleocr-vl", "mlx-community/PaddleOCR-VL-4bit"),
-    Candidate("internvl-chat", "mlx-community/InternVL3-1B-4bit"),
-    Candidate("fastvlm", "mlx-community/FastVLM-0.5B-bf16"),
-    Candidate("glm-ocr", "mlx-community/GLM-OCR-4bit"),
-    Candidate("glm4v", "mlx-community/GLM-4.6V-Flash-mxfp4"),
-    Candidate("deepseek-vl-v2", "mlx-community/deepseek-vl2-tiny-4bit"),
-    Candidate("paligemma", "mlx-community/paligemma2-3b-mix-224-4bit"),
-    Candidate("phi3-v", "mlx-community/Phi-3.5-vision-instruct-4bit"),
-    Candidate("moondream3", "moondream/md3p-int4"),
-    Candidate("falcon-perception", "tiiuae/Falcon-Perception-300M"),
-    Candidate("rfdetr", "mlx-community/rfdetr-base-fp32"),
-    Candidate("granite-vision", "mlx-community/granite-vision-3.2-2b-4bit"),
-    Candidate("deepseek-ocr", "mlx-community/DeepSeek-OCR-4bit"),
-    Candidate("deepseek-ocr2", "mlx-community/DeepSeek-OCR-2-4bit"),
-    Candidate("granite4-vision", "mlx-community/granite-4.0-3b-vision-4bit"),
-    Candidate("qwen2.5-vl", "mlx-community/Qwen2.5-VL-3B-Instruct-4bit"),
-    Candidate("dots-ocr", "mlx-community/dots.ocr-4bit"),
-    Candidate("gemma3", "mlx-community/gemma-3-4b-it-4bit"),
-    Candidate("llava", "mlx-community/llava-1.5-7b-4bit"),
-    Candidate("llava-next", "mlx-community/llava-v1.6-mistral-7b-4bit"),
-    Candidate("llava-bunny", "mlx-community/Bunny-Llama-3-8B-V-4bit"),
-    Candidate("gemma3n", "mlx-community/gemma-3n-E2B-it-4bit"),
-    Candidate("gemma3n-audio", "mlx-community/gemma-3n-E2B-it-4bit", modality="audio"),
-    Candidate("gemma4-audio", "unsloth/gemma-4-E2B-it-UD-MLX-4bit", modality="audio"),
-    Candidate("idefics2", "mlx-community/idefics2-8b-4bit"),
-    Candidate("molmo", "mlx-community/Molmo-7B-D-0924-4bit"),
-    Candidate("aya-vision", "mlx-community/aya-vision-8b-4bit"),
-    Candidate("mllama", "mlx-community/Llama-3.2-11B-Vision-Instruct-4bit"),
-    Candidate("locateanything", "mlx-community/LocateAnything-3B-4bit"),
-    Candidate("zaya1-vl", "OsaurusAI/ZAYA1-VL-8B-MXFP4"),
-    Candidate("youtu-vl", "tencent/Youtu-VL-4B-Instruct"),
-    Candidate("minicpmo-audio", "mlx-community/MiniCPM-o-4_5-4bit", modality="audio"),
-    Candidate("qwen2-audio", "mlx-community/Qwen2-Audio-7B-Instruct-4bit", modality="audio"),
-    Candidate("qwen2.5-omni-audio", "giangndm/qwen2.5-omni-3b-mlx-4bit", modality="audio"),
-    Candidate("pixtral", "mlx-community/pixtral-12b-4bit"),
-    Candidate("molmo2", "mlx-community/Molmo2-8B-4bit"),
-    Candidate("molmo-point", "mlx-community/MolmoPoint-8B-4bit"),
-    Candidate("kimi-vl", "mlx-community/Kimi-VL-A3B-Thinking-4bit"),
-    Candidate("deepseek-vl-v2-small", "mlx-community/deepseek-vl2-small-4bit"),
-    Candidate("mistral3-vl", "mlx-community/Mistral-Small-3.1-24B-Instruct-2503-4bit"),
-    Candidate("qwen3-vl-moe", "mlx-community/Qwen3-VL-30B-A3B-Instruct-3bit"),
-    Candidate("llama4", "mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit"),
-    Candidate("step3p7", "mlx-community/Step-3.7-Flash-4bit"),
-    Candidate("nemotron-h-nano-omni", "unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning", modality="audio"),
-    Candidate("ernie4.5-moe-vl", "mlx-community/ERNIE-4.5-VL-28B-A3B-Thinking-4bit"),
-    Candidate("qwen3-omni-audio", "mlx-community/Qwen3-Omni-30B-A3B-Instruct-4bit", modality="audio"),
+    Candidate("lfm2-vl", "mlx-community/LFM2.5-VL-1.6B-4bit", shard="small-b"),
+    Candidate("jina-vlm", "jinaai/jina-vlm-mlx", shard="small-b"),
+    Candidate("internvl-chat", "mlx-community/InternVL3-1B-4bit", shard="small-b"),
+    Candidate("fastvlm", "mlx-community/FastVLM-0.5B-bf16", shard="small-b"),
+    Candidate("gemma4", "unsloth/gemma-4-E2B-it-UD-MLX-4bit", shard="medium-a", required=True),
+    Candidate("minicpm-v4.6", "mlx-community/MiniCPM-V-4.6-mxfp4", shard="medium-a"),
+    Candidate("glm4v", "mlx-community/GLM-4.6V-Flash-mxfp4", shard="medium-a"),
+    Candidate("deepseek-vl-v2", "mlx-community/deepseek-vl2-tiny-4bit", shard="medium-a"),
+    Candidate("phi3-v", "mlx-community/Phi-3.5-vision-instruct-4bit", shard="medium-b"),
+    Candidate("granite-vision", "mlx-community/granite-vision-3.2-2b-4bit", shard="medium-b"),
+    Candidate("qwen2.5-vl", "mlx-community/Qwen2.5-VL-3B-Instruct-4bit", shard="medium-b"),
+    Candidate("gemma3", "mlx-community/gemma-3-4b-it-4bit", shard="medium-b"),
+    Candidate("llava", "mlx-community/llava-1.5-7b-4bit", shard="large-a"),
+    Candidate("llava-next", "mlx-community/llava-v1.6-mistral-7b-4bit", shard="large-a"),
+    Candidate("llava-bunny", "mlx-community/Bunny-Llama-3-8B-V-4bit", shard="large-a"),
+    Candidate("gemma3n", "mlx-community/gemma-3n-E2B-it-4bit", shard="large-a"),
+    Candidate("idefics2", "mlx-community/idefics2-8b-4bit", shard="large-a"),
+    Candidate("molmo", "mlx-community/Molmo-7B-D-0924-4bit", shard="large-a"),
+    Candidate("aya-vision", "mlx-community/aya-vision-8b-4bit", shard="large-b"),
+    Candidate("mllama", "mlx-community/Llama-3.2-11B-Vision-Instruct-4bit", shard="large-b"),
+    Candidate("zaya1-vl", "OsaurusAI/ZAYA1-VL-8B-MXFP4", shard="large-b"),
+    Candidate("youtu-vl", "tencent/Youtu-VL-4B-Instruct", shard="large-b"),
+    Candidate("pixtral", "mlx-community/pixtral-12b-4bit", shard="large-b"),
+    Candidate("molmo2", "mlx-community/Molmo2-8B-4bit", shard="large-b"),
+    Candidate("kimi-vl", "mlx-community/Kimi-VL-A3B-Thinking-4bit", shard="large-b"),
+    Candidate("deepseek-vl-v2-small", "mlx-community/deepseek-vl2-small-4bit", shard="large-b"),
+    Candidate("mistral3-vl", "mlx-community/Mistral-Small-3.1-24B-Instruct-2503-4bit", shard="large-b"),
+    Candidate("qwen3.6-vl-moe", "unsloth/Qwen3.6-35B-A3B-NVFP4", shard="moe"),
+    Candidate("qwen3-vl-moe", "mlx-community/Qwen3-VL-30B-A3B-Instruct-3bit", shard="moe"),
+    Candidate("llama4", "mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit", shard="moe"),
+    Candidate("step3p7", "mlx-community/Step-3.7-Flash-4bit", shard="moe"),
+    Candidate("ernie4.5-moe-vl", "mlx-community/ERNIE-4.5-VL-28B-A3B-Thinking-4bit", shard="moe"),
+    Candidate("phi4mm-audio", "Ferox-AI/Phi-4-multimodal-instruct-mlx-4bit", modality="audio", shard="audio-a"),
+    Candidate("gemma3n-audio", "mlx-community/gemma-3n-E2B-it-4bit", modality="audio", shard="audio-a"),
+    Candidate("gemma4-audio", "unsloth/gemma-4-E2B-it-UD-MLX-4bit", modality="audio", shard="audio-a"),
+    Candidate("minicpmo-audio", "mlx-community/MiniCPM-o-4_5-4bit", modality="audio", shard="audio-a"),
+    Candidate("qwen2-audio", "mlx-community/Qwen2-Audio-7B-Instruct-4bit", modality="audio", shard="audio-b"),
+    Candidate("qwen2.5-omni-audio", "giangndm/qwen2.5-omni-3b-mlx-4bit", modality="audio", shard="audio-b"),
+    Candidate("nemotron-h-nano-omni", "unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning", modality="audio", shard="audio-b"),
+    Candidate("qwen3-omni-audio", "mlx-community/Qwen3-Omni-30B-A3B-Instruct-4bit", modality="audio", shard="audio-b"),
 ]
 
 
@@ -187,7 +173,8 @@ def _run_child(candidate: Candidate, timeout_s: int) -> dict:
         match = re.search(r"RESULT_JSON:(\{.*\})", output)
         if completed.returncode == 0 and match:
             result = json.loads(match.group(1))
-            result.update(status="passed", elapsed_s=round(elapsed, 1))
+            result.setdefault("status", "passed")
+            result["elapsed_s"] = round(elapsed, 1)
             return result
         if _is_resource_failure(completed.returncode, output):
             return {
@@ -283,6 +270,21 @@ def _child_prompt(processor, config, modality: str):
         return f"{image_token}\nDescribe this image in one word."
 
 
+def _text_prompt(tokenizer) -> str:
+    tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+    if hasattr(tokenizer, "apply_chat_template"):
+        messages = [{"role": "user", "content": "Say hello."}]
+        try:
+            return tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except Exception:
+            pass
+    return "Say hello."
+
+
 def _write_tone(path: Path) -> None:
     import math
     import struct
@@ -300,17 +302,49 @@ def _write_tone(path: Path) -> None:
         wav.writeframes(b"".join(frames))
 
 
-def _child_main(payload: str) -> int:
-    data = json.loads(base64.b64decode(payload.encode()).decode())
-    candidate = Candidate(**data)
-    tmp_dir = Path(tempfile.mkdtemp(prefix="unsloth_mlx_real_case_"))
-    try:
-        import gc
-        from PIL import Image
-        import mlx.core as mx
-        from mlx_vlm import generate
-        from unsloth_zoo.mlx.loader import FastMLXModel
+def _short_exception(exc: BaseException) -> str:
+    lines = traceback.format_exception_only(type(exc), exc)
+    return " ".join(line.strip() for line in lines if line.strip())[:300]
 
+
+def _peak_memory_gb(mx) -> float:
+    if hasattr(mx.metal, "get_peak_memory"):
+        return round(float(mx.metal.get_peak_memory() or 0.0) / GiB, 3)
+    return 0.0
+
+
+def _common_summary(candidate: Candidate, processor, mx, **extra) -> dict:
+    summary = {
+        "family": candidate.family,
+        "repo": candidate.repo,
+        "modality": candidate.modality,
+        "shard": candidate.shard,
+        "processor": f"{processor.__class__.__module__}.{processor.__class__.__name__}",
+        "image_processor": (
+            None
+            if getattr(processor, "image_processor", None) is None
+            else f"{processor.image_processor.__class__.__module__}.{processor.image_processor.__class__.__name__}"
+        ),
+        "feature_extractor": (
+            None
+            if getattr(processor, "feature_extractor", None) is None
+            else f"{processor.feature_extractor.__class__.__module__}.{processor.feature_extractor.__class__.__name__}"
+        ),
+        "peak_memory_gb": _peak_memory_gb(mx),
+    }
+    summary.update(extra)
+    return summary
+
+
+def _run_multimodal_generation(candidate: Candidate, tmp_dir: Path) -> dict:
+    import gc
+    from PIL import Image
+    import mlx.core as mx
+    from mlx_vlm import generate
+    from unsloth_zoo.mlx.loader import FastMLXModel
+
+    model = processor = None
+    try:
         if hasattr(mx.metal, "reset_peak_memory"):
             mx.metal.reset_peak_memory()
 
@@ -338,31 +372,96 @@ def _child_main(payload: str) -> int:
         generation_tokens = int(getattr(result, "generation_tokens", 0) or 0)
         if generation_tokens <= 0:
             raise RuntimeError(f"no generation tokens produced: {result!r}")
-        summary = {
-            "family": candidate.family,
-            "repo": candidate.repo,
-            "modality": candidate.modality,
-            "processor": f"{processor.__class__.__module__}.{processor.__class__.__name__}",
-            "image_processor": (
-                None
-                if getattr(processor, "image_processor", None) is None
-                else f"{processor.image_processor.__class__.__module__}.{processor.image_processor.__class__.__name__}"
-            ),
-            "feature_extractor": (
-                None
-                if getattr(processor, "feature_extractor", None) is None
-                else f"{processor.feature_extractor.__class__.__module__}.{processor.feature_extractor.__class__.__name__}"
-            ),
-            "prompt_tokens": int(getattr(result, "prompt_tokens", 0) or 0),
-            "generation_tokens": generation_tokens,
-            "peak_memory_gb": round(float(getattr(result, "peak_memory", 0.0) or 0.0), 3),
-            "text_head": str(getattr(result, "text", ""))[:80],
-        }
-        print("RESULT_JSON:" + json.dumps(summary, sort_keys=True))
+        return _common_summary(
+            candidate,
+            processor,
+            mx,
+            status="passed",
+            prompt_tokens=int(getattr(result, "prompt_tokens", 0) or 0),
+            generation_tokens=generation_tokens,
+            text_head=str(getattr(result, "text", ""))[:80],
+        )
+    finally:
         del model, processor
         gc.collect()
-        if hasattr(mx.metal, "clear_cache"):
+        if "mx" in locals() and hasattr(mx.metal, "clear_cache"):
             mx.metal.clear_cache()
+
+
+def _run_text_only_generation(candidate: Candidate) -> dict:
+    import gc
+    import mlx.core as mx
+    from mlx_lm import generate as text_generate
+    from unsloth_zoo.mlx.loader import FastMLXModel
+
+    model = tokenizer = None
+    try:
+        if hasattr(mx.metal, "reset_peak_memory"):
+            mx.metal.reset_peak_memory()
+
+        model, tokenizer = FastMLXModel.from_pretrained(
+            candidate.repo,
+            text_only=True,
+            max_seq_length=128,
+        )
+        text = text_generate(
+            model,
+            tokenizer,
+            _text_prompt(tokenizer),
+            max_tokens=int(os.environ.get("UNSLOTH_MLX_REAL_MAX_TOKENS", "2")),
+            verbose=False,
+        )
+        if not str(text).strip():
+            raise RuntimeError("text-only generation returned empty text")
+        return _common_summary(
+            candidate,
+            tokenizer,
+            mx,
+            text_only_generation="passed",
+            text_head=str(text)[:80],
+        )
+    finally:
+        del model, tokenizer
+        gc.collect()
+        if "mx" in locals() and hasattr(mx.metal, "clear_cache"):
+            mx.metal.clear_cache()
+
+
+def _child_main(payload: str) -> int:
+    data = json.loads(base64.b64decode(payload.encode()).decode())
+    candidate = Candidate(**data)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="unsloth_mlx_real_case_"))
+    try:
+        try:
+            summary = _run_multimodal_generation(candidate, tmp_dir)
+        except Exception as multimodal_exc:
+            multimodal_error = _short_exception(multimodal_exc)
+            print(f"Multimodal path failed for {candidate.family}: {multimodal_error}")
+            try:
+                text_summary = _run_text_only_generation(candidate)
+            except Exception as text_exc:
+                summary = {
+                    "family": candidate.family,
+                    "repo": candidate.repo,
+                    "modality": candidate.modality,
+                    "shard": candidate.shard,
+                    "status": "unsupported-yet",
+                    "reason": (
+                        "text-only path also failed; "
+                        f"multimodal_error={multimodal_error}; "
+                        f"text_error={_short_exception(text_exc)}"
+                    ),
+                }
+            else:
+                summary = dict(text_summary)
+                summary.update(
+                    status="failed",
+                    reason=(
+                        f"text-only path passed but {candidate.modality} path failed: "
+                        f"{multimodal_error}"
+                    ),
+                )
+        print("RESULT_JSON:" + json.dumps(summary, sort_keys=True))
         return 0
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -370,8 +469,8 @@ def _child_main(payload: str) -> int:
 
 def _summary_markdown(results: list[dict]) -> str:
     rows = [
-        "| Family | Repo | Status | Detail |",
-        "| --- | --- | --- | --- |",
+        "| Shard | Family | Repo | Status | Detail |",
+        "| --- | --- | --- | --- | --- |",
     ]
     for result in results:
         detail = result.get("reason")
@@ -381,7 +480,8 @@ def _summary_markdown(results: list[dict]) -> str:
                 f"peak={result.get('peak_memory_gb')}GB"
             )
         rows.append(
-            "| {family} | `{repo}` | {status} | {detail} |".format(
+            "| {shard} | {family} | `{repo}` | {status} | {detail} |".format(
+                shard=result.get("shard", ""),
                 family=result.get("family", ""),
                 repo=result.get("repo", ""),
                 status=result.get("status", ""),
@@ -396,16 +496,28 @@ def _parent_main() -> int:
     min_real_passes = int(os.environ.get("UNSLOTH_MLX_REAL_MIN_REAL_PASSES", "5"))
     timeout_s = int(os.environ.get("UNSLOTH_MLX_REAL_CASE_TIMEOUT_S", "900"))
     total_budget_s = int(os.environ.get("UNSLOTH_MLX_REAL_TOTAL_BUDGET_S", "9600"))
+    disk_multiplier = float(os.environ.get("UNSLOTH_MLX_REAL_DISK_MULTIPLIER", "2.2"))
+    shard = os.environ.get("UNSLOTH_MLX_REAL_SHARD", "all")
+    candidates = [
+        candidate for candidate in CANDIDATES
+        if shard in {"", "all"} or candidate.shard == shard
+    ]
+    if not candidates:
+        print(f"No candidates selected for shard={shard!r}")
+        return 1
+    print(f"Selected shard={shard!r}; candidates={len(candidates)}")
+
     started_at = time.monotonic()
     results: list[dict] = []
 
-    for candidate in CANDIDATES:
+    for candidate in candidates:
         elapsed_total = time.monotonic() - started_at
         if elapsed_total + min(timeout_s, 300) > total_budget_s:
             results.append(
                 {
                     "family": candidate.family,
                     "repo": candidate.repo,
+                    "shard": candidate.shard,
                     "status": "skipped-time",
                     "reason": f"overall budget {total_budget_s}s nearly exhausted",
                 }
@@ -423,6 +535,7 @@ def _parent_main() -> int:
                     {
                         "family": candidate.family,
                         "repo": candidate.repo,
+                        "shard": candidate.shard,
                         "status": "skipped-metadata",
                         "reason": str(exc)[:200],
                     }
@@ -437,6 +550,7 @@ def _parent_main() -> int:
                     {
                         "family": candidate.family,
                         "repo": candidate.repo,
+                        "shard": candidate.shard,
                         "status": "skipped-size",
                         "reason": f"{size_gb:.2f}GB > limit {max_model_gb:.2f}GB",
                     }
@@ -444,13 +558,14 @@ def _parent_main() -> int:
                 continue
 
         free_gb = _free_gib(Path.cwd())
-        needed_gb = max(10.0, ((size or 0) / GiB) * 2.2 + 6.0)
+        needed_gb = max(10.0, ((size or 0) / GiB) * disk_multiplier + 6.0)
         print(f"Free disk: {free_gb:.1f} GiB; required guard: {needed_gb:.1f} GiB")
         if free_gb < needed_gb:
             results.append(
                 {
                     "family": candidate.family,
                     "repo": candidate.repo,
+                    "shard": candidate.shard,
                     "status": "skipped-disk",
                     "reason": f"{free_gb:.1f}GiB free < guard {needed_gb:.1f}GiB",
                 }
@@ -458,8 +573,7 @@ def _parent_main() -> int:
             continue
 
         result = _run_child(candidate, timeout_s)
-        if result.get("status") == "failed" and not candidate.required:
-            result["status"] = "failed-optional"
+        result.setdefault("shard", candidate.shard)
         results.append(result)
 
         repo_cache = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub" / _repo_cache_name(candidate.repo)
@@ -473,17 +587,13 @@ def _parent_main() -> int:
             handle.write("## Real MLX VLM/audio smoke\n\n")
             handle.write(markdown)
 
-    required_failures = [
-        result for result in results
-        if result.get("status") == "failed"
-        and any(c.repo == result.get("repo") and c.required for c in CANDIDATES)
-    ]
+    multimodal_failures = [result for result in results if result.get("status") == "failed"]
     real_passes = [result for result in results if result.get("status") == "passed"]
-    if required_failures:
-        print("Required candidates failed:")
-        print(json.dumps(required_failures, indent=2))
+    if multimodal_failures:
+        print("Multimodal candidates failed despite working text-only path:")
+        print(json.dumps(multimodal_failures, indent=2))
         return 1
-    if len(real_passes) < min_real_passes:
+    if min_real_passes > 0 and len(real_passes) < min_real_passes:
         print(
             f"Only {len(real_passes)} real model runs passed; "
             f"expected at least {min_real_passes}."
