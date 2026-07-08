@@ -1643,3 +1643,64 @@ def test_repair_uses_custom_processor_defaults_when_feature_sidecar_missing(
     assert ProcessorMixin.get_possibly_dynamic_module is before_lookup
     with pytest.raises(ValueError, match="Gemma4ImageProcessor"):
         ProcessorMixin.get_possibly_dynamic_module("Gemma4ImageProcessor")
+
+
+def test_repair_vlm_processor_runtime_attrs_fills_missing_config_values():
+    import unsloth_zoo.mlx.loader as loader
+
+    processor = types.SimpleNamespace(
+        patch_size=None,
+        vision_feature_select_strategy=None,
+        image_token_id=None,
+        image_token_index=None,
+    )
+    repaired = loader._repair_vlm_processor_runtime_attrs(
+        processor,
+        {
+            "vision_config": {"patch_size": 14},
+            "vision_feature_select_strategy": "default",
+            "image_token_id": 31000,
+            "image_token_index": 32000,
+        },
+    )
+
+    assert repaired is processor
+    assert processor.patch_size == 14
+    assert processor.vision_feature_select_strategy == "default"
+    assert processor.image_token_id == 31000
+    assert processor.image_token_index == 32000
+
+    processor = types.SimpleNamespace(image_token_id=None, image_token_index=None)
+    loader._repair_vlm_processor_runtime_attrs(
+        processor,
+        {"image_token_index": 32000},
+    )
+    assert processor.image_token_id is None
+    assert processor.image_token_index == 32000
+
+
+def test_repair_vlm_processor_runtime_attrs_preserves_processor_values():
+    import unsloth_zoo.mlx.loader as loader
+
+    processor = types.SimpleNamespace(
+        patch_size=16,
+        vision_feature_select_strategy="full",
+        image_token_id=42,
+        image_token_index=43,
+        num_additional_image_tokens=1,
+    )
+    loader._repair_vlm_processor_runtime_attrs(
+        processor,
+        {
+            "patch_size": 14,
+            "vision_feature_select_strategy": "default",
+            "image_token_id": 32000,
+            "num_additional_image_tokens": 0,
+        },
+    )
+
+    assert processor.patch_size == 16
+    assert processor.vision_feature_select_strategy == "full"
+    assert processor.image_token_id == 42
+    assert processor.image_token_index == 43
+    assert processor.num_additional_image_tokens == 1

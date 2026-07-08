@@ -178,6 +178,84 @@ def test_materialize_normalizes_list_extra_special_tokens_sidecar(tmp_path):
     )
 
 
+def test_materialize_replaces_tokenizers_backend_when_tokenizer_json_exists(tmp_path):
+    from unsloth_zoo.mlx.loader import _materialize_mlx_vlm_config_override
+    from transformers import AutoTokenizer
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+
+    source_dir = tmp_path / "snapshot"
+    source_dir.mkdir()
+    tokenizer = Tokenizer(
+        WordLevel(
+            {
+                "<|pad|>": 0,
+                "<|im_end|>": 1,
+                "<image>": 2,
+                "<video>": 3,
+                "<unk>": 4,
+            },
+            unk_token="<unk>",
+        )
+    )
+    tokenizer.pre_tokenizer = Whitespace()
+    tokenizer.save(str(source_dir / "tokenizer.json"))
+    original = {
+        "tokenizer_class": "TokenizersBackend",
+        "pad_token": "<|pad|>",
+        "eos_token": "<|im_end|>",
+        "unk_token": "<unk>",
+        "model_specific_special_tokens": {"image_token": "<image>"},
+        "video_token": "<video>",
+    }
+    (source_dir / "tokenizer_config.json").write_text(
+        json.dumps(original),
+        encoding="utf-8",
+    )
+
+    load_path, _ = _materialize_mlx_vlm_config_override(
+        str(source_dir),
+        {"model_type": "lfm2_vl"},
+        normalize_tokenizer_config=True,
+        supports_list_extra_special_tokens=False,
+    )
+
+    assert load_path != str(source_dir)
+    patched_config = json.loads(
+        (Path(load_path) / "tokenizer_config.json").read_text(encoding="utf-8")
+    )
+    assert patched_config["tokenizer_class"] == "PreTrainedTokenizerFast"
+    assert patched_config["extra_special_tokens"] == {
+        "image_token": "<image>",
+        "video_token": "<video>",
+    }
+    loaded_tokenizer = AutoTokenizer.from_pretrained(load_path)
+    assert loaded_tokenizer.__class__.__name__ == "PreTrainedTokenizerFast"
+    assert loaded_tokenizer.eos_token == "<|im_end|>"
+    assert loaded_tokenizer.pad_token == "<|pad|>"
+    assert loaded_tokenizer.image_token == "<image>"
+    assert loaded_tokenizer.video_token == "<video>"
+    assert json.loads(
+        (source_dir / "tokenizer_config.json").read_text(encoding="utf-8")
+    ) == original
+
+    load_path, _ = _materialize_mlx_vlm_config_override(
+        str(source_dir),
+        {"model_type": "lfm2_vl"},
+        normalize_tokenizer_config=True,
+        supports_list_extra_special_tokens=True,
+    )
+    patched_config = json.loads(
+        (Path(load_path) / "tokenizer_config.json").read_text(encoding="utf-8")
+    )
+    assert patched_config["tokenizer_class"] == "PreTrainedTokenizerFast"
+    assert patched_config["extra_special_tokens"] == {
+        "image_token": "<image>",
+        "video_token": "<video>",
+    }
+
+
 def test_materialize_probe_ignores_installed_coercion_patch(base_init, tmp_path):
     import unsloth_zoo.mlx.loader as loader
 

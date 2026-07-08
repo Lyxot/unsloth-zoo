@@ -437,6 +437,52 @@ def _normalize_tokenizer_config_extra_special_tokens(
     return patched_config, True
 
 
+def _tokenizer_config_custom_special_tokens(tokenizer_config):
+    model_specific = tokenizer_config.get("model_specific_special_tokens")
+    extra = dict(model_specific) if isinstance(model_specific, dict) else {}
+    for key, value in tokenizer_config.items():
+        if (
+            key.endswith("_token")
+            and key not in _STANDARD_TOKEN_KWARGS
+            and isinstance(value, str)
+        ):
+            extra.setdefault(key, value)
+    return extra
+
+
+def _normalize_tokenizer_config_for_mlx_vlm(
+    tokenizer_config,
+    *,
+    local_path=None,
+    supports_list_extra_special_tokens=None,
+):
+    patched_config, changed = _normalize_tokenizer_config_extra_special_tokens(
+        tokenizer_config,
+        supports_list_extra_special_tokens=supports_list_extra_special_tokens,
+    )
+    tokenizer_class = patched_config.get("tokenizer_class")
+    has_tokenizer_json = (
+        local_path is None
+        or os.path.exists(os.path.join(str(local_path), "tokenizer.json"))
+    )
+    if tokenizer_class == "TokenizersBackend" and has_tokenizer_json:
+        patched_config = dict(patched_config)
+        patched_config["tokenizer_class"] = "PreTrainedTokenizerFast"
+        custom_special_tokens = _tokenizer_config_custom_special_tokens(
+            patched_config
+        )
+        if custom_special_tokens:
+            existing_extra = patched_config.get("extra_special_tokens")
+            merged_extra = (
+                dict(existing_extra) if isinstance(existing_extra, dict) else {}
+            )
+            for key, value in custom_special_tokens.items():
+                merged_extra.setdefault(key, value)
+            patched_config["extra_special_tokens"] = merged_extra
+        changed = True
+    return patched_config, changed
+
+
 def _materialize_mlx_vlm_config_data(local_path, config_data):
     override_dir = tempfile.mkdtemp(prefix="unsloth_mlx_vlm_config_")
     for name in os.listdir(local_path):
@@ -447,6 +493,38 @@ def _materialize_mlx_vlm_config_data(local_path, config_data):
         _link_or_copy_path(src, dst)
     with open(os.path.join(override_dir, "config.json"), "w") as f:
         json.dump(config_data, f, indent=2)
+    return override_dir
+
+
+def _materialize_mlx_vlm_snapshot_view(
+    model_path,
+    *,
+    config_override_data=None,
+    sidecar_override_path=None,
+):
+    override_dir = tempfile.mkdtemp(prefix="unsloth_mlx_vlm_config_")
+    written = set()
+
+    if sidecar_override_path is not None:
+        for name in os.listdir(sidecar_override_path):
+            src = os.path.join(str(sidecar_override_path), name)
+            dst = os.path.join(override_dir, name)
+            _link_or_copy_path(src, dst)
+            written.add(name)
+
+    if config_override_data is not None:
+        config_path = os.path.join(override_dir, "config.json")
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config_override_data, f, indent=2)
+        written.add("config.json")
+
+    for name in os.listdir(model_path):
+        if name in written:
+            continue
+        src = os.path.join(str(model_path), name)
+        dst = os.path.join(override_dir, name)
+        _link_or_copy_path(src, dst)
+
     return override_dir
 
 
@@ -514,8 +592,9 @@ def _materialize_mlx_vlm_config_override(
             os.path.join(local_path, "tokenizer_config.json")
         )
         patched_tokenizer_config, patched_tokenizer = (
-            _normalize_tokenizer_config_extra_special_tokens(
+            _normalize_tokenizer_config_for_mlx_vlm(
                 tokenizer_config,
+                local_path=local_path,
                 supports_list_extra_special_tokens=supports_list_extra_special_tokens,
             )
         )
@@ -933,6 +1012,7 @@ def _load_mlx_vlm_distributed(
     hf_token=None,
     revision=None,
     config_override_data=None,
+    sidecar_override_path=None,
 ):
     pipeline_group, tensor_group = _mlx_active_distributed_groups(
         pipeline_group,
@@ -954,10 +1034,11 @@ def _load_mlx_vlm_distributed(
     try:
         with _temporary_hf_token_env(hf_token):
             load_target = get_model_path(model_name, revision=revision)
-            if config_override_data is not None:
-                load_target = _materialize_mlx_vlm_config_data(
+            if config_override_data is not None or sidecar_override_path is not None:
+                load_target = _materialize_mlx_vlm_snapshot_view(
                     str(load_target),
-                    config_override_data,
+                    config_override_data=config_override_data,
+                    sidecar_override_path=sidecar_override_path,
                 )
                 try:
                     model, processor = sharded_load(
@@ -1417,6 +1498,80 @@ def _repair_degraded_vlm_processor(
     return repaired
 
 
+def _read_config_path(config_data, path):
+    current = config_data
+    for key in path:
+        if isinstance(current, dict):
+            current = current.get(key)
+        else:
+            current = getattr(current, key, None)
+        if current is None:
+            return None
+    return current
+
+
+def _first_not_none(*values):
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _set_missing_processor_attr(processor, attr, value):
+    if value is None:
+        return
+    try:
+        current = getattr(processor, attr, None)
+    except Exception:
+        current = None
+    if current is None or current == "":
+        try:
+            setattr(processor, attr, value)
+        except Exception:
+            pass
+
+
+def _repair_vlm_processor_runtime_attrs(processor, config_data):
+    """Backfill runtime processor attrs omitted from processor sidecars.
+
+    Some VLM processor configs omit fields that Transformers processors need
+    during preprocessing while the model config still contains the canonical
+    value. Fill only missing attrs so valid processor-side values keep priority.
+    """
+    if processor is None or config_data is None:
+        return processor
+
+    _set_missing_processor_attr(
+        processor,
+        "patch_size",
+        _first_not_none(
+            _read_config_path(config_data, ("patch_size",)),
+            _read_config_path(config_data, ("vision_config", "patch_size")),
+        ),
+    )
+    _set_missing_processor_attr(
+        processor,
+        "vision_feature_select_strategy",
+        _read_config_path(config_data, ("vision_feature_select_strategy",)),
+    )
+    _set_missing_processor_attr(
+        processor,
+        "image_token_id",
+        _read_config_path(config_data, ("image_token_id",)),
+    )
+    _set_missing_processor_attr(
+        processor,
+        "image_token_index",
+        _read_config_path(config_data, ("image_token_index",)),
+    )
+    _set_missing_processor_attr(
+        processor,
+        "num_additional_image_tokens",
+        _read_config_path(config_data, ("num_additional_image_tokens",)),
+    )
+    return processor
+
+
 def _is_processor_return_tensors_backend_error(exc):
     message = str(exc).lower()
     return (
@@ -1425,6 +1580,45 @@ def _is_processor_return_tensors_backend_error(exc):
         or "unsupported return_tensors" in message
         or "unsupported return tensor" in message
     )
+
+
+def _convert_vlm_processor_output_backend(value, return_tensors):
+    if return_tensors not in {"mlx", "np"}:
+        return value
+    if isinstance(value, Mapping):
+        return {
+            key: _convert_vlm_processor_output_backend(item, return_tensors)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(
+            _convert_vlm_processor_output_backend(item, return_tensors)
+            for item in value
+        )
+    if isinstance(value, list):
+        return [
+            _convert_vlm_processor_output_backend(item, return_tensors)
+            for item in value
+        ]
+
+    module_name = type(value).__module__
+    if module_name.startswith("torch") and hasattr(value, "detach"):
+        array_value = value.detach().cpu().numpy()
+        if return_tensors == "np":
+            return array_value
+        import mlx.core as mx
+        return mx.array(array_value)
+
+    if return_tensors == "mlx":
+        try:
+            import numpy as np
+            if isinstance(value, np.ndarray):
+                import mlx.core as mx
+                return mx.array(value)
+        except Exception:
+            return value
+
+    return value
 
 
 def _ensure_mlx_vlm_input_tensor_compat():
@@ -1483,7 +1677,7 @@ def _ensure_mlx_vlm_input_tensor_compat():
                     and _is_processor_return_tensors_backend_error(exc)
                 ):
                     try:
-                        return original_process_inputs(
+                        retry_inputs = original_process_inputs(
                             processor,
                             prompts=prompts,
                             images=images,
@@ -1491,6 +1685,9 @@ def _ensure_mlx_vlm_input_tensor_compat():
                             add_special_tokens=add_special_tokens,
                             return_tensors="pt",
                             **kwargs,
+                        )
+                        return _convert_vlm_processor_output_backend(
+                            retry_inputs, return_tensors,
                         )
                     except Exception as retry_exc:
                         raise ValueError(
@@ -6086,6 +6283,11 @@ class FastMLXModel:
                 )
                 mode = "tensor" if active_tensor_group is not None else "pipeline"
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (distributed {mode} VLM)...")
+                sidecar_override_path = (
+                    local_path
+                    if local_path and local_path != original_local_path
+                    else None
+                )
                 model, processor = _load_mlx_vlm_distributed(
                     model_name,
                     model_type,
@@ -6094,6 +6296,7 @@ class FastMLXModel:
                     hf_token=token,
                     revision=revision,
                     config_override_data=vlm_config_override_data,
+                    sidecar_override_path=sidecar_override_path,
                 )
             else:
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM)...")
@@ -6117,6 +6320,7 @@ class FastMLXModel:
                 token=token,
                 trust_remote_code=trust_remote_code,
             )
+            processor = _repair_vlm_processor_runtime_attrs(processor, config_data)
 
             if target_dtype is not None:
                 _convert_mlx_dtype(model, target_dtype, model_type=model_type)

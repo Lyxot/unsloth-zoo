@@ -349,6 +349,21 @@ def test_mlx_vlm_prepare_inputs_patch_forwards_and_fallbacks_tensor_backend(tmp_
     assert processor.calls == ["mlx", "pt"]
     assert processor.audio_seen == [["audio"], ["audio"]]
     assert audio_inputs["input_ids"].shape == (1, 3)
+    for key in ("input_ids", "attention_mask", "pixel_values", "image_grid_thw"):
+        assert isinstance(audio_inputs[key], mx.array)
+
+    processor = _TorchOnlyTensorProcessor()
+    numpy_inputs = vlm_utils.process_inputs_with_fallback(
+        processor,
+        prompts=["Transcribe this."],
+        images=None,
+        audio=["audio"],
+        return_tensors="np",
+    )
+
+    assert processor.calls == ["np", "pt"]
+    for key in ("input_ids", "attention_mask", "pixel_values", "image_grid_thw"):
+        assert isinstance(numpy_inputs[key], np.ndarray)
 
     audio_path = tmp_path / "audio.wav"
     with wave.open(str(audio_path), "wb") as wav:
