@@ -37,7 +37,7 @@ class Candidate:
 CANDIDATES = [
     Candidate("idefics3-smolvlm", "mlx-community/SmolVLM-256M-Instruct-4bit", required=True),
     Candidate("qwen2-vl", "mlx-community/Qwen2-VL-2B-Instruct-4bit", required=True),
-    Candidate("lfm2-vl", "mlx-community/LFM2.5-VL-1.6B-4bit", required=True),
+    Candidate("lfm2-vl", "mlx-community/LFM2.5-VL-1.6B-4bit"),
     Candidate("qwen3-vl", "unsloth/Qwen3-VL-2B-Instruct", required=True),
     Candidate("gemma4", "unsloth/gemma-4-E2B-it-UD-MLX-4bit", required=True),
     Candidate("qwen3.5-vl", "unsloth/Qwen3.5-0.8B"),
@@ -139,6 +139,26 @@ def _is_resource_failure(returncode: int | None, output: str) -> bool:
     )
 
 
+def _as_text(part) -> str:
+    if part is None:
+        return ""
+    if isinstance(part, bytes):
+        return part.decode("utf-8", errors="replace")
+    return str(part)
+
+
+def _combined_output(*parts) -> str:
+    return "\n".join(text for text in (_as_text(part) for part in parts) if text)
+
+
+def _failure_reason(returncode: int | None, output: str) -> str:
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    detail = lines[-1] if lines else ""
+    if detail:
+        return f"returncode={returncode}: {detail[:240]}"
+    return f"returncode={returncode}"
+
+
 def _run_child(candidate: Candidate, timeout_s: int) -> dict:
     hf_home = Path(tempfile.mkdtemp(prefix="unsloth_mlx_real_hf_"))
     payload = base64.b64encode(json.dumps(asdict(candidate)).encode()).decode()
@@ -162,7 +182,7 @@ def _run_child(candidate: Candidate, timeout_s: int) -> dict:
             timeout=timeout_s,
         )
         elapsed = time.monotonic() - started
-        output = "\n".join(part for part in (completed.stdout, completed.stderr) if part)
+        output = _combined_output(completed.stdout, completed.stderr)
         _print_group(f"{candidate.family}: child output", output)
         match = re.search(r"RESULT_JSON:(\{.*\})", output)
         if completed.returncode == 0 and match:
@@ -181,11 +201,11 @@ def _run_child(candidate: Candidate, timeout_s: int) -> dict:
             "family": candidate.family,
             "repo": candidate.repo,
             "status": "failed",
-            "reason": f"returncode={completed.returncode}",
+            "reason": _failure_reason(completed.returncode, output),
             "elapsed_s": round(elapsed, 1),
         }
     except subprocess.TimeoutExpired as exc:
-        output = "\n".join(part for part in (exc.stdout or "", exc.stderr or "") if part)
+        output = _combined_output(exc.stdout, exc.stderr)
         _print_group(f"{candidate.family}: timeout output", output)
         return {
             "family": candidate.family,
@@ -200,6 +220,11 @@ def _run_child(candidate: Candidate, timeout_s: int) -> dict:
 
 def _child_prompt(processor, config, modality: str):
     from mlx_vlm import prompt_utils
+
+    model_type = getattr(config, "model_type", None)
+    if isinstance(config, dict):
+        model_type = config.get("model_type")
+    model_type = str(model_type or "").lower()
 
     if modality == "audio":
         messages = [
@@ -227,6 +252,9 @@ def _child_prompt(processor, config, modality: str):
             )
             return f"{audio_token}\nDescribe this short tone."
 
+    if "deepseek_vl" in model_type:
+        return "<image>\nDescribe this image in one word."
+
     messages = [
         {
             "role": "user",
@@ -250,10 +278,7 @@ def _child_prompt(processor, config, modality: str):
             or getattr(getattr(processor, "tokenizer", None), "image_token", None)
             or "<image>"
         )
-        model_type = getattr(config, "model_type", None)
-        if isinstance(config, dict):
-            model_type = config.get("model_type")
-        if "llava" in str(model_type).lower():
+        if "llava" in model_type:
             return f"USER: {image_token}\nDescribe this image in one word.\nASSISTANT:"
         return f"{image_token}\nDescribe this image in one word."
 
