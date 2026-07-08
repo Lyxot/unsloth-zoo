@@ -1461,21 +1461,185 @@ def test_sanitize_pipelines_keep_wrapper_first_when_present():
 def test_image_processor_rebuild_uses_mlx_vlm_module_class(monkeypatch, tmp_path):
     import unsloth_zoo.mlx.loader as loader
 
-    class EdgeImageProcessor:
+    class Gemma4ImageProcessor:
         def __init__(self, size=None):
             self.size = size
 
-    fake_processing = types.ModuleType("mlx_vlm.models.edge_type.processing")
-    fake_processing.EdgeImageProcessor = EdgeImageProcessor
+    class Gemma4AudioFeatureExtractor:
+        def __init__(self, sampling_rate=None):
+            self.sampling_rate = sampling_rate
+
+    fake_processing = types.ModuleType("mlx_vlm.models.gemma4.processing_gemma4")
+    fake_processing.Gemma4ImageProcessor = Gemma4ImageProcessor
     monkeypatch.setitem(
-        sys.modules, "mlx_vlm.models.edge_type.processing", fake_processing
+        sys.modules, "mlx_vlm.models.gemma4.processing_gemma4", fake_processing
+    )
+    fake_audio = types.ModuleType("mlx_vlm.models.gemma4.audio_feature_extractor")
+    fake_audio.Gemma4AudioFeatureExtractor = Gemma4AudioFeatureExtractor
+    monkeypatch.setitem(
+        sys.modules, "mlx_vlm.models.gemma4.audio_feature_extractor", fake_audio
     )
 
     built = loader._build_vlm_image_processor_from_config(
         tmp_path,
         {},
-        {"image_processor_type": "EdgeImageProcessor", "size": 224},
-        "edge_type",
+        {"image_processor_type": "Gemma4ImageProcessor", "size": 224},
+        "gemma4",
     )
-    assert isinstance(built, EdgeImageProcessor)
+    assert isinstance(built, Gemma4ImageProcessor)
     assert built.size == 224
+
+    feature = loader._build_vlm_feature_extractor_from_config(
+        tmp_path,
+        {"feature_extractor": {
+            "feature_extractor_type": "Gemma4AudioFeatureExtractor",
+            "sampling_rate": 16000,
+        }},
+        {},
+        "gemma4",
+    )
+    assert isinstance(feature, Gemma4AudioFeatureExtractor)
+    assert feature.sampling_rate == 16000
+
+
+def test_repair_uses_custom_processor_defaults_when_feature_sidecar_missing(
+    monkeypatch, tmp_path
+):
+    import unsloth_zoo.mlx.loader as loader
+    from transformers.processing_utils import ProcessorMixin
+
+    Gemma4Tokenizer = type(
+        "Gemma4Tokenizer",
+        (),
+        {
+            "chat_template": None,
+            "save_pretrained": lambda *_args, **_kwargs: None,
+            "__call__": lambda self, text=None, **_kwargs: {"input_ids": [text]},
+        },
+    )
+    Gemma4ImageProcessor = type(
+        "Gemma4ImageProcessor",
+        (),
+        {
+            "__init__": lambda self, size=None: setattr(self, "size", size),
+            "__call__": lambda self, images=None: {"pixel_values": [self.size, images]},
+        },
+    )
+    Gemma4AudioFeatureExtractor = type(
+        "Gemma4AudioFeatureExtractor",
+        (),
+        {
+            "__init__": lambda self, sampling_rate=None: setattr(self, "sampling_rate", sampling_rate),
+            "__call__": lambda self, audio=None: {"input_features": [self.sampling_rate, audio]},
+        },
+    )
+    Gemma4VideoProcessor = type(
+        "Gemma4VideoProcessor",
+        (),
+        {"__init__": lambda self, fps=None: setattr(self, "fps", fps)},
+    )
+
+    class Gemma4Processor(ProcessorMixin):
+        attributes = ["image_processor", "tokenizer"]
+        image_processor_class = "Gemma4ImageProcessor"
+        tokenizer_class = "Gemma4Tokenizer"
+
+        def __init__(
+            self,
+            image_processor=None,
+            tokenizer=None,
+            chat_template=None,
+            **kwargs,
+        ):
+            self.image_seq_length = kwargs.pop("image_seq_length", None)
+            self.audio_seq_length = kwargs.pop("audio_seq_length", None)
+            self.audio_ms_per_token = kwargs.pop("audio_ms_per_token", None)
+            self.feature_extractor = kwargs.pop("feature_extractor", None)
+            self.video_processor = kwargs.pop("video_processor", None)
+            super().__init__(
+                image_processor=image_processor,
+                tokenizer=tokenizer,
+                chat_template=chat_template,
+            )
+
+        def __call__(self, images=None, audio=None, text=None):
+            return {
+                **self.image_processor(images=images),
+                **self.feature_extractor(audio=audio),
+                **self.tokenizer(text=text),
+            }
+
+        @classmethod
+        def from_pretrained(cls, *_args, **_kwargs):
+            default_tokenizer = Gemma4Tokenizer()
+            default_tokenizer.chat_template = "tokenizer-template"
+            return cls(
+                image_processor=Gemma4ImageProcessor(size=999),
+                tokenizer=default_tokenizer,
+                chat_template="processor-template",
+                image_seq_length=111,
+                audio_seq_length=222,
+                audio_ms_per_token=333,
+                feature_extractor=Gemma4AudioFeatureExtractor(sampling_rate=24000),
+                video_processor=Gemma4VideoProcessor(fps=60),
+            )
+
+    fake_processing = types.ModuleType("mlx_vlm.models.gemma4.processing_gemma4")
+    fake_processing.Gemma4Processor = Gemma4Processor
+    fake_processing.Gemma4ImageProcessor = Gemma4ImageProcessor
+    fake_processing.Gemma4VideoProcessor = Gemma4VideoProcessor
+    monkeypatch.setitem(
+        sys.modules, "mlx_vlm.models.gemma4.processing_gemma4", fake_processing
+    )
+
+    (tmp_path / "processor_config.json").write_text(
+        json.dumps(
+            {
+                "processor_class": "Gemma4Processor",
+                "image_processor": {
+                    "image_processor_type": "Gemma4ImageProcessor",
+                    "size": 224,
+                },
+                "video_processor": {
+                    "video_processor_type": "Gemma4VideoProcessor",
+                    "fps": 30,
+                },
+                "audio_seq_length": 456,
+                "audio_ms_per_token": 80,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    detokenizer = object()
+    stopping_criteria = object()
+    degraded = Gemma4Tokenizer()
+    degraded.detokenizer = detokenizer
+    degraded.stopping_criteria = stopping_criteria
+    before_lookup = ProcessorMixin.get_possibly_dynamic_module
+    repaired = loader._repair_degraded_vlm_processor(
+        degraded, str(tmp_path), "gemma4"
+    )
+
+    assert isinstance(repaired, Gemma4Processor)
+    assert repaired.tokenizer is degraded
+    assert repaired.image_processor.size == 224
+    assert isinstance(repaired.feature_extractor, Gemma4AudioFeatureExtractor)
+    assert repaired.feature_extractor.sampling_rate == 24000
+    assert isinstance(repaired.video_processor, Gemma4VideoProcessor)
+    assert repaired.video_processor.fps == 30
+    assert repaired.image_seq_length == 111
+    assert repaired.audio_seq_length == 456
+    assert repaired.audio_ms_per_token == 80
+    assert repaired.chat_template == "processor-template"
+    assert repaired.tokenizer.chat_template == "processor-template"
+    assert repaired(images="img", audio="wav", text="hi") == {
+        "pixel_values": [224, "img"],
+        "input_features": [24000, "wav"],
+        "input_ids": ["hi"],
+    }
+    assert repaired.detokenizer is detokenizer
+    assert repaired.tokenizer.stopping_criteria is stopping_criteria
+    assert ProcessorMixin.get_possibly_dynamic_module is before_lookup
+    with pytest.raises(ValueError, match="Gemma4ImageProcessor"):
+        ProcessorMixin.get_possibly_dynamic_module("Gemma4ImageProcessor")

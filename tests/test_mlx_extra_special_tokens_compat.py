@@ -53,6 +53,31 @@ def test_list_coerced_only_when_init_crashes(base_init):
     base_init.__init__(object(), extra_special_tokens={"image_token": "<img>"})
     assert seen["extra_special_tokens"] == {"image_token": "<img>"}
 
+    seen.clear()
+    media_tokens = {
+        "image_token": "<|image|>",
+        "audio_token": "<|audio|>",
+        "boi_token": "<|image>",
+        "eoi_token": "<image|>",
+        "boa_token": "<|audio>",
+        "eoa_token": "<audio|>",
+    }
+    base_init.__init__(
+        object(),
+        extra_special_tokens=["<|video|>"],
+        model_specific_special_tokens=media_tokens,
+        bos_token="<bos>",
+    )
+    assert seen["extra_special_tokens"] == media_tokens
+
+    seen.clear()
+    base_init.__init__(
+        object(),
+        extra_special_tokens=["<|video|>"],
+        image_token="<|image|>",
+    )
+    assert seen["extra_special_tokens"] == {"image_token": "<|image|>"}
+
 
 def test_unrelated_attributeerror_not_swallowed(base_init):
     from unsloth_zoo.mlx.loader import _coerce_list_extra_special_tokens

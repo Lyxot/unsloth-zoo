@@ -65,6 +65,16 @@ _MULTIMODAL_STRIP_KEYS = (
 import threading
 _HF_TOKEN_ENV_LOCK = threading.RLock()
 _LOAD_WEIGHTS_PATCH_LOCK = threading.RLock()
+_PROCESSOR_COMPONENT_PATCH_LOCK = threading.RLock()
+_STANDARD_TOKEN_KWARGS = {
+    "bos_token",
+    "eos_token",
+    "unk_token",
+    "sep_token",
+    "pad_token",
+    "cls_token",
+    "mask_token",
+}
 
 
 @contextmanager
@@ -1019,6 +1029,10 @@ def _resolve_mlx_vlm_processor_class(model_type, processor_class_name):
         for name in (
             f"mlx_vlm.models.{module_type}.processing",
             f"mlx_vlm.models.{module_type}.processing_{module_type}",
+            f"mlx_vlm.models.{module_type}.image_processing",
+            f"mlx_vlm.models.{module_type}.image_processor",
+            f"mlx_vlm.models.{module_type}.feature_extractor",
+            f"mlx_vlm.models.{module_type}.audio_feature_extractor",
         )
     )
     for module_name in module_candidates:
@@ -1027,14 +1041,70 @@ def _resolve_mlx_vlm_processor_class(model_type, processor_class_name):
         except Exception:
             continue
         processor_class = getattr(module, processor_class_name, None)
-        if processor_class is not None:
+        if inspect.isclass(processor_class):
             return processor_class
 
     try:
         import transformers
-        return getattr(transformers, processor_class_name, None)
+        processor_class = getattr(transformers, processor_class_name, None)
+        return processor_class if inspect.isclass(processor_class) else None
     except Exception:
         return None
+
+
+@contextmanager
+def _temporary_processor_component_lookup(*component_classes):
+    """Let ProcessorMixin validate custom mlx-vlm components during repair."""
+    by_name = {
+        cls.__name__: cls
+        for cls in component_classes
+        if inspect.isclass(cls) and getattr(cls, "__name__", None)
+    }
+    if not by_name:
+        yield
+        return
+
+    try:
+        from transformers.processing_utils import ProcessorMixin
+    except Exception:
+        yield
+        return
+
+    with _PROCESSOR_COMPONENT_PATCH_LOCK:
+        original_descriptor = ProcessorMixin.__dict__.get(
+            "get_possibly_dynamic_module"
+        )
+        original_lookup = ProcessorMixin.get_possibly_dynamic_module
+
+        def patched_lookup(module_name):
+            if isinstance(module_name, str) and module_name in by_name:
+                return by_name[module_name]
+            return original_lookup(module_name)
+
+        ProcessorMixin.get_possibly_dynamic_module = staticmethod(patched_lookup)
+        try:
+            yield
+        finally:
+            if original_descriptor is not None:
+                ProcessorMixin.get_possibly_dynamic_module = original_descriptor
+            else:
+                delattr(ProcessorMixin, "get_possibly_dynamic_module")
+
+
+def _processor_declared_component_classes(processor_class, model_type):
+    """Resolve custom component classes declared by a ProcessorMixin subclass."""
+    classes = []
+    for attribute in getattr(processor_class, "attributes", ()) or ():
+        class_names = getattr(processor_class, f"{attribute}_class", None)
+        if isinstance(class_names, str):
+            class_names = (class_names,)
+        if not isinstance(class_names, (tuple, list)):
+            continue
+        for class_name in class_names:
+            component_class = _resolve_mlx_vlm_processor_class(model_type, class_name)
+            if component_class is not None:
+                classes.append(component_class)
+    return tuple(classes)
 
 
 def _build_vlm_image_processor_from_config(
@@ -1080,6 +1150,146 @@ def _build_vlm_image_processor_from_config(
         return None
 
 
+def _build_vlm_feature_extractor_from_config(
+    model_path, processor_config, preprocessor_config, model_type=None,
+):
+    """Recreate an optional audio feature extractor from processor sidecars."""
+    feature_config = processor_config.get("feature_extractor")
+    if not isinstance(feature_config, dict):
+        feature_config = preprocessor_config
+    if not isinstance(feature_config, dict):
+        feature_config = {}
+
+    feature_extractor_type = (
+        feature_config.get("feature_extractor_type")
+        or preprocessor_config.get("feature_extractor_type")
+    )
+    feature_kwargs = dict(feature_config)
+    feature_kwargs.pop("feature_extractor_type", None)
+    feature_kwargs.pop("processor_class", None)
+
+    if feature_extractor_type:
+        try:
+            import transformers
+            feature_extractor_class = getattr(
+                transformers, feature_extractor_type, None
+            )
+            if feature_extractor_class is not None:
+                return feature_extractor_class(**feature_kwargs)
+        except Exception:
+            pass
+        try:
+            feature_extractor_class = _resolve_mlx_vlm_processor_class(
+                model_type, feature_extractor_type,
+            )
+            if feature_extractor_class is not None:
+                return feature_extractor_class(**feature_kwargs)
+        except Exception:
+            pass
+
+    try:
+        from transformers import AutoFeatureExtractor
+        return AutoFeatureExtractor.from_pretrained(model_path)
+    except Exception:
+        return None
+
+
+def _build_vlm_video_processor_from_config(
+    model_path, processor_config, preprocessor_config, model_type=None,
+):
+    """Recreate an optional video processor from processor sidecars."""
+    video_config = processor_config.get("video_processor")
+    if not isinstance(video_config, dict):
+        video_config = preprocessor_config
+    if not isinstance(video_config, dict):
+        video_config = {}
+
+    video_processor_type = (
+        video_config.get("video_processor_type")
+        or preprocessor_config.get("video_processor_type")
+    )
+    video_kwargs = dict(video_config)
+    video_kwargs.pop("video_processor_type", None)
+    video_kwargs.pop("processor_class", None)
+
+    if video_processor_type:
+        try:
+            import transformers
+            video_processor_class = getattr(transformers, video_processor_type, None)
+            if video_processor_class is not None:
+                return video_processor_class(**video_kwargs)
+        except Exception:
+            pass
+        try:
+            video_processor_class = _resolve_mlx_vlm_processor_class(
+                model_type, video_processor_type,
+            )
+            if video_processor_class is not None:
+                return video_processor_class(**video_kwargs)
+        except Exception:
+            pass
+
+    try:
+        from transformers import AutoVideoProcessor
+        return AutoVideoProcessor.from_pretrained(model_path)
+    except Exception:
+        return None
+
+
+def _copy_vlm_processor_runtime_attrs(source, repaired):
+    """Preserve mlx-vlm detokenizer/stopping metadata across processor repair."""
+    for attr in ("detokenizer",):
+        if hasattr(source, attr):
+            try:
+                setattr(repaired, attr, getattr(source, attr))
+            except Exception:
+                pass
+
+    source_tokenizer = getattr(source, "tokenizer", None) or source
+    repaired_tokenizer = getattr(repaired, "tokenizer", None)
+    if repaired_tokenizer is None:
+        return
+    for attr in ("stopping_criteria",):
+        if hasattr(source_tokenizer, attr) and not hasattr(repaired_tokenizer, attr):
+            try:
+                setattr(repaired_tokenizer, attr, getattr(source_tokenizer, attr))
+            except Exception:
+                pass
+
+
+def _load_vlm_processor_defaults(
+    processor_class,
+    model_path,
+    component_classes,
+    *,
+    token=None,
+    trust_remote_code=False,
+):
+    """Best-effort custom processor load for optional defaults."""
+    from_pretrained = getattr(processor_class, "from_pretrained", None)
+    if not callable(from_pretrained):
+        return None
+
+    kwargs = {"trust_remote_code": trust_remote_code}
+    if token:
+        kwargs["token"] = token
+    try:
+        with _temporary_processor_component_lookup(*component_classes):
+            return from_pretrained(model_path, **kwargs)
+    except Exception:
+        return None
+
+
+def _get_processor_chat_template(processor):
+    if processor is None:
+        return None
+    chat_template = getattr(processor, "chat_template", None)
+    if chat_template is not None:
+        return chat_template
+    tokenizer = getattr(processor, "tokenizer", None)
+    return getattr(tokenizer, "chat_template", None)
+
+
 def _repair_degraded_vlm_processor(
     processor,
     model_path,
@@ -1121,6 +1331,12 @@ def _repair_degraded_vlm_processor(
     )
     if image_processor is None:
         return processor
+    feature_extractor = _build_vlm_feature_extractor_from_config(
+        model_path, processor_config, preprocessor_config, model_type,
+    )
+    video_processor = _build_vlm_video_processor_from_config(
+        model_path, processor_config, preprocessor_config, model_type,
+    )
 
     tokenizer = getattr(processor, "tokenizer", None) or processor
     if tokenizer is None or not hasattr(tokenizer, "save_pretrained"):
@@ -1137,18 +1353,57 @@ def _repair_degraded_vlm_processor(
     if chat_template is not None and getattr(tokenizer, "chat_template", None) is None:
         tokenizer.chat_template = chat_template
 
+    default_components = _load_vlm_processor_defaults(
+        processor_class,
+        model_path,
+        (
+            type(image_processor),
+            type(tokenizer),
+            *_processor_declared_component_classes(processor_class, model_type),
+        ),
+        token=token,
+        trust_remote_code=trust_remote_code,
+    )
+    if feature_extractor is None and default_components is not None:
+        feature_extractor = getattr(default_components, "feature_extractor", None)
+    if video_processor is None and default_components is not None:
+        video_processor = getattr(default_components, "video_processor", None)
+    if chat_template is None:
+        chat_template = _get_processor_chat_template(default_components)
+        if chat_template is not None and getattr(tokenizer, "chat_template", None) is None:
+            tokenizer.chat_template = chat_template
+
+    processor_kwargs = {
+        "image_processor": image_processor,
+        "tokenizer": tokenizer,
+        "chat_template": chat_template,
+    }
+    for key in ("image_seq_length", "audio_seq_length", "audio_ms_per_token"):
+        if key in processor_config:
+            processor_kwargs[key] = processor_config[key]
+        elif default_components is not None and hasattr(default_components, key):
+            processor_kwargs[key] = getattr(default_components, key)
+    if feature_extractor is not None:
+        processor_kwargs["feature_extractor"] = feature_extractor
+    if video_processor is not None:
+        processor_kwargs["video_processor"] = video_processor
+
+    component_classes = (
+        type(image_processor),
+        type(feature_extractor) if feature_extractor is not None else None,
+        type(video_processor) if video_processor is not None else None,
+        type(tokenizer),
+    )
     try:
-        repaired = processor_class(
-            image_processor=image_processor,
-            tokenizer=tokenizer,
-            chat_template=chat_template,
-        )
+        with _temporary_processor_component_lookup(*component_classes):
+            repaired = processor_class(**processor_kwargs)
     except TypeError:
         try:
-            repaired = processor_class(
-                image_processor=image_processor,
-                tokenizer=tokenizer,
-            )
+            with _temporary_processor_component_lookup(*component_classes):
+                repaired = processor_class(
+                    image_processor=image_processor,
+                    tokenizer=tokenizer,
+                )
         except Exception:
             return processor
     except Exception:
@@ -1156,6 +1411,7 @@ def _repair_degraded_vlm_processor(
 
     if chat_template is not None and getattr(repaired, "chat_template", None) is None:
         repaired.chat_template = chat_template
+    _copy_vlm_processor_runtime_attrs(processor, repaired)
     return repaired
 
 
@@ -4797,6 +5053,18 @@ def _coerce_list_extra_special_tokens():
     if getattr(init, "_unsloth_extra_special_tokens_patched", False):
         return
 
+    def _fallback_extra_special_tokens(kwargs):
+        model_specific = kwargs.get("model_specific_special_tokens")
+        extra = dict(model_specific) if isinstance(model_specific, dict) else {}
+        for key, value in kwargs.items():
+            if (
+                key.endswith("_token")
+                and key not in _STANDARD_TOKEN_KWARGS
+                and isinstance(value, str)
+            ):
+                extra.setdefault(key, value)
+        return extra
+
     def patched_init(*args, **kwargs):
         if not isinstance(kwargs.get("extra_special_tokens"), list):
             return init(*args, **kwargs)
@@ -4805,7 +5073,7 @@ def _coerce_list_extra_special_tokens():
         except AttributeError as e:
             if "keys" not in str(e):
                 raise
-            kwargs["extra_special_tokens"] = {}
+            kwargs["extra_special_tokens"] = _fallback_extra_special_tokens(kwargs)
             return init(*args, **kwargs)
 
     patched_init._unsloth_extra_special_tokens_patched = True
