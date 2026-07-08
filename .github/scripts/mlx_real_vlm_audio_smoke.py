@@ -38,15 +38,62 @@ CANDIDATES = [
     Candidate("idefics3-smolvlm", "mlx-community/SmolVLM-256M-Instruct-4bit", required=True),
     Candidate("qwen2-vl", "mlx-community/Qwen2-VL-2B-Instruct-4bit", required=True),
     Candidate("lfm2-vl", "mlx-community/LFM2.5-VL-1.6B-4bit", required=True),
+    Candidate("qwen3-vl", "unsloth/Qwen3-VL-2B-Instruct", required=True),
+    Candidate("gemma4", "unsloth/gemma-4-E2B-it-UD-MLX-4bit", required=True),
+    Candidate("qwen3.5-vl", "unsloth/Qwen3.5-0.8B"),
+    Candidate("qwen3.6-vl-moe", "unsloth/Qwen3.6-35B-A3B-NVFP4"),
+    Candidate("jina-vlm", "jinaai/jina-vlm-mlx"),
+    Candidate("minicpm-v4.6", "mlx-community/MiniCPM-V-4.6-mxfp4"),
+    Candidate("phi4mm-audio", "Ferox-AI/Phi-4-multimodal-instruct-mlx-4bit", modality="audio"),
+    Candidate("florence2", "mlx-community/Florence-2-base-ft-4bit"),
+    Candidate("falcon-ocr", "mlx-community/Falcon-OCR-bf16"),
+    Candidate("sam3", "mlx-community/sam3-4bit"),
+    Candidate("sam3.1", "mlx-community/sam3.1-bf16"),
+    Candidate("paddleocr-vl", "mlx-community/PaddleOCR-VL-4bit"),
+    Candidate("internvl-chat", "mlx-community/InternVL3-1B-4bit"),
+    Candidate("fastvlm", "mlx-community/FastVLM-0.5B-bf16"),
+    Candidate("glm-ocr", "mlx-community/GLM-OCR-4bit"),
+    Candidate("glm4v", "mlx-community/GLM-4.6V-Flash-mxfp4"),
+    Candidate("deepseek-vl-v2", "mlx-community/deepseek-vl2-tiny-4bit"),
+    Candidate("paligemma", "mlx-community/paligemma2-3b-mix-224-4bit"),
+    Candidate("phi3-v", "mlx-community/Phi-3.5-vision-instruct-4bit"),
+    Candidate("moondream3", "moondream/md3p-int4"),
+    Candidate("falcon-perception", "tiiuae/Falcon-Perception-300M"),
+    Candidate("rfdetr", "mlx-community/rfdetr-base-fp32"),
+    Candidate("granite-vision", "mlx-community/granite-vision-3.2-2b-4bit"),
+    Candidate("deepseek-ocr", "mlx-community/DeepSeek-OCR-4bit"),
+    Candidate("deepseek-ocr2", "mlx-community/DeepSeek-OCR-2-4bit"),
+    Candidate("granite4-vision", "mlx-community/granite-4.0-3b-vision-4bit"),
     Candidate("qwen2.5-vl", "mlx-community/Qwen2.5-VL-3B-Instruct-4bit"),
-    Candidate("qwen3-vl", "unsloth/Qwen3-VL-2B-Instruct"),
+    Candidate("dots-ocr", "mlx-community/dots.ocr-4bit"),
     Candidate("gemma3", "mlx-community/gemma-3-4b-it-4bit"),
-    Candidate("gemma4", "unsloth/gemma-4-E2B-it-UD-MLX-4bit"),
     Candidate("llava", "mlx-community/llava-1.5-7b-4bit"),
     Candidate("llava-next", "mlx-community/llava-v1.6-mistral-7b-4bit"),
+    Candidate("llava-bunny", "mlx-community/Bunny-Llama-3-8B-V-4bit"),
+    Candidate("gemma3n", "mlx-community/gemma-3n-E2B-it-4bit"),
     Candidate("gemma3n-audio", "mlx-community/gemma-3n-E2B-it-4bit", modality="audio"),
-    Candidate("pixtral", "mlx-community/pixtral-12b-4bit"),
+    Candidate("gemma4-audio", "unsloth/gemma-4-E2B-it-UD-MLX-4bit", modality="audio"),
+    Candidate("idefics2", "mlx-community/idefics2-8b-4bit"),
+    Candidate("molmo", "mlx-community/Molmo-7B-D-0924-4bit"),
+    Candidate("aya-vision", "mlx-community/aya-vision-8b-4bit"),
+    Candidate("mllama", "mlx-community/Llama-3.2-11B-Vision-Instruct-4bit"),
+    Candidate("locateanything", "mlx-community/LocateAnything-3B-4bit"),
+    Candidate("zaya1-vl", "OsaurusAI/ZAYA1-VL-8B-MXFP4"),
+    Candidate("youtu-vl", "tencent/Youtu-VL-4B-Instruct"),
+    Candidate("minicpmo-audio", "mlx-community/MiniCPM-o-4_5-4bit", modality="audio"),
     Candidate("qwen2-audio", "mlx-community/Qwen2-Audio-7B-Instruct-4bit", modality="audio"),
+    Candidate("qwen2.5-omni-audio", "giangndm/qwen2.5-omni-3b-mlx-4bit", modality="audio"),
+    Candidate("pixtral", "mlx-community/pixtral-12b-4bit"),
+    Candidate("molmo2", "mlx-community/Molmo2-8B-4bit"),
+    Candidate("molmo-point", "mlx-community/MolmoPoint-8B-4bit"),
+    Candidate("kimi-vl", "mlx-community/Kimi-VL-A3B-Thinking-4bit"),
+    Candidate("deepseek-vl-v2-small", "mlx-community/deepseek-vl2-small-4bit"),
+    Candidate("mistral3-vl", "mlx-community/Mistral-Small-3.1-24B-Instruct-2503-4bit"),
+    Candidate("qwen3-vl-moe", "mlx-community/Qwen3-VL-30B-A3B-Instruct-3bit"),
+    Candidate("llama4", "mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit"),
+    Candidate("step3p7", "mlx-community/Step-3.7-Flash-4bit"),
+    Candidate("nemotron-h-nano-omni", "unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning", modality="audio"),
+    Candidate("ernie4.5-moe-vl", "mlx-community/ERNIE-4.5-VL-28B-A3B-Thinking-4bit"),
     Candidate("qwen3-omni-audio", "mlx-community/Qwen3-Omni-30B-A3B-Instruct-4bit", modality="audio"),
 ]
 
@@ -320,18 +367,42 @@ def _summary_markdown(results: list[dict]) -> str:
 
 
 def _parent_main() -> int:
-    max_model_gb = float(os.environ.get("UNSLOTH_MLX_REAL_MAX_MODEL_GB", "5.0"))
-    min_real_passes = int(os.environ.get("UNSLOTH_MLX_REAL_MIN_REAL_PASSES", "3"))
+    max_model_gb = float(os.environ.get("UNSLOTH_MLX_REAL_MAX_MODEL_GB", "8.0"))
+    min_real_passes = int(os.environ.get("UNSLOTH_MLX_REAL_MIN_REAL_PASSES", "5"))
     timeout_s = int(os.environ.get("UNSLOTH_MLX_REAL_CASE_TIMEOUT_S", "900"))
+    total_budget_s = int(os.environ.get("UNSLOTH_MLX_REAL_TOTAL_BUDGET_S", "9600"))
+    started_at = time.monotonic()
     results: list[dict] = []
 
     for candidate in CANDIDATES:
+        elapsed_total = time.monotonic() - started_at
+        if elapsed_total + min(timeout_s, 300) > total_budget_s:
+            results.append(
+                {
+                    "family": candidate.family,
+                    "repo": candidate.repo,
+                    "status": "skipped-time",
+                    "reason": f"overall budget {total_budget_s}s nearly exhausted",
+                }
+            )
+            continue
+
         print(f"==> {candidate.family}: {candidate.repo}")
         try:
             size = _candidate_size_bytes(candidate.repo)
         except Exception as exc:
             size = None
             print(f"Could not read model metadata for {candidate.repo}: {exc}")
+            if not candidate.required:
+                results.append(
+                    {
+                        "family": candidate.family,
+                        "repo": candidate.repo,
+                        "status": "skipped-metadata",
+                        "reason": str(exc)[:200],
+                    }
+                )
+                continue
 
         if size is not None:
             size_gb = size / 1e9
