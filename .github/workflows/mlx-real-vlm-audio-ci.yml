@@ -19,71 +19,71 @@ jobs:
   real-vlm-audio:
     name: Real MLX VLM/audio chat (${{ matrix.shard }})
     runs-on: macos-14
-    timeout-minutes: 180
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
         include:
           - shard: small-a
             max_model_gb: "8.0"
-            case_timeout_s: "600"
-            total_budget_s: "3600"
+            case_timeout_s: "1800"
+            total_budget_s: "7200"
             disk_multiplier: "2.0"
             min_passes: "1"
             large_models: "false"
           - shard: small-b
             max_model_gb: "8.0"
-            case_timeout_s: "600"
-            total_budget_s: "3600"
+            case_timeout_s: "1800"
+            total_budget_s: "7200"
             disk_multiplier: "2.0"
             min_passes: "0"
             large_models: "false"
           - shard: medium-a
             max_model_gb: "12.0"
-            case_timeout_s: "900"
-            total_budget_s: "5400"
+            case_timeout_s: "2400"
+            total_budget_s: "9600"
             disk_multiplier: "1.7"
             min_passes: "1"
             large_models: "false"
           - shard: medium-b
             max_model_gb: "12.0"
-            case_timeout_s: "900"
-            total_budget_s: "5400"
+            case_timeout_s: "2400"
+            total_budget_s: "9600"
             disk_multiplier: "1.7"
             min_passes: "0"
             large_models: "false"
           - shard: large-a
             max_model_gb: "18.0"
-            case_timeout_s: "1200"
-            total_budget_s: "7200"
+            case_timeout_s: "3600"
+            total_budget_s: "14400"
             disk_multiplier: "1.35"
             min_passes: "0"
             large_models: "true"
           - shard: large-b
             max_model_gb: "26.0"
-            case_timeout_s: "1200"
-            total_budget_s: "7200"
+            case_timeout_s: "3600"
+            total_budget_s: "14400"
             disk_multiplier: "1.25"
             min_passes: "0"
             large_models: "true"
           - shard: moe
             max_model_gb: "40.0"
-            case_timeout_s: "2400"
-            total_budget_s: "9600"
+            case_timeout_s: "5400"
+            total_budget_s: "18000"
             disk_multiplier: "1.15"
             min_passes: "0"
             large_models: "true"
           - shard: audio-a
             max_model_gb: "16.0"
-            case_timeout_s: "1200"
-            total_budget_s: "7200"
+            case_timeout_s: "3600"
+            total_budget_s: "14400"
             disk_multiplier: "1.4"
             min_passes: "0"
             large_models: "true"
           - shard: audio-b
             max_model_gb: "40.0"
-            case_timeout_s: "1800"
-            total_budget_s: "9000"
+            case_timeout_s: "3600"
+            total_budget_s: "14400"
             disk_multiplier: "1.2"
             min_passes: "0"
             large_models: "true"
@@ -98,7 +98,7 @@ jobs:
       UNSLOTH_MLX_REAL_CASE_TIMEOUT_S: ${{ matrix.case_timeout_s }}
       UNSLOTH_MLX_REAL_TOTAL_BUDGET_S: ${{ matrix.total_budget_s }}
       UNSLOTH_MLX_REAL_DISK_MULTIPLIER: ${{ matrix.disk_multiplier }}
-      UNSLOTH_MLX_REAL_MAX_TOKENS: "2"
+      UNSLOTH_MLX_REAL_MAX_TOKENS: "128"
 
     steps:
       - name: Harden runner (audit)

@@ -52,7 +52,7 @@ CANDIDATES = [
     Candidate("phi3-v", "mlx-community/Phi-3.5-vision-instruct-4bit", shard="medium-b"),
     Candidate("granite-vision", "mlx-community/granite-vision-3.2-2b-4bit", shard="medium-b"),
     Candidate("qwen2.5-vl", "mlx-community/Qwen2.5-VL-3B-Instruct-4bit", shard="medium-b"),
-    Candidate("gemma3", "mlx-community/gemma-3-4b-it-4bit", shard="medium-b"),
+    Candidate("gemma3-qat", "mlx-community/gemma-3-4b-it-qat-4bit", shard="medium-b"),
     Candidate("llava", "mlx-community/llava-1.5-7b-4bit", shard="large-a"),
     Candidate("llava-next", "mlx-community/llava-v1.6-mistral-7b-4bit", shard="large-a"),
     Candidate("llava-bunny", "mlx-community/Bunny-Llama-3-8B-V-4bit", shard="large-a"),
@@ -68,7 +68,7 @@ CANDIDATES = [
     Candidate("kimi-vl", "mlx-community/Kimi-VL-A3B-Thinking-4bit", shard="large-b"),
     Candidate("deepseek-vl-v2-small", "mlx-community/deepseek-vl2-small-4bit", shard="large-b"),
     Candidate("mistral3-vl", "mlx-community/Mistral-Small-3.1-24B-Instruct-2503-4bit", shard="large-b"),
-    Candidate("qwen3.6-vl-moe", "unsloth/Qwen3.6-35B-A3B-NVFP4", shard="moe"),
+    Candidate("qwen3.6-moe-ud", "unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit", shard="moe"),
     Candidate("qwen3-vl-moe", "mlx-community/Qwen3-VL-30B-A3B-Instruct-3bit", shard="moe"),
     Candidate("llama4", "mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit", shard="moe"),
     Candidate("step3p7", "mlx-community/Step-3.7-Flash-4bit", shard="moe"),
@@ -79,8 +79,8 @@ CANDIDATES = [
     Candidate("minicpmo-audio", "mlx-community/MiniCPM-o-4_5-4bit", modality="audio", shard="audio-a"),
     Candidate("qwen2-audio", "mlx-community/Qwen2-Audio-7B-Instruct-4bit", modality="audio", shard="audio-b"),
     Candidate("qwen2.5-omni-audio", "giangndm/qwen2.5-omni-3b-mlx-4bit", modality="audio", shard="audio-b"),
-    Candidate("nemotron-h-nano-omni", "unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning", modality="audio", shard="audio-b"),
-    Candidate("qwen3-omni-audio", "mlx-community/Qwen3-Omni-30B-A3B-Instruct-4bit", modality="audio", shard="audio-b"),
+    Candidate("nemotron-h-nano-omni-mxfp4", "mlx-community/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-mxfp4", modality="audio", shard="audio-b"),
+    Candidate("qwen3-omni-audio", "abnormalmapstudio/Qwen3-Omni-30B-A3B-Instruct-mxfp4-mlx", modality="audio", shard="audio-b"),
 ]
 
 
@@ -219,7 +219,7 @@ def _child_prompt(processor, config, modality: str):
                 "role": "user",
                 "content": [
                     {"type": "audio"},
-                    {"type": "text", "text": "Describe this short tone."},
+                    {"type": "text", "text": "Describe this short tone in a detailed paragraph of about 128 tokens."},
                 ],
             }
         ]
@@ -237,17 +237,17 @@ def _child_prompt(processor, config, modality: str):
                 or getattr(getattr(processor, "tokenizer", None), "audio_token", None)
                 or "<audio>"
             )
-            return f"{audio_token}\nDescribe this short tone."
+            return f"{audio_token}\nDescribe this short tone in a detailed paragraph of about 128 tokens."
 
     if "deepseek_vl" in model_type:
-        return "<image>\nDescribe this image in one word."
+        return "<image>\nDescribe this image in a detailed paragraph of about 128 tokens."
 
     messages = [
         {
             "role": "user",
             "content": [
                 {"type": "image"},
-                {"type": "text", "text": "Describe this image in one word."},
+                {"type": "text", "text": "Describe this image in a detailed paragraph of about 128 tokens."},
             ],
         }
     ]
@@ -266,8 +266,8 @@ def _child_prompt(processor, config, modality: str):
             or "<image>"
         )
         if "llava" in model_type:
-            return f"USER: {image_token}\nDescribe this image in one word.\nASSISTANT:"
-        return f"{image_token}\nDescribe this image in one word."
+            return f"USER: {image_token}\nDescribe this image in a detailed paragraph of about 128 tokens.\nASSISTANT:"
+        return f"{image_token}\nDescribe this image in a detailed paragraph of about 128 tokens."
 
 
 def _text_prompt(tokenizer) -> str:
@@ -282,7 +282,7 @@ def _text_prompt(tokenizer) -> str:
             )
         except Exception:
             pass
-    return "Say hello."
+    return "Write a detailed paragraph of about 128 tokens about validating model inference."
 
 
 def _write_tone(path: Path) -> None:
@@ -305,6 +305,15 @@ def _write_tone(path: Path) -> None:
 def _short_exception(exc: BaseException) -> str:
     lines = traceback.format_exception_only(type(exc), exc)
     return " ".join(line.strip() for line in lines if line.strip())[:300]
+
+
+def _markdown_cell(value) -> str:
+    text = "" if value is None else str(value)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text.replace("|", "\\|")
+    if len(text) > 220:
+        text = text[:217].rstrip() + "..."
+    return text
 
 
 def _peak_memory_gb(mx) -> float:
@@ -331,6 +340,7 @@ def _common_summary(candidate: Candidate, processor, mx, **extra) -> dict:
             else f"{processor.feature_extractor.__class__.__module__}.{processor.feature_extractor.__class__.__name__}"
         ),
         "peak_memory_gb": _peak_memory_gb(mx),
+        "requested_max_tokens": int(os.environ.get("UNSLOTH_MLX_REAL_MAX_TOKENS", "128")),
     }
     summary.update(extra)
     return summary
@@ -468,24 +478,35 @@ def _child_main(payload: str) -> int:
 
 
 def _summary_markdown(results: list[dict]) -> str:
+    counts = {}
+    for result in results:
+        status = result.get("status", "")
+        counts[status] = counts.get(status, 0) + 1
+    count_text = ", ".join(f"{status}={count}" for status, count in sorted(counts.items()))
     rows = [
-        "| Shard | Family | Repo | Status | Detail |",
-        "| --- | --- | --- | --- | --- |",
+        f"Status counts: {count_text or 'none'}",
+        "",
+        "| Shard | Family | Repo | Modality | Status | Tokens | Peak | Processor | Detail |",
+        "| --- | --- | --- | --- | --- | ---: | ---: | --- | --- |",
     ]
     for result in results:
         detail = result.get("reason")
         if result.get("status") == "passed":
             detail = (
-                f"{result.get('modality')} generation_tokens={result.get('generation_tokens')} "
-                f"peak={result.get('peak_memory_gb')}GB"
+                f"requested_max_tokens={result.get('requested_max_tokens')} "
+                f"text_head={result.get('text_head', '')!r}"
             )
         rows.append(
-            "| {shard} | {family} | `{repo}` | {status} | {detail} |".format(
-                shard=result.get("shard", ""),
-                family=result.get("family", ""),
-                repo=result.get("repo", ""),
-                status=result.get("status", ""),
-                detail=(detail or "").replace("|", "\\|"),
+            "| {shard} | {family} | `{repo}` | {modality} | {status} | {tokens} | {peak} | {processor} | {detail} |".format(
+                shard=_markdown_cell(result.get("shard", "")),
+                family=_markdown_cell(result.get("family", "")),
+                repo=_markdown_cell(result.get("repo", "")),
+                modality=_markdown_cell(result.get("modality", "")),
+                status=_markdown_cell(result.get("status", "")),
+                tokens=_markdown_cell(result.get("generation_tokens", "")),
+                peak=_markdown_cell(result.get("peak_memory_gb", "")),
+                processor=_markdown_cell(result.get("processor", "")),
+                detail=_markdown_cell(detail),
             )
         )
     return "\n".join(rows) + "\n"
@@ -517,6 +538,7 @@ def _parent_main() -> int:
                 {
                     "family": candidate.family,
                     "repo": candidate.repo,
+                    "modality": candidate.modality,
                     "shard": candidate.shard,
                     "status": "skipped-time",
                     "reason": f"overall budget {total_budget_s}s nearly exhausted",
@@ -535,6 +557,7 @@ def _parent_main() -> int:
                     {
                         "family": candidate.family,
                         "repo": candidate.repo,
+                        "modality": candidate.modality,
                         "shard": candidate.shard,
                         "status": "skipped-metadata",
                         "reason": str(exc)[:200],
@@ -550,6 +573,7 @@ def _parent_main() -> int:
                     {
                         "family": candidate.family,
                         "repo": candidate.repo,
+                        "modality": candidate.modality,
                         "shard": candidate.shard,
                         "status": "skipped-size",
                         "reason": f"{size_gb:.2f}GB > limit {max_model_gb:.2f}GB",
@@ -565,6 +589,7 @@ def _parent_main() -> int:
                 {
                     "family": candidate.family,
                     "repo": candidate.repo,
+                    "modality": candidate.modality,
                     "shard": candidate.shard,
                     "status": "skipped-disk",
                     "reason": f"{free_gb:.1f}GiB free < guard {needed_gb:.1f}GiB",
