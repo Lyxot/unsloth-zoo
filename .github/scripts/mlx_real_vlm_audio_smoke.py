@@ -79,7 +79,7 @@ CANDIDATES = [
     Candidate("kimi-vl", "mlx-community/Kimi-VL-A3B-Thinking-4bit", shard="large-b"),
     Candidate("deepseek-vl-v2-small", "mlx-community/deepseek-vl2-small-4bit", shard="large-b"),
     Candidate("mistral3-vl", "mlx-community/Mistral-Small-3.1-24B-Instruct-2503-4bit", shard="large-b"),
-    Candidate("qwen3.6-moe", "Qwen/Qwen3.6-35B-A3B-FP8", shard="moe"),
+    Candidate("qwen3.6-moe", "unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit", shard="moe"),
     Candidate("qwen3-vl-moe", "mlx-community/Qwen3-VL-30B-A3B-Instruct-3bit", shard="moe"),
     Candidate("llama4", "mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit", shard="moe"),
     Candidate("step3p7", "mlx-community/Step-3.7-Flash-4bit", shard="moe"),
@@ -226,6 +226,7 @@ def _run_child(
         {
             "HF_HOME": str(hf_home),
             "HF_HUB_DISABLE_XET": "1",
+            "HF_HUB_ENABLE_HF_TRANSFER": "0",
             "TOKENIZERS_PARALLELISM": "false",
             "PYTHONUNBUFFERED": "1",
         }

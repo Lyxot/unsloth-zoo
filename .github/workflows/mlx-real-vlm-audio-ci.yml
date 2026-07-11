@@ -47,6 +47,7 @@ jobs:
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
       HF_HUB_DISABLE_XET: "1"
+      HF_HUB_ENABLE_HF_TRANSFER: "0"
       HF_HOME: /tmp/unsloth-hf-${{ matrix.model_key }}
       PIP_NO_CACHE_DIR: "1"
       PYTHONUNBUFFERED: "1"
@@ -72,7 +73,7 @@ jobs:
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
-          python-version: "3.12"
+          python-version: "3.13"
 
       - name: Show runner resources
         run: |
@@ -100,12 +101,56 @@ jobs:
           sysctl vm.swapusage || true
           df -h
 
-      - name: Install zoo with MLX and media deps
+      - name: Install zoo with Studio release MLX stack
         run: |
-          python -m pip install --upgrade pip
-          pip install "torch>=2.4.0,<2.13.0" "torchvision>=0.19.0" "torchaudio>=2.4.0"
-          pip install -e .[mlx]
-          pip install "soundfile>=0.12.1" "timm>=1.0.0" "addict>=2.4.0" "matplotlib>=3.8.0"
+          constraints=.github/constraints/studio-release-macos.txt
+          python -m pip install -c "$constraints" pip
+          pip install -c "$constraints" \
+            torch torchvision torchaudio \
+            datasets transformers tokenizers huggingface-hub safetensors \
+            sentencepiece protobuf pyyaml jinja2 \
+            numpy pillow opencv-python scipy \
+            packaging requests tqdm psutil wheel hf-transfer \
+            regex msgspec typing-extensions filelock \
+            miniaudio fastapi uvicorn \
+            soundfile timm matplotlib
+          # Studio overlays this MLX stack despite mlx-lm/mlx-vlm declaring a
+          # Transformers >=5 dependency; reproduce the shipped environment.
+          pip install --no-deps -c "$constraints" mlx mlx-metal mlx-lm mlx-vlm
+          pip install --no-deps -e .
+
+      - name: Verify Studio release runtime
+        run: |
+          python - <<'PY'
+          import platform
+          from importlib.metadata import PackageNotFoundError, version
+          from pathlib import Path
+
+          expected = {}
+          for raw_line in Path(".github/constraints/studio-release-macos.txt").read_text().splitlines():
+              line = raw_line.strip()
+              if line and not line.startswith("#"):
+                  package, expected_version = line.split("==", 1)
+                  expected[package] = expected_version
+          mismatches = {
+              package: {"expected": expected_version, "actual": version(package)}
+              for package, expected_version in expected.items()
+              if version(package) != expected_version
+          }
+          python_version = platform.python_version()
+          print("Studio release Python:", python_version)
+          print("Studio release packages checked:", len(expected))
+          if tuple(map(int, python_version.split(".")[:2])) != (3, 13):
+              raise SystemExit(f"Studio release Python mismatch: {python_version}")
+          if mismatches:
+              raise SystemExit(f"Studio release runtime mismatch: {mismatches}")
+          for package in ("mlx-audio", "addict"):
+              try:
+                  unexpected_version = version(package)
+              except PackageNotFoundError:
+                  continue
+              raise SystemExit(f"Studio does not ship {package}, found {unexpected_version}")
+          PY
 
       - name: Real model generation
         run: |
