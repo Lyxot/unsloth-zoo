@@ -7,6 +7,11 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   workflow_dispatch:
+    inputs:
+      model_keys:
+        description: Optional comma-separated model keys to run
+        required: false
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -33,7 +38,9 @@ jobs:
       - id: matrix
         name: Emit model matrix
         run: |
-          matrix=$(python .github/scripts/mlx_real_vlm_audio_smoke.py --matrix-json)
+          matrix=$(python .github/scripts/mlx_real_vlm_audio_smoke.py \
+            --matrix-json \
+            --matrix-model-keys "${{ inputs.model_keys }}")
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   real-vlm-audio:
@@ -56,6 +63,7 @@ jobs:
       UNSLOTH_MLX_REAL_MAX_MODEL_GB: ${{ matrix.max_model_gb }}
       UNSLOTH_MLX_REAL_MIN_REAL_PASSES: ${{ matrix.min_real_passes }}
       UNSLOTH_MLX_REAL_CASE_TIMEOUT_S: "600"
+      UNSLOTH_MLX_REAL_DOWNLOAD_TIMEOUT_S: "600"
       UNSLOTH_MLX_REAL_TOTAL_BUDGET_S: ${{ matrix.total_budget_s }}
       UNSLOTH_MLX_REAL_DISK_MULTIPLIER: ${{ matrix.disk_multiplier }}
       UNSLOTH_MLX_REAL_MAX_TOKENS: "128"
