@@ -63,7 +63,7 @@ CANDIDATES = [
     Candidate("granite-vision", "mlx-community/granite-vision-3.2-2b-4bit", shard="medium"),
     Candidate("qwen2.5-vl", "mlx-community/Qwen2.5-VL-3B-Instruct-4bit", shard="medium"),
     Candidate("qwen2.5-vl", "mlx-community/Qwen2.5-VL-3B-Instruct-4bit", modality="video", shard="medium"),
-    Candidate("gemma3", "google/gemma-3-4b-it", shard="medium"),
+    Candidate("gemma3", "mlx-community/gemma-3-4b-it-4bit", shard="medium"),
     Candidate("llava", "mlx-community/llava-1.5-7b-4bit", shard="large-a"),
     Candidate("llava-next", "mlx-community/llava-v1.6-mistral-7b-4bit", shard="large-a"),
     Candidate("llava-bunny", "mlx-community/Bunny-Llama-3-8B-V-4bit", shard="large-a"),
@@ -124,9 +124,16 @@ def _model_groups() -> dict[str, list[Candidate]]:
     return groups
 
 
-def _model_matrix() -> dict:
+def _model_matrix(model_keys: str | None = None) -> dict:
+    selected = {
+        key.strip()
+        for key in str(model_keys or "").split(",")
+        if key.strip()
+    }
     include = []
     for repo, candidates in _model_groups().items():
+        if selected and _model_key(candidates[0]) not in selected:
+            continue
         policies = [SHARD_POLICIES[candidate.shard] for candidate in candidates]
         modalities = list(dict.fromkeys(candidate.modality for candidate in candidates))
         include.append(
@@ -143,6 +150,10 @@ def _model_matrix() -> dict:
                 "timeout_minutes": 15 + 10 * len(candidates),
             }
         )
+    found = {model["model_key"] for model in include}
+    unknown = sorted(selected - found)
+    if unknown:
+        raise ValueError(f"Unknown model keys: {unknown}")
     return {"include": include}
 
 
@@ -152,8 +163,13 @@ def _print_group(title: str, body: str) -> None:
     print("::endgroup::")
 
 
-def _repo_cache_name(repo: str) -> str:
-    return "models--" + repo.replace("/", "--")
+def _stage(name: str) -> None:
+    print(f"STAGE:{name}", flush=True)
+
+
+def _last_stage(output: str) -> str:
+    matches = re.findall(r"^STAGE:([^\r\n]+)", output, flags=re.MULTILINE)
+    return matches[-1].strip() if matches else "unknown"
 
 
 def _candidate_size_bytes(repo: str) -> int | None:
@@ -186,6 +202,24 @@ def _is_resource_failure(returncode: int | None, output: str) -> bool:
             "kiogpucommandbuffercallbackerrortimeout",
             "causing prior/excessive gpu errors",
             "resource exhausted",
+        )
+    )
+
+
+def _is_network_failure(output: str) -> bool:
+    lowered = output.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "read operation timed out",
+            "connect timeout",
+            "connection error",
+            "connection reset",
+            "temporary failure in name resolution",
+            "failed to establish a new connection",
+            "max retries exceeded",
+            "http 429",
+            "http 5",
         )
     )
 
@@ -225,6 +259,7 @@ def _run_child(
     env.update(
         {
             "HF_HOME": str(hf_home),
+            "HF_HUB_OFFLINE": "1",
             "HF_HUB_DISABLE_XET": "1",
             "HF_HUB_ENABLE_HF_TRANSFER": "0",
             "TOKENIZERS_PARALLELISM": "false",
@@ -254,6 +289,7 @@ def _run_child(
             return {
                 "family": candidate.family,
                 "repo": candidate.repo,
+                "modality": candidate.modality,
                 "status": "skipped-resource",
                 "reason": f"resource failure, returncode={completed.returncode}",
                 "elapsed_s": round(elapsed, 1),
@@ -261,6 +297,7 @@ def _run_child(
         return {
             "family": candidate.family,
             "repo": candidate.repo,
+            "modality": candidate.modality,
             "status": "failed",
             "reason": _failure_reason(completed.returncode, output),
             "elapsed_s": round(elapsed, 1),
@@ -268,16 +305,76 @@ def _run_child(
     except subprocess.TimeoutExpired as exc:
         output = _combined_output(exc.stdout, exc.stderr)
         _print_group(f"{candidate.family}: timeout output", output)
+        stage = _last_stage(output)
+        if _is_network_failure(output):
+            status = "skipped-network"
+        elif _is_resource_failure(None, output):
+            status = "skipped-resource"
+        else:
+            status = "skipped-timeout"
         return {
             "family": candidate.family,
             "repo": candidate.repo,
-            "status": "skipped-resource",
-            "reason": f"timeout after {timeout_s}s",
+            "modality": candidate.modality,
+            "status": status,
+            "reason": f"timeout after {timeout_s}s during {stage}",
+            "last_stage": stage,
             "elapsed_s": timeout_s,
         }
     finally:
         if owns_hf_home:
             shutil.rmtree(hf_home, ignore_errors=True)
+
+
+def _download_candidate(repo: str, hf_home: Path, timeout_s: int) -> dict:
+    env = os.environ.copy()
+    env.pop("HF_HUB_OFFLINE", None)
+    env.update(
+        {
+            "HF_HOME": str(hf_home),
+            "HF_HUB_DISABLE_XET": "1",
+            "HF_HUB_ENABLE_HF_TRANSFER": "0",
+            "HF_HUB_DOWNLOAD_TIMEOUT": "120",
+            "PYTHONUNBUFFERED": "1",
+        }
+    )
+    started = time.monotonic()
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                __file__,
+                "--download",
+                repo,
+                "--download-cache",
+                str(hf_home / "hub"),
+            ],
+            cwd=Path(__file__).resolve().parents[2],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = _combined_output(exc.stdout, exc.stderr)
+        _print_group(f"{repo}: download timeout", output)
+        return {
+            "status": "skipped-network",
+            "reason": f"download timeout after {timeout_s}s",
+            "download_elapsed_s": timeout_s,
+        }
+
+    elapsed = round(time.monotonic() - started, 1)
+    output = _combined_output(completed.stdout, completed.stderr)
+    _print_group(f"{repo}: download output", output)
+    if completed.returncode == 0:
+        return {"status": "downloaded", "download_elapsed_s": elapsed}
+    status = "skipped-network" if _is_network_failure(output) else "skipped-download"
+    return {
+        "status": status,
+        "reason": _failure_reason(completed.returncode, output),
+        "download_elapsed_s": elapsed,
+    }
 
 
 def _child_prompt(processor, config, modality: str):
@@ -442,17 +539,6 @@ def _shape_list(value) -> list[int] | None:
     return [int(dim) for dim in shape]
 
 
-def _sequence_length(value) -> int | None:
-    shape = _shape_list(value)
-    if shape:
-        return int(shape[-1])
-    if isinstance(value, list):
-        if value and isinstance(value[0], list):
-            return len(value[0])
-        return len(value)
-    return None
-
-
 def _input_keys(inputs) -> list[str]:
     if hasattr(inputs, "keys"):
         return sorted(str(key) for key in inputs.keys())
@@ -493,25 +579,35 @@ def _studio_user_text(candidate: Candidate) -> str:
 
 
 def _studio_prompt(processor, config, candidate: Candidate, user_text: str) -> str:
-    media = {"type": candidate.modality}
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                media,
-                {"type": "text", "text": user_text},
-            ],
-        }
-    ]
-    if hasattr(processor, "apply_chat_template"):
+    if candidate.modality == "text":
+        messages = [{"role": "user", "content": user_text}]
+    else:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": candidate.modality},
+                    {"type": "text", "text": user_text},
+                ],
+            }
+        ]
+    chat_target = processor
+    if (
+        getattr(processor, "apply_chat_template", None) is None
+        or getattr(processor, "chat_template", None) is None
+    ):
+        chat_target = getattr(processor, "tokenizer", processor)
+    if hasattr(chat_target, "apply_chat_template"):
         try:
-            return processor.apply_chat_template(
+            return chat_target.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
             )
         except Exception:
             pass
+    if candidate.modality == "text":
+        return user_text
     return _child_prompt(processor, config, candidate.modality)
 
 
@@ -530,160 +626,159 @@ def _first_processor_success(attempts: list[tuple[str, object]]):
     raise RuntimeError("all Studio-shaped processor calls failed; " + "; ".join(errors[:5]))
 
 
-def _build_studio_shape_inputs(candidate: Candidate, processor, config):
-    from PIL import Image
-
-    user_text = _studio_user_text(candidate)
-
-    if candidate.modality == "audio":
-        audio, sample_rate = _tone_array()
-        messages = [
-            {
-                "role": "system",
-                "content": [{"type": "text", "text": "You are an assistant that transcribes speech accurately."}],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "audio", "audio": audio},
-                    {"type": "text", "text": user_text},
-                ],
-            },
-        ]
-        attempts = []
-        if hasattr(processor, "apply_chat_template"):
-            attempts.append(
-                (
-                    "apply_chat_template(audio)",
-                    lambda: processor.apply_chat_template(
-                        messages,
-                        add_generation_prompt=True,
-                        tokenize=True,
-                        return_dict=True,
-                        return_tensors="pt",
-                        truncation=False,
-                    ),
-                )
-            )
-        prompt = _studio_prompt(processor, config, candidate, user_text)
-        attempts.extend(
-            [
-                (
-                    "processor(text,audio)",
-                    lambda: processor(
-                        text=[prompt],
-                        audio=[audio],
-                        sampling_rate=sample_rate,
-                        padding=True,
-                        return_tensors="pt",
-                    ),
-                ),
-                (
-                    "processor(text,audios)",
-                    lambda: processor(
-                        text=[prompt],
-                        audios=[audio],
-                        sampling_rate=sample_rate,
-                        padding=True,
-                        return_tensors="pt",
-                    ),
-                ),
-            ]
-        )
-        inputs, processor_call = _first_processor_success(attempts)
-        return inputs, {"processor_call": processor_call, "audio_samples": len(audio)}
-
-    prompt = _studio_prompt(processor, config, candidate, user_text)
-    if candidate.modality == "video":
-        frames = _video_frames()
-        attempts = [
-            (
-                "processor(text,videos)",
-                lambda: processor(
-                    text=[prompt],
-                    videos=[frames],
-                    padding=True,
-                    return_tensors="pt",
-                ),
-            ),
-            (
-                "processor(prompt,videos)",
-                lambda: processor(
-                    prompt,
-                    videos=[frames],
-                    return_tensors="pt",
-                ),
-            ),
-        ]
-        inputs, processor_call = _first_processor_success(attempts)
-        return inputs, {"processor_call": processor_call, "video_frames": len(frames)}
-
-    image_size = (1024, 1024) if candidate.family == "qwen3-vl" else (224, 224)
-    image = Image.new("RGB", image_size, (80, 120, 210))
+def _build_studio_video_inputs(candidate: Candidate, processor, config):
+    prompt = _studio_prompt(
+        processor,
+        config,
+        candidate,
+        _studio_user_text(candidate),
+    )
+    frames = _video_frames()
     attempts = [
         (
-            "processor(image,prompt)",
+            "processor(text,videos)",
             lambda: processor(
-                image,
+                text=[prompt],
+                videos=[frames],
+                padding=True,
+                return_tensors="pt",
+            ),
+        ),
+        (
+            "processor(prompt,videos)",
+            lambda: processor(
                 prompt,
-                add_special_tokens=False,
-                return_tensors="pt",
-            ),
-        ),
-        (
-            "processor(images,text)",
-            lambda: processor(
-                images=[image],
-                text=[prompt],
-                padding=True,
-                add_special_tokens=False,
-                return_tensors="pt",
-            ),
-        ),
-        (
-            "processor(text,images)",
-            lambda: processor(
-                text=[prompt],
-                images=[image],
-                padding=True,
-                add_special_tokens=False,
+                videos=[frames],
                 return_tensors="pt",
             ),
         ),
     ]
     inputs, processor_call = _first_processor_success(attempts)
-    return inputs, {"processor_call": processor_call, "image_size": f"{image_size[0]}x{image_size[1]}"}
+    return inputs, {"processor_call": processor_call, "video_frames": len(frames)}
 
 
-def _run_studio_shape_generation(candidate: Candidate, model, processor, mx) -> dict:
+def _to_mlx(value, mx):
+    if isinstance(value, mx.array):
+        return value
+    try:
+        import torch
+
+        if isinstance(value, torch.Tensor):
+            return mx.array(value.detach().cpu().numpy())
+    except ImportError:
+        pass
+    try:
+        import numpy as np
+
+        if isinstance(value, np.ndarray):
+            return mx.array(value)
+        if isinstance(value, (list, tuple)) and value and not isinstance(
+            value[0], (str, bytes, dict)
+        ):
+            return mx.array(np.asarray(value))
+    except (TypeError, ValueError):
+        pass
+    return value
+
+
+def _run_studio_shape_generation(
+    candidate: Candidate,
+    model,
+    processor,
+    mx,
+    tmp_dir: Path,
+) -> dict:
+    from PIL import Image
+    from mlx_vlm import generate as vlm_generate
+
     max_tokens = int(os.environ.get("UNSLOTH_MLX_REAL_MAX_TOKENS", "128"))
     config = getattr(model, "config", getattr(model, "_config", {}))
-    inputs, metadata = _build_studio_shape_inputs(candidate, processor, config)
-    keys = _input_keys(inputs)
-    if "input_ids" not in inputs:
-        raise RuntimeError(f"Studio-shaped processor call did not return input_ids: keys={keys}")
-
-    prompt_tokens = _sequence_length(inputs["input_ids"])
-    if prompt_tokens is None:
-        raise RuntimeError("Studio-shaped processor call returned input_ids without a sequence length")
-    if candidate.family == "qwen3-vl" and candidate.modality == "image" and prompt_tokens <= 2048:
-        raise RuntimeError(f"Studio-shaped prompt did not cross prefill chunk boundary: {prompt_tokens}")
-
-    output = model.generate(
-        **inputs,
-        streamer=None,
-        max_new_tokens=max_tokens,
-        use_cache=True,
-        do_sample=False,
-        temperature=0.0,
-        top_p=1.0,
-        top_k=0,
-        min_p=0.0,
+    prompt = _studio_prompt(
+        processor,
+        config,
+        candidate,
+        _studio_user_text(candidate),
     )
-    output_tokens = _sequence_length(output)
-    generation_tokens = 0 if output_tokens is None else max(0, output_tokens - prompt_tokens)
+    metadata = {"processor_call": "mlx_vlm.generate"}
+    generation_kwargs = {
+        "max_tokens": max_tokens,
+        "verbose": False,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": 0,
+        "min_p": 0.0,
+    }
+
+    _stage(f"{candidate.modality}-preprocess")
+    if candidate.modality == "image":
+        image_size = (1024, 1024) if candidate.family == "qwen3-vl" else (224, 224)
+        image = Image.new("RGB", image_size, (80, 120, 210))
+        metadata["image_size"] = f"{image_size[0]}x{image_size[1]}"
+        _stage("image-generate")
+        result = vlm_generate(
+            model,
+            processor,
+            prompt,
+            image=[image],
+            **generation_kwargs,
+        )
+    elif candidate.modality == "audio":
+        import soundfile as sf
+
+        audio, sample_rate = _tone_array()
+        audio_path = tmp_dir / "tone.wav"
+        sf.write(audio_path, audio, sample_rate)
+        metadata["audio_samples"] = len(audio)
+        _stage("audio-generate")
+        result = vlm_generate(
+            model,
+            processor,
+            prompt,
+            audio=[str(audio_path)],
+            **generation_kwargs,
+        )
+    else:
+        inputs, video_metadata = _build_studio_video_inputs(
+            candidate, processor, config
+        )
+        metadata.update(video_metadata)
+        keys = _input_keys(inputs)
+        if "input_ids" not in inputs:
+            raise RuntimeError(
+                f"Studio-shaped processor call did not return input_ids: keys={keys}"
+            )
+        prepared = {key: _to_mlx(value, mx) for key, value in inputs.items()}
+        input_ids = prepared.pop("input_ids")
+        pixel_values = prepared.pop("pixel_values", None)
+        mask = prepared.pop("attention_mask", None)
+        metadata.update(
+            input_keys=",".join(keys[:8]),
+            input_shape=str(_shape_list(input_ids)),
+        )
+        _stage("video-generate")
+        result = vlm_generate(
+            model,
+            processor,
+            prompt,
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            mask=mask,
+            **prepared,
+            **generation_kwargs,
+        )
+
+    prompt_tokens = int(getattr(result, "prompt_tokens", 0) or 0)
+    generation_tokens = int(getattr(result, "generation_tokens", 0) or 0)
     if generation_tokens <= 0:
-        raise RuntimeError(f"Studio-shaped generation produced no new tokens: shape={_shape_list(output)}")
+        raise RuntimeError("Studio-shaped generation produced no new tokens")
+    if (
+        candidate.family == "qwen3-vl"
+        and candidate.modality == "image"
+        and prompt_tokens <= 2048
+    ):
+        raise RuntimeError(
+            f"Studio-shaped prompt did not cross prefill chunk boundary: {prompt_tokens}"
+        )
 
     return _common_summary(
         candidate,
@@ -693,9 +788,7 @@ def _run_studio_shape_generation(candidate: Candidate, model, processor, mx) -> 
         studio_shape=True,
         prompt_tokens=prompt_tokens,
         generation_tokens=generation_tokens,
-        input_shape=str(_shape_list(inputs["input_ids"])),
-        output_shape=str(_shape_list(output)),
-        input_keys=",".join(keys[:8]),
+        text_head=str(getattr(result, "text", ""))[:80],
         **metadata,
     )
 
@@ -706,20 +799,23 @@ def _run_multimodal_generation(candidate: Candidate, tmp_dir: Path) -> dict:
     from unsloth_zoo.mlx.loader import FastMLXModel
 
     model = processor = None
-    stage = "load"
+    stage = "multimodal-load"
     try:
         if hasattr(mx.metal, "reset_peak_memory"):
             mx.metal.reset_peak_memory()
 
+        _stage(stage)
         model, processor = FastMLXModel.from_pretrained(
             candidate.repo,
             text_only=False,
             max_seq_length=2048,
         )
         stage = "Studio-shaped generation"
-        return _run_studio_shape_generation(candidate, model, processor, mx)
+        return _run_studio_shape_generation(
+            candidate, model, processor, mx, tmp_dir
+        )
     except Exception as exc:
-        if stage != "load":
+        if stage != "multimodal-load":
             raise MultimodalExecutionError(stage, exc) from exc
         raise
     finally:
@@ -732,57 +828,58 @@ def _run_multimodal_generation(candidate: Candidate, tmp_dir: Path) -> dict:
 def _run_text_only_generation(candidate: Candidate) -> dict:
     import gc
     import mlx.core as mx
-    from mlx_lm import generate as text_generate
+    from mlx_vlm import generate as vlm_generate
     from unsloth_zoo.mlx.loader import FastMLXModel
 
-    model = tokenizer = None
+    model = processor = None
     try:
         if hasattr(mx.metal, "reset_peak_memory"):
             mx.metal.reset_peak_memory()
 
-        model, tokenizer = FastMLXModel.from_pretrained(
+        _stage("text-load")
+        model, processor = FastMLXModel.from_pretrained(
             candidate.repo,
-            text_only=True,
-            max_seq_length=128,
+            text_only=False,
+            max_seq_length=2048,
         )
-        prompt = _text_prompt(tokenizer)
-        max_tokens = int(os.environ.get("UNSLOTH_MLX_REAL_MAX_TOKENS", "2"))
-        if getattr(model, "_unsloth_text_only_vlm", False):
-            from mlx_vlm import generate as vlm_generate
-
-            processor = getattr(model, "_processor", tokenizer)
-            result = vlm_generate(
-                model,
-                processor,
-                prompt,
-                max_tokens=max_tokens,
-                verbose=False,
-            )
-            text = str(getattr(result, "text", ""))
-            generation_tokens = int(getattr(result, "generation_tokens", 0) or 0)
-            summary_target = processor
-        else:
-            text = text_generate(
-                model,
-                tokenizer,
-                prompt,
-                max_tokens=max_tokens,
-                verbose=False,
-            )
-            generation_tokens = 0
-            summary_target = tokenizer
-        if not str(text).strip():
-            raise RuntimeError("text-only generation returned empty text")
+        config = getattr(model, "config", getattr(model, "_config", {}))
+        text_candidate = Candidate(
+            candidate.family,
+            candidate.repo,
+            modality="text",
+            shard=candidate.shard,
+            required=candidate.required,
+        )
+        prompt = _studio_prompt(
+            processor,
+            config,
+            text_candidate,
+            _text_prompt(processor),
+        )
+        max_tokens = int(os.environ.get("UNSLOTH_MLX_REAL_MAX_TOKENS", "128"))
+        _stage("text-generate")
+        result = vlm_generate(
+            model,
+            processor,
+            prompt,
+            max_tokens=max_tokens,
+            temperature=0.0,
+            verbose=False,
+        )
+        text = str(getattr(result, "text", ""))
+        generation_tokens = int(getattr(result, "generation_tokens", 0) or 0)
+        if generation_tokens <= 0:
+            raise RuntimeError("pure-text VLM generation produced no tokens")
         return _common_summary(
             candidate,
-            summary_target,
+            processor,
             mx,
             text_only_generation="passed",
             generation_tokens=generation_tokens,
             text_head=str(text)[:80],
         )
     finally:
-        del model, tokenizer
+        del model, processor
         gc.collect()
         if "mx" in locals() and hasattr(mx.metal, "clear_cache"):
             mx.metal.clear_cache()
@@ -853,13 +950,17 @@ def _summary_markdown(results: list[dict]) -> str:
     for result in results:
         detail = result.get("reason")
         if result.get("status") == "passed":
-            parts = [f"requested_max_tokens={result.get('requested_max_tokens')}"]
+            parts = [
+                f"requested_max_tokens={result.get('requested_max_tokens')}",
+                f"prompt_tokens={result.get('prompt_tokens')}",
+                f"download_s={result.get('download_elapsed_s')}",
+            ]
             if result.get("studio_shape"):
                 parts.append(
                     "studio_shape=True "
                     f"processor_call={result.get('processor_call')} "
                     f"input_shape={result.get('input_shape')} "
-                    f"output_shape={result.get('output_shape')}"
+                    f"text_head={result.get('text_head', '')!r}"
                 )
             else:
                 parts.append(f"text_head={result.get('text_head', '')!r}")
@@ -975,6 +1076,9 @@ def _parent_main(model_key: str | None = None) -> int:
     max_model_gb = float(os.environ.get("UNSLOTH_MLX_REAL_MAX_MODEL_GB", "8.0"))
     min_real_passes = int(os.environ.get("UNSLOTH_MLX_REAL_MIN_REAL_PASSES", "5"))
     timeout_s = int(os.environ.get("UNSLOTH_MLX_REAL_CASE_TIMEOUT_S", "600"))
+    download_timeout_s = int(
+        os.environ.get("UNSLOTH_MLX_REAL_DOWNLOAD_TIMEOUT_S", "600")
+    )
     total_budget_s = int(os.environ.get("UNSLOTH_MLX_REAL_TOTAL_BUDGET_S", "9600"))
     disk_multiplier = float(os.environ.get("UNSLOTH_MLX_REAL_DISK_MULTIPLIER", "2.2"))
     shard = os.environ.get("UNSLOTH_MLX_REAL_SHARD", "all")
@@ -1007,6 +1111,8 @@ def _parent_main(model_key: str | None = None) -> int:
         if model_key
         else None
     )
+    repo_hf_homes: dict[str, Path] = {}
+    download_results: dict[str, dict] = {}
 
     try:
         for candidate in candidates:
@@ -1075,26 +1181,46 @@ def _parent_main(model_key: str | None = None) -> int:
                 )
                 continue
 
-            print(f"Child timeout: {timeout_s}s")
-            result = _run_child(candidate, timeout_s, shared_hf_home)
-            result.setdefault("shard", candidate.shard)
-            results.append(result)
-
-            if shared_hf_home is None:
-                repo_cache = (
-                    Path(
-                        os.environ.get(
-                            "HF_HOME",
-                            Path.home() / ".cache" / "huggingface",
-                        )
-                    )
-                    / "hub"
-                    / _repo_cache_name(candidate.repo)
+            hf_home = shared_hf_home
+            if hf_home is None:
+                hf_home = repo_hf_homes.setdefault(
+                    candidate.repo,
+                    Path(tempfile.mkdtemp(prefix="unsloth_mlx_real_repo_")),
                 )
-                shutil.rmtree(repo_cache, ignore_errors=True)
+            download_result = download_results.get(candidate.repo)
+            if download_result is None:
+                print(f"Download timeout: {download_timeout_s}s")
+                download_result = _download_candidate(
+                    candidate.repo,
+                    hf_home,
+                    download_timeout_s,
+                )
+                download_results[candidate.repo] = download_result
+            if download_result["status"] != "downloaded":
+                results.append(
+                    {
+                        "family": candidate.family,
+                        "repo": candidate.repo,
+                        "modality": candidate.modality,
+                        "shard": candidate.shard,
+                        **download_result,
+                    }
+                )
+                continue
+
+            print(f"Child timeout: {timeout_s}s")
+            result = _run_child(candidate, timeout_s, hf_home)
+            result.setdefault("shard", candidate.shard)
+            result.setdefault(
+                "download_elapsed_s",
+                download_result.get("download_elapsed_s"),
+            )
+            results.append(result)
     finally:
         if shared_hf_home is not None:
             shutil.rmtree(shared_hf_home, ignore_errors=True)
+        for hf_home in repo_hf_homes.values():
+            shutil.rmtree(hf_home, ignore_errors=True)
 
     markdown = _summary_markdown(results)
     print(markdown)
@@ -1124,16 +1250,45 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--child")
     parser.add_argument("--matrix-json", action="store_true")
+    parser.add_argument("--matrix-model-keys")
     parser.add_argument("--model-key")
     parser.add_argument("--summarize-results")
+    parser.add_argument("--download")
+    parser.add_argument("--download-cache")
     args = parser.parse_args()
     if args.child:
         return _child_main(args.child)
     if args.matrix_json:
-        print(json.dumps(_model_matrix(), separators=(",", ":")))
+        print(
+            json.dumps(
+                _model_matrix(args.matrix_model_keys),
+                separators=(",", ":"),
+            )
+        )
         return 0
     if args.summarize_results:
         return _aggregate_results_main(args.summarize_results)
+    if args.download:
+        if not args.download_cache:
+            parser.error("--download-cache is required with --download")
+        from huggingface_hub import snapshot_download
+
+        _stage("download")
+        path = snapshot_download(
+            args.download,
+            cache_dir=args.download_cache,
+            allow_patterns=[
+                "*.json",
+                "*.safetensors",
+                "*.py",
+                "*.model",
+                "*.tiktoken",
+                "*.txt",
+                "*.jinja",
+            ],
+        )
+        print(f"Downloaded snapshot: {path}")
+        return 0
     return _parent_main(args.model_key)
 
 
