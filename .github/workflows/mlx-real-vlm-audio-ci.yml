@@ -1,0 +1,164 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+name: MLX Real VLM and Audio Smoke
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Build unique-model matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.12"
+
+      - id: matrix
+        name: Emit model matrix
+        run: |
+          matrix=$(python .github/scripts/mlx_real_vlm_audio_smoke.py --matrix-json)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  real-vlm-audio:
+    name: Real MLX ${{ matrix.family }} (${{ matrix.modalities }})
+    needs: plan
+    runs-on: macos-14
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      HF_HUB_DISABLE_XET: "1"
+      HF_HOME: /tmp/unsloth-hf-${{ matrix.model_key }}
+      PIP_NO_CACHE_DIR: "1"
+      PYTHONUNBUFFERED: "1"
+      TOKENIZERS_PARALLELISM: "false"
+      UNSLOTH_MLX_REAL_MODEL_KEY: ${{ matrix.model_key }}
+      UNSLOTH_MLX_REAL_MAX_MODEL_GB: ${{ matrix.max_model_gb }}
+      UNSLOTH_MLX_REAL_MIN_REAL_PASSES: ${{ matrix.min_real_passes }}
+      UNSLOTH_MLX_REAL_CASE_TIMEOUT_S: "600"
+      UNSLOTH_MLX_REAL_TOTAL_BUDGET_S: ${{ matrix.total_budget_s }}
+      UNSLOTH_MLX_REAL_DISK_MULTIPLIER: ${{ matrix.disk_multiplier }}
+      UNSLOTH_MLX_REAL_MAX_TOKENS: "128"
+      UNSLOTH_MLX_REAL_RESULTS_PATH: /tmp/mlx-results/${{ matrix.model_key }}.json
+
+    steps:
+      - name: Harden runner (audit)
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.12"
+
+      - name: Show runner resources
+        run: |
+          uname -a
+          python - <<'PY'
+          import os, platform, shutil
+          print("model:", os.environ["UNSLOTH_MLX_REAL_MODEL_KEY"])
+          print("machine:", platform.machine())
+          print("python:", platform.python_version())
+          print("free_gib:", round(shutil.disk_usage(".").free / 1024**3, 2))
+          PY
+          sysctl vm.swapusage || true
+          ulimit -n || true
+
+      - name: Prepare macOS swap headroom for large models
+        if: matrix.large_models == 'true'
+        run: |
+          # macOS grows swap dynamically under /private/var/vm; keep disk headroom
+          # available there for large MLX models instead of adding Linux swapon.
+          sudo mkdir -p /private/var/vm
+          sudo purge || true
+          ulimit -n 65536 || true
+          rm -rf ~/Library/Caches/pip ~/.cache/pip "$HF_HOME" || true
+          brew cleanup -s || true
+          sysctl vm.swapusage || true
+          df -h
+
+      - name: Install zoo with MLX and media deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0" "torchvision>=0.19.0" "torchaudio>=2.4.0"
+          pip install -e .[mlx]
+          pip install "soundfile>=0.12.1" "timm>=1.0.0" "addict>=2.4.0" "matplotlib>=3.8.0"
+
+      - name: Real model generation
+        run: |
+          ulimit -n 65536 || true
+          python .github/scripts/mlx_real_vlm_audio_smoke.py \
+            --model-key "$UNSLOTH_MLX_REAL_MODEL_KEY"
+
+      - name: Upload model result
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: mlx-result-${{ matrix.model_key }}
+          path: ${{ env.UNSLOTH_MLX_REAL_RESULTS_PATH }}
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Final disk report
+        if: always()
+        run: |
+          sysctl vm.swapusage || true
+          df -h
+          du -sh "$HF_HOME" 2>/dev/null || true
+
+  report:
+    name: Summarize all model results
+    if: always()
+    needs: [plan, real-vlm-audio]
+    runs-on: ubuntu-latest
+    env:
+      UNSLOTH_MLX_REAL_EXPECTED_MATRIX: ${{ needs.plan.outputs.matrix }}
+    steps:
+      - name: Harden runner (audit)
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.12"
+
+      - name: Download model results
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: mlx-result-*
+          path: matrix-results
+          merge-multiple: true
+
+      - name: Build aggregate summary
+        run: |
+          python .github/scripts/mlx_real_vlm_audio_smoke.py \
+            --summarize-results matrix-results
