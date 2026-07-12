@@ -115,7 +115,7 @@ jobs:
           python -m pip install -c "$constraints" pip
           pip install -c "$constraints" \
             torch torchvision torchaudio \
-            datasets transformers tokenizers huggingface-hub safetensors \
+            datasets einops transformers tokenizers huggingface-hub safetensors \
             sentencepiece protobuf pyyaml jinja2 \
             numpy pillow opencv-python scipy \
             packaging requests tqdm psutil wheel hf-transfer \

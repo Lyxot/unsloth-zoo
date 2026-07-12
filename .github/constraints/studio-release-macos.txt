@@ -2,6 +2,7 @@
 anyio==4.13.0
 click==8.3.0
 datasets==4.3.0
+einops==0.8.2
 fastapi==0.139.0
 filelock==3.29.0
 hf-transfer==0.1.9
