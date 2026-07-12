@@ -17,7 +17,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import textwrap
 import time
 import traceback
 from dataclasses import dataclass, asdict
@@ -194,6 +193,8 @@ def _is_resource_failure(returncode: int | None, output: str) -> bool:
         for marker in (
             "out of memory",
             "cannot allocate memory",
+            "unable to allocate",
+            "[malloc]",
             "no space left on device",
             "killed: 9",
             "signal 9",
@@ -222,6 +223,46 @@ def _is_network_failure(output: str) -> bool:
             "http 5",
         )
     )
+
+
+def _missing_dependency(output: str) -> str | None:
+    match = re.search(
+        r"(?:ModuleNotFoundError|ImportError): No module named ['\"]([^'\"]+)",
+        output,
+    )
+    if match is None or match.group(1).startswith("mlx_vlm.models."):
+        return None
+    return match.group(1)
+
+
+def _is_explicitly_unsupported(output: str) -> bool:
+    lowered = output.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "model type ",
+            "no module named 'mlx_vlm.models.",
+            " parameters not in model",
+            "unrecognized processing class",
+            "contains custom code which must be executed",
+            "installed mlx-lm / mlx-vlm rejects",
+            "cannot load mlx ",
+        )
+    )
+
+
+def _classify_dual_path_failure(multimodal_error: str, text_error: str) -> tuple[str, str]:
+    combined = f"{multimodal_error}\n{text_error}"
+    if _is_resource_failure(None, combined):
+        return "skipped-resource", "model could not run within runner resources"
+    if _is_network_failure(combined):
+        return "skipped-network", "model failed because network access was unavailable"
+    dependency = _missing_dependency(combined)
+    if dependency is not None:
+        return "unsupported-dependency", f"release environment is missing {dependency!r}"
+    if _is_explicitly_unsupported(combined):
+        return "unsupported-yet", "installed MLX runtime explicitly rejects this model"
+    return "failed-load", "both text and multimodal loading failed unexpectedly"
 
 
 def _as_text(part) -> str:
@@ -908,16 +949,21 @@ def _child_main(payload: str) -> int:
                 try:
                     text_summary = _run_text_only_generation(candidate)
                 except Exception as text_exc:
+                    text_error = _short_exception(text_exc)
+                    status, classification = _classify_dual_path_failure(
+                        multimodal_error,
+                        text_error,
+                    )
                     summary = {
                         "family": candidate.family,
                         "repo": candidate.repo,
                         "modality": candidate.modality,
                         "shard": candidate.shard,
-                        "status": "unsupported-yet",
+                        "status": status,
                         "reason": (
-                            "text-only path also failed; "
+                            f"{classification}; text-only path also failed; "
                             f"multimodal_error={multimodal_error}; "
-                            f"text_error={_short_exception(text_exc)}"
+                            f"text_error={text_error}"
                         ),
                     }
                 else:
@@ -1231,7 +1277,11 @@ def _parent_main(model_key: str | None = None) -> int:
             handle.write(markdown)
     _write_results_artifact(model_key, candidates, results)
 
-    multimodal_failures = [result for result in results if result.get("status") == "failed"]
+    multimodal_failures = [
+        result
+        for result in results
+        if str(result.get("status", "")).startswith("failed")
+    ]
     real_passes = [result for result in results if result.get("status") == "passed"]
     if multimodal_failures:
         print("Multimodal candidates failed despite working text-only path:")
