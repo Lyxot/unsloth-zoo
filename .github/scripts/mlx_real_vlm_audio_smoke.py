@@ -62,10 +62,10 @@ CANDIDATES = [
     Candidate("granite-vision", "mlx-community/granite-vision-3.2-2b-4bit", shard="medium"),
     Candidate("qwen2.5-vl", "mlx-community/Qwen2.5-VL-3B-Instruct-4bit", shard="medium"),
     Candidate("qwen2.5-vl", "mlx-community/Qwen2.5-VL-3B-Instruct-4bit", modality="video", shard="medium"),
-    Candidate("gemma3", "mlx-community/gemma-3-4b-it-4bit", shard="medium"),
+    Candidate("gemma3", "google/gemma-3-4b-it", shard="medium"),
     Candidate("llava", "mlx-community/llava-1.5-7b-4bit", shard="large-a"),
     Candidate("llava-next", "mlx-community/llava-v1.6-mistral-7b-4bit", shard="large-a"),
-    Candidate("llava-bunny", "mlx-community/Bunny-Llama-3-8B-V-4bit", shard="large-a"),
+    Candidate("llava-bunny", "BAAI/Bunny-v1_1-Llama-3-8B-V", shard="large-a"),
     Candidate("gemma3n", "mlx-community/gemma-3n-E2B-it-4bit", shard="large-a"),
     Candidate("idefics2", "mlx-community/idefics2-8b-4bit", shard="large-a"),
     Candidate("molmo", "mlx-community/Molmo-7B-D-0924-4bit", shard="large-a"),
@@ -539,8 +539,14 @@ def _text_prompt(tokenizer) -> str:
 
 
 def _short_exception(exc: BaseException) -> str:
-    lines = traceback.format_exception_only(type(exc), exc)
-    return " ".join(line.strip() for line in lines if line.strip())[:300]
+    parts = []
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        lines = traceback.format_exception_only(type(exc), exc)
+        parts.append(" ".join(line.strip() for line in lines if line.strip()))
+        exc = exc.__cause__ or exc.__context__
+    return " <- ".join(parts)[:500]
 
 
 def _markdown_cell(value) -> str:
@@ -656,11 +662,16 @@ def _studio_prompt(processor, config, candidate: Candidate, user_text: str) -> s
         chat_target = getattr(processor, "tokenizer", processor)
     if hasattr(chat_target, "apply_chat_template"):
         try:
-            return chat_target.apply_chat_template(
+            rendered = chat_target.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
             )
+            if (
+                candidate.modality == "text"
+                or str(messages[0]["content"]) not in rendered
+            ):
+                return rendered
         except Exception:
             pass
     if candidate.modality == "text":
