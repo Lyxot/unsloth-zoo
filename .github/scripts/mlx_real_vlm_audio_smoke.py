@@ -265,6 +265,22 @@ def _classify_dual_path_failure(multimodal_error: str, text_error: str) -> tuple
     return "failed-load", "both text and multimodal loading failed unexpectedly"
 
 
+def _runtime_unsupported_reason(candidate: Candidate) -> str | None:
+    if candidate.family != "gemma4" or candidate.modality != "video":
+        return None
+    from importlib.metadata import version
+
+    from packaging.version import Version
+
+    mlx_vlm_version = version("mlx-vlm")
+    if Version(mlx_vlm_version) < Version("0.5.0"):
+        return (
+            f"mlx-vlm {mlx_vlm_version} predates Gemma4 video support; "
+            "Gemma4VideoProcessor first shipped in mlx-vlm 0.5.0"
+        )
+    return None
+
+
 def _as_text(part) -> str:
     if part is None:
         return ""
@@ -929,6 +945,18 @@ def _run_text_only_generation(candidate: Candidate) -> dict:
 def _child_main(payload: str) -> int:
     data = json.loads(base64.b64decode(payload.encode()).decode())
     candidate = Candidate(**data)
+    unsupported_reason = _runtime_unsupported_reason(candidate)
+    if unsupported_reason is not None:
+        summary = {
+            "family": candidate.family,
+            "repo": candidate.repo,
+            "modality": candidate.modality,
+            "shard": candidate.shard,
+            "status": "unsupported-yet",
+            "reason": unsupported_reason,
+        }
+        print("RESULT_JSON:" + json.dumps(summary, sort_keys=True))
+        return 0
     tmp_dir = Path(tempfile.mkdtemp(prefix="unsloth_mlx_real_case_"))
     try:
         try:
