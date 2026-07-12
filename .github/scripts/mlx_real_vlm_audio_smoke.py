@@ -62,7 +62,7 @@ CANDIDATES = [
     Candidate("granite-vision", "mlx-community/granite-vision-3.2-2b-4bit", shard="medium"),
     Candidate("qwen2.5-vl", "mlx-community/Qwen2.5-VL-3B-Instruct-4bit", shard="medium"),
     Candidate("qwen2.5-vl", "mlx-community/Qwen2.5-VL-3B-Instruct-4bit", modality="video", shard="medium"),
-    Candidate("gemma3", "google/gemma-3-4b-it", shard="medium"),
+    Candidate("gemma3", "unsloth/gemma-3-4b-it", shard="medium"),
     Candidate("llava", "mlx-community/llava-1.5-7b-4bit", shard="large-a"),
     Candidate("llava-next", "mlx-community/llava-v1.6-mistral-7b-4bit", shard="large-a"),
     Candidate("llava-bunny", "BAAI/Bunny-v1_1-Llama-3-8B-V", shard="large-a"),
@@ -230,9 +230,15 @@ def _missing_dependency(output: str) -> str | None:
         r"(?:ModuleNotFoundError|ImportError): No module named ['\"]([^'\"]+)",
         output,
     )
+    if match is None:
+        match = re.search(
+            r"packages? that (?:was|were) not found in your environment:\s*"
+            r"([A-Za-z0-9_.-]+)",
+            output,
+        )
     if match is None or match.group(1).startswith("mlx_vlm.models."):
         return None
-    return match.group(1)
+    return match.group(1).rstrip(".,;:")
 
 
 def _is_explicitly_unsupported(output: str) -> bool:
@@ -247,6 +253,7 @@ def _is_explicitly_unsupported(output: str) -> bool:
             "contains custom code which must be executed",
             "installed mlx-lm / mlx-vlm rejects",
             "cannot load mlx ",
+            "but received shape",
         )
     )
 
