@@ -3,10 +3,17 @@
 name: "PR 6990 Finite-text Resource Benchmark"
 
 on:
-  push:
-    branches:
-      - "pr-6990-long-tail-repro-ci-*"
   workflow_dispatch:
+    inputs:
+      suite:
+        description: "Benchmark suite to run"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - synthetic
+          - finetome
 
 permissions:
   contents: read
@@ -18,6 +25,7 @@ env:
 
 jobs:
   synthetic:
+    if: ${{ inputs.suite != 'finetome' }}
     name: "Synthetic matrix (${{ matrix.schedule }})"
     strategy:
       fail-fast: false
@@ -83,6 +91,7 @@ jobs:
         run: git worktree remove --force "$RUNNER_TEMP/unsloth-zoo-main" || true
 
   finetome:
+    if: ${{ inputs.suite != 'synthetic' }}
     name: "FineTome real-data matrix"
     runs-on: "macos-14"
     timeout-minutes: 360

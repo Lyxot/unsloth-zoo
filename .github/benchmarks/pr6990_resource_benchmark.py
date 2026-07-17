@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 import ctypes
 import gzip
 import hashlib
@@ -121,8 +122,14 @@ def prepare_finetome(args):
             tokenize=True,
             add_generation_prompt=False,
         )
-        if isinstance(ids, dict):
+        if hasattr(ids, "input_ids"):
+            ids = ids.input_ids
+        elif isinstance(ids, Mapping):
             ids = ids["input_ids"]
+        if ids and isinstance(ids[0], list):
+            if len(ids) != 1:
+                raise RuntimeError("chat template returned an unexpected batch")
+            ids = ids[0]
         ids = [int(token) for token in ids]
         raw_length = len(ids)
         width = min(raw_length, MAX_FINE_LENGTH)
