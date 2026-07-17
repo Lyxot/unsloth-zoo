@@ -1,0 +1,156 @@
+# Disposable benchmark workflow. Delete after PR validation.
+
+name: "PR 6990 Finite-text Resource Benchmark"
+
+on:
+  push:
+    branches:
+      - "pr-6990-long-tail-repro-ci-*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  HF_HUB_DISABLE_XET: "1"
+  PYTHONHASHSEED: "6990"
+  TOKENIZERS_PARALLELISM: "false"
+
+jobs:
+  synthetic:
+    name: "Synthetic matrix (${{ matrix.schedule }})"
+    strategy:
+      fail-fast: false
+      matrix:
+        schedule: [small, clustered, irregular, long_tail]
+    runs-on: "macos-14"
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.12"
+
+      - name: "Prepare same-runner A/B sources"
+        shell: bash
+        run: |
+          git fetch --no-tags https://github.com/unslothai/unsloth-zoo.git main
+          git worktree add --detach "$RUNNER_TEMP/unsloth-zoo-main" FETCH_HEAD
+          echo "MAIN_SOURCE=$RUNNER_TEMP/unsloth-zoo-main" >> "$GITHUB_ENV"
+          echo "FEATURE_SOURCE=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          git -C "$RUNNER_TEMP/unsloth-zoo-main" log -1 --oneline
+          git log -1 --oneline
+
+      - name: "Install pinned benchmark stack"
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "torch==2.10.0" "torchvision==0.25.0" "mlx==0.32.0" "mlx-lm==0.31.2" "mlx-vlm==0.4.4"
+          python -m pip install -e "$FEATURE_SOURCE[mlx]"
+          uname -a
+          sw_vers
+          sysctl -n machdep.cpu.brand_string
+          sysctl -n hw.memsize
+          python -c "import mlx.core as mx; print(mx.device_info())"
+
+      - name: "Run same-runner synthetic A/B matrix"
+        shell: bash
+        run: |
+          mkdir -p "artifacts/synthetic-${{ matrix.schedule }}"
+          python .github/benchmarks/pr6990_resource_benchmark.py matrix \
+            --kind synthetic \
+            --only-schedule "${{ matrix.schedule }}" \
+            --main-source "$MAIN_SOURCE" \
+            --feature-source "$FEATURE_SOURCE" \
+            --output-dir "artifacts/synthetic-${{ matrix.schedule }}" \
+            --cell-timeout 3600 \
+            --budget-seconds 18000
+
+      - name: "Upload synthetic benchmark artifacts"
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: pr6990-synthetic-${{ matrix.schedule }}
+          path: artifacts/synthetic-${{ matrix.schedule }}/
+          if-no-files-found: warn
+
+      - name: "Clean temporary source"
+        if: always()
+        shell: bash
+        run: git worktree remove --force "$RUNNER_TEMP/unsloth-zoo-main" || true
+
+  finetome:
+    name: "FineTome real-data matrix"
+    runs-on: "macos-14"
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.12"
+
+      - name: "Prepare same-runner A/B sources"
+        shell: bash
+        run: |
+          git fetch --no-tags https://github.com/unslothai/unsloth-zoo.git main
+          git worktree add --detach "$RUNNER_TEMP/unsloth-zoo-main" FETCH_HEAD
+          echo "MAIN_SOURCE=$RUNNER_TEMP/unsloth-zoo-main" >> "$GITHUB_ENV"
+          echo "FEATURE_SOURCE=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          git -C "$RUNNER_TEMP/unsloth-zoo-main" log -1 --oneline
+          git log -1 --oneline
+
+      - name: "Install pinned benchmark stack"
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "torch==2.10.0" "torchvision==0.25.0" "mlx==0.32.0" "mlx-lm==0.31.2" "mlx-vlm==0.4.4" "datasets>=2.20,<5"
+          python -m pip install -e "$FEATURE_SOURCE[mlx]"
+          uname -a
+          sw_vers
+          sysctl -n machdep.cpu.brand_string
+          sysctl -n hw.memsize
+          python -c "import mlx.core as mx; print(mx.device_info())"
+
+      - name: "Pre-scan full FineTome dataset"
+        shell: bash
+        run: |
+          mkdir -p artifacts/finetome
+          nice -n 10 python .github/benchmarks/pr6990_resource_benchmark.py prepare \
+            --output artifacts/finetome/finetome-bundle.json.gz \
+            --stats artifacts/finetome/prescan.json
+
+      - name: "Run same-runner counterbalanced FineTome A/B matrix"
+        shell: bash
+        run: |
+          python .github/benchmarks/pr6990_resource_benchmark.py matrix \
+            --kind finetome \
+            --main-source "$MAIN_SOURCE" \
+            --feature-source "$FEATURE_SOURCE" \
+            --bundle artifacts/finetome/finetome-bundle.json.gz \
+            --output-dir artifacts/finetome/results \
+            --cell-timeout 5400 \
+            --budget-seconds 18000
+
+      - name: "Remove temporary tokenized dataset bundle"
+        if: always()
+        shell: bash
+        run: rm -f artifacts/finetome/finetome-bundle.json.gz
+
+      - name: "Upload FineTome benchmark artifacts"
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: pr6990-finetome
+          path: artifacts/finetome/
+          if-no-files-found: warn
+
+      - name: "Clean temporary source"
+        if: always()
+        shell: bash
+        run: git worktree remove --force "$RUNNER_TEMP/unsloth-zoo-main" || true
