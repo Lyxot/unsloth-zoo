@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Disposable same-runner Qwen3.5 benchmark for issue 6990."""
+"""Disposable same-runner Gemma 3 benchmark for issue 6990."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from pathlib import Path
 
 
 SEED = 6990
-MODEL_ID = "Qwen/Qwen3.5-0.8B"
+MODEL_ID = "unsloth/gemma-3-270m-it"
 DATASET_ID = "mlabonne/FineTome-100k"
 MAX_FINE_LENGTH = 1024
 RESOURCE_STOP = 350_000
