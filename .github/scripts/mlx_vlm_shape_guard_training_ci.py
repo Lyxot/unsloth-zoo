@@ -31,6 +31,7 @@ ROWS = 140
 MAX_SEQ_LENGTH = 384
 LOSS_RELATIVE_TOLERANCE = 0.008
 RESULT_MARKER = "VLM_SHAPE_GUARD_RESULT:"
+STAGE_MARKER = "VLM_SHAPE_GUARD_STAGE:"
 GIB = 1024 ** 3
 
 
@@ -179,6 +180,29 @@ def is_resource_failure(returncode: int | None, output: str) -> bool:
             "signal 9",
         )
     )
+
+
+def is_runtime_unsupported(output: str) -> bool:
+    lines = [line for line in output.splitlines() if line.strip()]
+    lowered = "\n".join(lines[-12:]).lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "tokenizer class tokenizersbackend does not exist",
+            "no module named 'mlx_vlm.models.",
+            "unrecognized processing class",
+            "contains custom code which must be executed",
+        )
+    )
+
+
+def last_child_stage(output: str) -> str | None:
+    matches = re.findall(
+        rf"^{re.escape(STAGE_MARKER)}(.+)$",
+        output,
+        flags=re.MULTILINE,
+    )
+    return matches[-1].strip() if matches else None
 
 
 def candidate_size_bytes(repo: str) -> int | None:
@@ -372,6 +396,7 @@ def child_main(payload_text: str) -> int:
     import psutil
     import unsloth_zoo
     from unsloth_zoo.mlx.loader import FastMLXModel
+    from unsloth_zoo.mlx.compile import resolve_training_compile
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
     import unsloth_zoo.mlx.utils as utils_module
 
@@ -388,6 +413,7 @@ def child_main(payload_text: str) -> int:
     fixture_digest = stable_digest(fixture_manifest)
     process = psutil.Process()
 
+    print(STAGE_MARKER + "model_load", flush=True)
     model, processor = FastMLXModel.from_pretrained(
         candidate.repo,
         max_seq_length=MAX_SEQ_LENGTH,
@@ -395,6 +421,7 @@ def child_main(payload_text: str) -> int:
         load_in_4bit=True,
         random_state=SEED,
     )
+    print(STAGE_MARKER + "model_loaded", flush=True)
     actual_arch = model_type(model)
     model = FastMLXModel.get_peft_model(
         model,
@@ -445,6 +472,34 @@ def child_main(payload_text: str) -> int:
         disable_memory_limits=True,
         compile_max_variants=None,
     )
+    compile_decision = resolve_training_compile(model, args=training_args)
+    if not compile_decision.enabled:
+        result = {
+            "status": "compile-unqualified",
+            "mode": mode,
+            "candidate": asdict(candidate),
+            "source": str(source),
+            "source_commit": subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=source,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip(),
+            "imported_zoo": str(imported),
+            "fixture_digest": fixture_digest,
+            "rows": len(rows),
+            "model_type": actual_arch,
+            "compile_enabled": False,
+            "compile_scope": "none",
+            "compile_reason": compile_decision.reason,
+            "compile_support_state": compile_decision.support_state,
+            "plan_supported": False,
+            "plan_verified": False,
+            "plan_skip_reason": "vlm_compile_unqualified",
+        }
+        print(RESULT_MARKER + json.dumps(result, sort_keys=True), flush=True)
+        return 0
     trainer = MLXTrainer(
         model=model,
         tokenizer=processor,
@@ -568,6 +623,7 @@ def child_main(payload_text: str) -> int:
         )
 
     trainer.add_step_callback(on_step)
+    print(STAGE_MARKER + "training", flush=True)
     started = time.perf_counter()
     try:
         train_output = trainer.train()
@@ -847,6 +903,32 @@ def compare_runs(main_result: dict, planned_result: dict) -> dict:
     }
 
 
+def compare_qualification(
+    main_result: dict,
+    planned_result: dict,
+) -> dict | None:
+    main_unqualified = main_result.get("status") == "compile-unqualified"
+    planned_unqualified = planned_result.get("status") == "compile-unqualified"
+    if not main_unqualified and not planned_unqualified:
+        return None
+    if main_unqualified and planned_unqualified:
+        if main_result["fixture_digest"] != planned_result["fixture_digest"]:
+            raise RuntimeError("Main and planned fixtures differ")
+        return {
+            "plan_supported": False,
+            "plan_verified": False,
+            "plan_skip_reason": "vlm_compile_unqualified",
+            "action": "not_applicable",
+            "main_compile_reason": main_result.get("compile_reason"),
+            "planned_compile_reason": planned_result.get("compile_reason"),
+        }
+    raise RuntimeError(
+        "Main and feature disagree on compiled-training qualification: "
+        f"main_status={main_result.get('status')!r}, "
+        f"feature_status={planned_result.get('status')!r}"
+    )
+
+
 def parent_main(args) -> int:
     candidate = candidate_for_key(args.model_key)
     feature_source = Path(args.feature_source).resolve()
@@ -858,6 +940,7 @@ def parent_main(args) -> int:
         "status": "starting",
         "candidate": asdict(candidate),
     }
+    child_mode = None
     try:
         from huggingface_hub import snapshot_download
 
@@ -908,6 +991,7 @@ def parent_main(args) -> int:
         snapshot_download(candidate.repo)
         payload["download_seconds"] = time.perf_counter() - download_started
         timeout_seconds = int(os.environ.get("VLM_SHAPE_CASE_TIMEOUT_S", "2400"))
+        child_mode = "main"
         main_result, _ = run_child(
             candidate,
             "main",
@@ -915,6 +999,7 @@ def parent_main(args) -> int:
             timeout_seconds,
             output_dir / "main.log",
         )
+        child_mode = "planned"
         planned_result, _ = run_child(
             candidate,
             "planned",
@@ -922,7 +1007,9 @@ def parent_main(args) -> int:
             timeout_seconds,
             output_dir / "planned.log",
         )
-        comparison = compare_runs(main_result, planned_result)
+        comparison = compare_qualification(main_result, planned_result)
+        if comparison is None:
+            comparison = compare_runs(main_result, planned_result)
         status = (
             "passed"
             if comparison["plan_verified"]
@@ -948,14 +1035,27 @@ def parent_main(args) -> int:
             flush=True,
         )
     except BaseException as error:
+        child_output = error.output if isinstance(error, ChildRunError) else ""
         resource_failure = (
             isinstance(error, ChildRunError)
             and is_resource_failure(error.returncode, error.output)
         ) or is_resource_failure(None, traceback.format_exc())
+        runtime_unsupported = (
+            child_mode == "main"
+            and isinstance(error, ChildRunError)
+            and last_child_stage(child_output) == "model_load"
+            and is_runtime_unsupported(child_output)
+        )
         payload.update(
             {
                 "status": (
-                    "skipped-resource" if resource_failure else "failed"
+                    "skipped-resource"
+                    if resource_failure
+                    else (
+                        "skipped-unsupported"
+                        if runtime_unsupported
+                        else "failed"
+                    )
                 ),
                 "error_type": type(error).__name__,
                 "error": str(error),
@@ -967,7 +1067,12 @@ def parent_main(args) -> int:
     return (
         0
         if payload["status"]
-        in {"passed", "skipped-unqualified", "skipped-resource"}
+        in {
+            "passed",
+            "skipped-unqualified",
+            "skipped-resource",
+            "skipped-unsupported",
+        }
         else 1
     )
 
@@ -983,7 +1088,7 @@ def markdown_summary(results: list[dict]) -> str:
         candidate = result.get("candidate", {})
         comparison = result.get("comparison", {})
         signatures = ""
-        if comparison:
+        if comparison.get("raw_signatures") is not None:
             signatures = (
                 f"{comparison.get('raw_signatures')} → "
                 f"{comparison.get('planned_signatures')}"
