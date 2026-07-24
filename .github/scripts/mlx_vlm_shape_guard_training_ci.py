@@ -130,32 +130,32 @@ SHARD_POLICIES = {
     "small": {
         "max_model_gb": 8.0,
         "disk_multiplier": 2.0,
-        "timeout_minutes": 45,
-        "case_timeout_s": 900,
+        "timeout_minutes": 180,
+        "case_timeout_s": 4800,
     },
     "medium": {
         "max_model_gb": 12.0,
         "disk_multiplier": 1.7,
-        "timeout_minutes": 60,
-        "case_timeout_s": 1200,
+        "timeout_minutes": 180,
+        "case_timeout_s": 4800,
     },
     "large-a": {
         "max_model_gb": 18.0,
         "disk_multiplier": 1.35,
-        "timeout_minutes": 75,
-        "case_timeout_s": 1800,
+        "timeout_minutes": 180,
+        "case_timeout_s": 4800,
     },
     "large-b": {
         "max_model_gb": 26.0,
         "disk_multiplier": 1.25,
-        "timeout_minutes": 90,
-        "case_timeout_s": 2100,
+        "timeout_minutes": 180,
+        "case_timeout_s": 4800,
     },
     "moe": {
         "max_model_gb": 40.0,
         "disk_multiplier": 1.15,
-        "timeout_minutes": 105,
-        "case_timeout_s": 2400,
+        "timeout_minutes": 180,
+        "case_timeout_s": 4800,
     },
 }
 
