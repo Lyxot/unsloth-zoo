@@ -30,6 +30,11 @@ SEED = 3407
 ROWS = 140
 MAX_SEQ_LENGTH = 384
 LOSS_RELATIVE_TOLERANCE = 0.008
+DATASET_REPO = "axolotl-ai-co/llava-instruct-mix-vsft-small"
+DATASET_REVISION = "a3ca113612453f2624904f1c99d8b650a56cc430"
+DATASET_SPLIT = "train"
+MIN_TEXT_CHARACTERS = 80
+MAX_TEXT_CHARACTERS = 1200
 RESULT_MARKER = "VLM_SHAPE_GUARD_RESULT:"
 STAGE_MARKER = "VLM_SHAPE_GUARD_STAGE:"
 GIB = 1024 ** 3
@@ -259,113 +264,107 @@ def model_matrix(selected_keys: str | None = None) -> dict:
     return {"include": include}
 
 
-def make_fixture():
-    """Build 140 deterministic rows with image and text shape diversity."""
-    from PIL import Image, ImageDraw
+def message_text_characters(messages) -> int:
+    return sum(
+        len(part.get("text") or "")
+        for message in messages
+        for part in message.get("content", ())
+    )
 
-    # These dimensions are distinct post-prepare families on dynamic-image
-    # processors and remain valid inputs for fixed-resolution processors.
-    image_sizes = (
-        (28, 112),
-        (56, 56),
-        (112, 28),
-        (28, 168),
-        (168, 28),
-        (28, 196),
-        (56, 84),
-        (84, 56),
-        (196, 28),
-        (28, 224),
-        (224, 28),
-        (56, 112),
-        (140, 56),
-        (84, 84),
-        (56, 168),
-        (168, 56),
-        (56, 196),
-        (84, 140),
-        (140, 84),
-        (196, 56),
+
+def evenly_spaced_indices(length: int, count: int) -> list[int]:
+    if count < 1 or length < count:
+        raise ValueError(
+            f"Cannot select {count} evenly spaced items from {length}"
+        )
+    if count == 1:
+        return [0]
+    return [
+        round(index * (length - 1) / (count - 1))
+        for index in range(count)
+    ]
+
+
+def make_fixture():
+    """Select 140 deterministic, naturally diverse real VLM training rows."""
+    from datasets import load_dataset
+
+    dataset = load_dataset(
+        DATASET_REPO,
+        revision=DATASET_REVISION,
+        split=DATASET_SPLIT,
     )
-    repeat_counts = (0, 61, 104, 177, 219, 264, 309)
-    rows = []
-    manifest = []
-    for family, (image_width, image_height) in enumerate(image_sizes):
-        short_side = min(image_width, image_height)
-        for width_index, base_repeat_count in enumerate(repeat_counts):
-            image = Image.new(
-                "RGB",
-                (image_width, image_height),
-                (
-                    (family * 53 + width_index * 17) % 256,
-                    (family * 89 + width_index * 29) % 256,
-                    (family * 31 + width_index * 47) % 256,
-                ),
+    first_index_by_text_length = {}
+    for dataset_index, messages in enumerate(dataset["messages"]):
+        text_characters = message_text_characters(messages)
+        if MIN_TEXT_CHARACTERS <= text_characters <= MAX_TEXT_CHARACTERS:
+            first_index_by_text_length.setdefault(
+                text_characters,
+                dataset_index,
             )
-            draw = ImageDraw.Draw(image)
-            inset = 2 + (width_index % max(2, short_side // 8))
-            draw.rectangle(
-                (
-                    inset,
-                    inset,
-                    image_width - inset - 1,
-                    image_height - inset - 1,
-                ),
-                outline=(
-                    (255 - family * 11) % 256,
-                    (20 + width_index * 23) % 256,
-                    90,
-                ),
-                width=max(1, short_side // 28),
+    candidates = sorted(first_index_by_text_length.items())
+    selected = [
+        candidates[index]
+        for index in evenly_spaced_indices(len(candidates), ROWS)
+    ]
+
+    records = []
+    for text_characters, dataset_index in selected:
+        source = dataset[int(dataset_index)]
+        if len(source["images"]) != 1:
+            raise RuntimeError(
+                f"Expected one image in dataset row {dataset_index}"
             )
-            repeat_count = base_repeat_count + family
-            prompt = (
-                "Inspect the patterned rectangle and report its group and index."
-                + " detail" * repeat_count
-            )
-            answer = (
-                f"The rectangle belongs to image group {family} and sample "
-                f"{width_index}."
-            )
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image"},
-                        {"type": "text", "text": prompt},
-                    ],
-                },
-                {
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": answer}],
-                },
-            ]
-            row_id = f"{family}:{width_index}"
-            rows.append(
-                {
-                    "messages": messages,
-                    "images": [image],
-                    "_shape_guard_ci_row_id": row_id,
-                }
-            )
-            manifest.append(
-                {
-                    "row_id": row_id,
-                    "family": family,
-                    "image_size": [image_width, image_height],
-                    "width_index": width_index,
-                    "repeat_count": repeat_count,
-                    "messages": messages,
-                    "image_sha256": hashlib.sha256(image.tobytes()).hexdigest(),
-                }
-            )
-    assert len(rows) == ROWS
-    order = list(range(len(rows)))
-    random.Random(SEED).shuffle(order)
+        image = source["images"][0]
+        row_id = f"{DATASET_SPLIT}:{dataset_index}"
+        row = {
+            "messages": source["messages"],
+            "images": source["images"],
+            "_shape_guard_ci_row_id": row_id,
+        }
+        manifest = {
+            "dataset_repo": DATASET_REPO,
+            "dataset_revision": DATASET_REVISION,
+            "dataset_split": DATASET_SPLIT,
+            "dataset_index": int(dataset_index),
+            "row_id": row_id,
+            "text_characters": int(text_characters),
+            "message_count": len(source["messages"]),
+            "messages_sha256": stable_digest(source["messages"]),
+            "image_size": [int(image.width), int(image.height)],
+            "image_sha256": hashlib.sha256(image.tobytes()).hexdigest(),
+        }
+        records.append((row, manifest))
+
+    random.Random(SEED).shuffle(records)
     return (
-        [rows[index] for index in order],
-        [manifest[index] for index in order],
+        [row for row, _manifest in records],
+        [manifest for _row, manifest in records],
     )
+
+
+def fixture_summary(manifest: list[dict]) -> dict:
+    return {
+        "dataset_repo": DATASET_REPO,
+        "dataset_revision": DATASET_REVISION,
+        "dataset_split": DATASET_SPLIT,
+        "selected_rows": len(manifest),
+        "selected_indices": [
+            int(item["dataset_index"]) for item in manifest
+        ],
+        "unique_text_lengths": len(
+            {int(item["text_characters"]) for item in manifest}
+        ),
+        "text_characters_min": min(
+            int(item["text_characters"]) for item in manifest
+        ),
+        "text_characters_max": max(
+            int(item["text_characters"]) for item in manifest
+        ),
+        "unique_image_sizes": len(
+            {tuple(item["image_size"]) for item in manifest}
+        ),
+    }
 
 
 def array_width(batch) -> int | None:
@@ -411,6 +410,7 @@ def child_main(payload_text: str) -> int:
     mx.random.seed(SEED)
     rows, fixture_manifest = make_fixture()
     fixture_digest = stable_digest(fixture_manifest)
+    selected_fixture = fixture_summary(fixture_manifest)
     process = psutil.Process()
 
     print(STAGE_MARKER + "model_load", flush=True)
@@ -488,6 +488,7 @@ def child_main(payload_text: str) -> int:
             ).stdout.strip(),
             "imported_zoo": str(imported),
             "fixture_digest": fixture_digest,
+            "fixture": selected_fixture,
             "rows": len(rows),
             "model_type": actual_arch,
             "compile_enabled": False,
@@ -734,6 +735,7 @@ def child_main(payload_text: str) -> int:
         ).stdout.strip(),
         "imported_zoo": str(imported),
         "fixture_digest": fixture_digest,
+        "fixture": selected_fixture,
         "rows": len(rows),
         "model_type": actual_arch,
         "train_loss": float(train_output["train_loss"]),
@@ -942,6 +944,7 @@ def parent_main(args) -> int:
     }
     child_mode = None
     try:
+        from datasets import load_dataset
         from huggingface_hub import snapshot_download
 
         size_bytes = candidate_size_bytes(candidate.repo)
@@ -990,6 +993,24 @@ def parent_main(args) -> int:
         download_started = time.perf_counter()
         snapshot_download(candidate.repo)
         payload["download_seconds"] = time.perf_counter() - download_started
+        dataset_started = time.perf_counter()
+        dataset = load_dataset(
+            DATASET_REPO,
+            revision=DATASET_REVISION,
+            split=DATASET_SPLIT,
+        )
+        payload["dataset"] = {
+            "repo": DATASET_REPO,
+            "revision": DATASET_REVISION,
+            "split": DATASET_SPLIT,
+            "rows": len(dataset),
+            "download_seconds": time.perf_counter() - dataset_started,
+        }
+        if len(dataset) < ROWS:
+            raise RuntimeError(
+                f"Real VLM dataset has only {len(dataset)} rows"
+            )
+        del dataset
         timeout_seconds = int(os.environ.get("VLM_SHAPE_CASE_TIMEOUT_S", "2400"))
         child_mode = "main"
         main_result, _ = run_child(
