@@ -1,0 +1,209 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+name: MLX VLM Shape Guard Real Training
+
+on:
+  pull_request:
+    branches: [feat/mlx-vlm-shape-guard]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      model_keys:
+        description: Optional comma-separated model keys to run
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Build image-model matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.12"
+
+      - id: matrix
+        name: Emit model matrix
+        run: |
+          matrix=$(python .github/scripts/mlx_vlm_shape_guard_training_ci.py \
+            --matrix-json \
+            --matrix-model-keys "${{ inputs.model_keys }}")
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  planned-training:
+    name: Planned VLM ${{ matrix.family }}
+    needs: plan
+    runs-on: macos-14
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      HF_HUB_DISABLE_XET: "1"
+      HF_HUB_ENABLE_HF_TRANSFER: "0"
+      HF_HOME: /tmp/unsloth-vlm-shape-${{ matrix.key }}
+      PIP_NO_CACHE_DIR: "1"
+      PYTHONUNBUFFERED: "1"
+      TOKENIZERS_PARALLELISM: "false"
+      VLM_SHAPE_CASE_TIMEOUT_S: ${{ matrix.case_timeout_s }}
+      VLM_SHAPE_RESULT_DIR: /tmp/vlm-shape-results/${{ matrix.key }}
+
+    steps:
+      - name: Harden runner (audit)
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.13"
+
+      - name: Show runner resources
+        run: |
+          uname -a
+          python - <<'PY'
+          import os, platform, shutil
+          print("model:", os.environ["HF_HOME"].rsplit("-", 1)[-1])
+          print("machine:", platform.machine())
+          print("python:", platform.python_version())
+          print("free_gib:", round(shutil.disk_usage(".").free / 1024**3, 2))
+          PY
+          sysctl vm.swapusage || true
+          ulimit -n || true
+
+      - name: Prepare macOS swap headroom
+        if: matrix.large_model
+        run: |
+          sudo mkdir -p /private/var/vm
+          sudo purge || true
+          ulimit -n 65536 || true
+          rm -rf ~/Library/Caches/pip ~/.cache/pip "$HF_HOME" || true
+          brew cleanup -s || true
+          sysctl vm.swapusage || true
+          df -h
+
+      - name: Fetch upstream main baseline
+        run: |
+          git remote add upstream https://github.com/unslothai/unsloth-zoo.git
+          git fetch --no-tags upstream main
+          git worktree add --detach /tmp/unsloth-zoo-upstream-main upstream/main
+          echo "feature=$(git rev-parse HEAD)"
+          echo "main=$(git -C /tmp/unsloth-zoo-upstream-main rev-parse HEAD)"
+
+      - name: Install Studio release MLX stack
+        run: |
+          constraints=.github/constraints/vlm-shape-guard-macos.txt
+          python -m pip install -c "$constraints" pip
+          pip install -c "$constraints" \
+            anyio click setuptools \
+            torch torchvision \
+            datasets einops transformers tokenizers huggingface-hub safetensors \
+            sentencepiece protobuf pyyaml jinja2 \
+            numpy pillow opencv-python scipy pandas pyarrow pytz tzdata \
+            packaging requests tqdm psutil wheel hf-transfer \
+            regex msgspec typing-extensions filelock \
+            timm matplotlib
+          pip install --no-deps -c "$constraints" mlx mlx-metal mlx-lm mlx-vlm
+          pip install --no-deps -e .
+
+      - name: Verify pinned runtime
+        run: |
+          python - <<'PY'
+          from importlib.metadata import version
+          from pathlib import Path
+
+          expected = {}
+          for raw_line in Path(".github/constraints/vlm-shape-guard-macos.txt").read_text().splitlines():
+              line = raw_line.strip()
+              if line and not line.startswith("#"):
+                  package, expected_version = line.split("==", 1)
+                  expected[package] = expected_version
+          mismatches = {
+              package: {"expected": expected_version, "actual": version(package)}
+              for package, expected_version in expected.items()
+              if version(package) != expected_version
+          }
+          if mismatches:
+              raise SystemExit(f"Pinned runtime mismatch: {mismatches}")
+          print(f"Pinned packages checked: {len(expected)}")
+          PY
+
+      - name: Compare upstream main with planned training
+        run: |
+          ulimit -n 65536 || true
+          python .github/scripts/mlx_vlm_shape_guard_training_ci.py \
+            --model-key "${{ matrix.key }}" \
+            --feature-source "$GITHUB_WORKSPACE" \
+            --main-source /tmp/unsloth-zoo-upstream-main \
+            --output-dir "$VLM_SHAPE_RESULT_DIR" \
+            --max-model-gb "${{ matrix.max_model_gb }}" \
+            --disk-multiplier "${{ matrix.disk_multiplier }}"
+
+      - name: Upload model evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: vlm-shape-${{ matrix.key }}
+          path: ${{ env.VLM_SHAPE_RESULT_DIR }}
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Final resource report
+        if: always()
+        run: |
+          sysctl vm.swapusage || true
+          df -h
+          du -sh "$HF_HOME" 2>/dev/null || true
+
+  report:
+    name: Summarize planned-training results
+    if: always()
+    needs: [plan, planned-training]
+    runs-on: ubuntu-latest
+    env:
+      VLM_SHAPE_EXPECTED_MATRIX: ${{ needs.plan.outputs.matrix }}
+    steps:
+      - name: Harden runner (audit)
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.12"
+
+      - name: Download model evidence
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: vlm-shape-*
+          path: matrix-results
+
+      - name: Build aggregate summary
+        run: |
+          python .github/scripts/mlx_vlm_shape_guard_training_ci.py \
+            --summarize-results matrix-results
