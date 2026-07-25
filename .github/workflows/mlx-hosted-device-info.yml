@@ -1,0 +1,41 @@
+name: MLX Hosted Device Info
+
+on:
+  pull_request:
+    branches: [feat/mlx-vlm-shape-guard]
+
+permissions:
+  contents: read
+
+jobs:
+  device-info:
+    runs-on: macos-14
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.13"
+
+      - name: Print host and MLX device identity
+        run: |
+          set -euo pipefail
+          uname -a
+          sw_vers
+          sysctl -n hw.model hw.memsize
+          python -m pip install --disable-pip-version-check \
+            mlx==0.32.0 mlx-metal==0.32.0
+          python - <<'PY'
+          import json
+          import mlx.core as mx
+
+          info = mx.device_info()
+          print("MLX_DEVICE_INFO=" + json.dumps(info, sort_keys=True))
+          chip = info.get("device_name", "") or ""
+          print("UNSLOTH_BF16_NATIVE=" + str(
+              not chip.startswith(("Apple M1", "Apple M2"))
+          ))
+          PY
