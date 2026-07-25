@@ -207,12 +207,32 @@ def _check_affine_6bit_embedding(module, input_ids):
     packed = module["weight"][input_ids]
     scales = module["scales"][input_ids]
     biases = module["biases"][input_ids]
+    packed_cpu = mx.take(
+        module["weight"], input_ids, axis=0, stream=mx.cpu
+    )
+    scales_cpu = mx.take(
+        module["scales"], input_ids, axis=0, stream=mx.cpu
+    )
+    biases_cpu = mx.take(
+        module["biases"], input_ids, axis=0, stream=mx.cpu
+    )
     metal = module(input_ids)
-    mx.eval(packed, scales, biases, metal)
+    mx.eval(
+        packed,
+        scales,
+        biases,
+        packed_cpu,
+        scales_cpu,
+        biases_cpu,
+        metal,
+    )
 
     packed_np = np.asarray(packed)
     scales_np = np.asarray(scales.astype(mx.float32))
     biases_np = np.asarray(biases.astype(mx.float32))
+    packed_cpu_np = np.asarray(packed_cpu)
+    scales_cpu_np = np.asarray(scales_cpu.astype(mx.float32))
+    biases_cpu_np = np.asarray(biases_cpu.astype(mx.float32))
     metal_np = np.asarray(metal.astype(mx.float32))
 
     packed_bytes = packed_np.view(np.uint8).reshape(
@@ -239,8 +259,20 @@ def _check_affine_6bit_embedding(module, input_ids):
         "input_shape": list(input_ids.shape),
         "output_shape": list(metal.shape),
         "packed_sha256": _sha256_array(packed_np),
+        "packed_cpu_sha256": _sha256_array(packed_cpu_np),
         "scales_sha256": _sha256_array(scales_np),
+        "scales_cpu_sha256": _sha256_array(scales_cpu_np),
         "biases_sha256": _sha256_array(biases_np),
+        "biases_cpu_sha256": _sha256_array(biases_cpu_np),
+        "packed_gather_exact_fraction": float(
+            np.mean(packed_np == packed_cpu_np)
+        ),
+        "scales_gather_exact_fraction": float(
+            np.mean(scales_np == scales_cpu_np)
+        ),
+        "biases_gather_exact_fraction": float(
+            np.mean(biases_np == biases_cpu_np)
+        ),
         "metal_sha256": _sha256_array(metal_np),
         "reference_sha256": _sha256_array(rounded_reference),
         "relative_rmse": float(
