@@ -32,6 +32,25 @@ TRACE_CLASS_NAMES = {
     "VisionPooler",
     "VisionTransformerBlock",
 }
+DETAIL_CLASS_NAMES = {
+    "Embedding",
+    "Linear",
+    "LoRALinear",
+    "QuantizedEmbedding",
+    "QuantizedLinear",
+    "RMSNorm",
+    "RMSNormNoScale",
+    "RMSNormZeroShift",
+    "ScaledLinear",
+    "VisionRMSNorm",
+    "VisionRMSNormNoScale",
+}
+DETAIL_PATH_PREFIXES = (
+    "vision_tower.encoder.layers.0",
+    "language_model.model.embed_tokens_per_layer",
+    "language_model.model.per_layer_",
+    "language_model.model.layers.0",
+)
 
 
 def _load_fixture_builder():
@@ -71,19 +90,28 @@ def _install_boundary_trace(model, records):
     seen_classes = set()
     for _name, module in model.named_modules():
         cls = type(module)
-        if cls in seen_classes or cls.__name__ not in TRACE_CLASS_NAMES:
+        class_name = cls.__name__
+        if cls in seen_classes or class_name not in (
+            TRACE_CLASS_NAMES | DETAIL_CLASS_NAMES
+        ):
             continue
         seen_classes.add(cls)
         original = cls.__call__
 
         def traced_call(self, *args, __original=original, **kwargs):
             name = module_names.get(id(self))
-            if name is not None:
+            detailed = (
+                type(self).__name__ in DETAIL_CLASS_NAMES
+                and name is not None
+                and name.startswith(DETAIL_PATH_PREFIXES)
+            )
+            boundary = type(self).__name__ in TRACE_CLASS_NAMES
+            if name is not None and (boundary or detailed):
                 value = _first_array(args, mx)
                 if value is not None:
                     records.append((f"{name}:input", value))
             output = __original(self, *args, **kwargs)
-            if name is not None:
+            if name is not None and (boundary or detailed):
                 value = _first_array(output, mx)
                 if value is not None:
                     records.append((f"{name}:output", value))
