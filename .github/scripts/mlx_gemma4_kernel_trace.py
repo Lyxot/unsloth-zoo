@@ -181,6 +181,82 @@ def _finish_payload(item):
     return item
 
 
+def _sha256_array(value):
+    import numpy as np
+
+    value = np.asarray(value)
+    digest = hashlib.sha256()
+    digest.update(str((value.shape, value.dtype)).encode())
+    digest.update(value.tobytes())
+    return digest.hexdigest()
+
+
+def _round_float32_to_bfloat16(value):
+    import numpy as np
+
+    value = np.asarray(value, dtype=np.float32)
+    bits = value.view(np.uint32)
+    rounded = bits + np.uint32(0x7FFF) + ((bits >> 16) & 1)
+    return (rounded & np.uint32(0xFFFF0000)).view(np.float32)
+
+
+def _check_affine_6bit_embedding(module, input_ids):
+    import mlx.core as mx
+    import numpy as np
+
+    packed = module["weight"][input_ids]
+    scales = module["scales"][input_ids]
+    biases = module["biases"][input_ids]
+    metal = module(input_ids)
+    mx.eval(packed, scales, biases, metal)
+
+    packed_np = np.asarray(packed)
+    scales_np = np.asarray(scales.astype(mx.float32))
+    biases_np = np.asarray(biases.astype(mx.float32))
+    metal_np = np.asarray(metal.astype(mx.float32))
+
+    packed_bytes = packed_np.view(np.uint8).reshape(
+        *packed_np.shape[:-1], packed_np.shape[-1] * 4
+    )
+    chunks = packed_bytes.reshape(*packed_bytes.shape[:-1], -1, 3)
+    values = np.empty((*chunks.shape[:-2], chunks.shape[-2] * 4), dtype=np.uint8)
+    values[..., 0::4] = chunks[..., 0] & 0x3F
+    values[..., 1::4] = (
+        (chunks[..., 0] >> 6) | ((chunks[..., 1] & 0x0F) << 2)
+    )
+    values[..., 2::4] = (
+        (chunks[..., 1] >> 4) | ((chunks[..., 2] & 0x03) << 4)
+    )
+    values[..., 3::4] = chunks[..., 2] >> 2
+    reference = (
+        values.astype(np.float32) * np.repeat(scales_np, 64, axis=-1)
+        + np.repeat(biases_np, 64, axis=-1)
+    )
+    rounded_reference = _round_float32_to_bfloat16(reference)
+    difference = metal_np - rounded_reference
+    return {
+        "kernel": "affine_dequantize_bfloat16_gs_64_b_6",
+        "input_shape": list(input_ids.shape),
+        "output_shape": list(metal.shape),
+        "packed_sha256": _sha256_array(packed_np),
+        "scales_sha256": _sha256_array(scales_np),
+        "biases_sha256": _sha256_array(biases_np),
+        "metal_sha256": _sha256_array(metal_np),
+        "reference_sha256": _sha256_array(rounded_reference),
+        "relative_rmse": float(
+            np.sqrt(np.mean(np.square(difference, dtype=np.float64)))
+            / max(
+                np.sqrt(
+                    np.mean(np.square(rounded_reference, dtype=np.float64))
+                ),
+                1e-30,
+            )
+        ),
+        "max_abs_error": float(np.max(np.abs(difference))),
+        "exact_fraction": float(np.mean(metal_np == rounded_reference)),
+    }
+
+
 def child_main(payload_text):
     payload = json.loads(payload_text)
     source = Path(payload["source"]).resolve()
@@ -291,6 +367,25 @@ def child_main(payload_text):
     batch = captured[0]
     mx.eval([value for value in batch.values() if isinstance(value, mx.array)])
 
+    input_ids = batch["input_ids"]
+    model_config = getattr(model, "config", None)
+    image_token_id = int(getattr(model_config, "image_token_id", -1))
+    audio_token_id = int(getattr(model_config, "audio_token_id", -1))
+    per_layer_ids = mx.where(
+        (input_ids == image_token_id) | (input_ids == audio_token_id),
+        mx.zeros_like(input_ids),
+        input_ids,
+    )
+    kernel_checks = {
+        "main_embedding": _check_affine_6bit_embedding(
+            model.language_model.model.embed_tokens, input_ids
+        ),
+        "per_layer_embedding": _check_affine_6bit_embedding(
+            model.language_model.model.embed_tokens_per_layer,
+            per_layer_ids,
+        ),
+    }
+
     norm_state = snapshot_mlx_norm_output_cast_state(
         iter_mlx_norm_output_cast_classes(model)
     )
@@ -327,6 +422,7 @@ def child_main(payload_text):
         "supervised_tokens": int(tokens.item()),
         "elapsed_seconds": elapsed,
         "mlx_peak_bytes": int(mx.get_peak_memory()),
+        "kernel_checks": kernel_checks,
         "traces": [_finish_payload(item) for item in trace_items],
     }
     output_dir.mkdir(parents=True, exist_ok=True)
