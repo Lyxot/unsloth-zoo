@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare one real Gemma4 VLM training step eager versus compiled."""
+"""Compare four real Gemma4 VLM training steps eager versus compiled."""
 
 from __future__ import annotations
 
@@ -93,36 +93,38 @@ def child_main(payload_text):
     mx.eval(model.parameters(), model.trainable_parameters())
     mx.synchronize()
 
-    batch_record = {}
+    batch_record = []
     original_create = trainer_module.create_vlm_batches
 
     def recording_create(*args, **kwargs):
         batches = original_create(*args, **kwargs)
-        batch = batches[0]
-        mx.eval(
-            [
-                value
-                for value in batch.values()
-                if isinstance(value, mx.array)
-            ]
-        )
-        for key in (
-            "input_ids",
-            "labels",
-            "attention_mask",
-            "pixel_values",
-            "mm_token_type_ids",
-        ):
-            if key in batch and isinstance(batch[key], mx.array):
-                batch_record[key] = _array_digest(batch[key])
-        labels = np.asarray(batch["labels"])
-        attention = np.asarray(batch["attention_mask"])
-        batch_record["supervised_tokens"] = int(
-            np.logical_and(
-                labels[:, 1:] != -100,
-                attention[:, 1:] != 0,
-            ).sum()
-        )
+        for batch in batches:
+            record = {}
+            mx.eval(
+                [
+                    value
+                    for value in batch.values()
+                    if isinstance(value, mx.array)
+                ]
+            )
+            for key in (
+                "input_ids",
+                "labels",
+                "attention_mask",
+                "pixel_values",
+                "mm_token_type_ids",
+            ):
+                if key in batch and isinstance(batch[key], mx.array):
+                    record[key] = _array_digest(batch[key])
+            labels = np.asarray(batch["labels"])
+            attention = np.asarray(batch["attention_mask"])
+            record["supervised_tokens"] = int(
+                np.logical_and(
+                    labels[:, 1:] != -100,
+                    attention[:, 1:] != 0,
+                ).sum()
+            )
+            batch_record.append(record)
         return batches
 
     trainer_module.create_vlm_batches = recording_create
@@ -131,7 +133,7 @@ def child_main(payload_text):
         args = MLXTrainingConfig(
             per_device_train_batch_size=1,
             gradient_accumulation_steps=1,
-            max_steps=1,
+            max_steps=4,
             warmup_steps=5,
             learning_rate=2e-4,
             logging_steps=1,
@@ -164,6 +166,28 @@ def child_main(payload_text):
             args=args,
         )
         trainer.save_model = lambda *args, **kwargs: None
+        steps = []
+
+        def record_step(
+            step,
+            total_steps,
+            loss,
+            learning_rate,
+            tokens_per_second,
+            peak_gb,
+            elapsed,
+            num_tokens,
+            grad_norm=None,
+        ):
+            steps.append(
+                {
+                    "step": int(step),
+                    "loss": float(loss),
+                    "trained_tokens": int(num_tokens),
+                }
+            )
+
+        trainer.add_step_callback(record_step)
         started = time.perf_counter()
         output = trainer.train()
         mx.synchronize()
@@ -179,6 +203,7 @@ def child_main(payload_text):
         "fixture_messages_sha256": manifest[0]["messages_sha256"],
         "fixture_image_sha256": manifest[0]["image_sha256"],
         "batch": batch_record,
+        "steps": steps,
         "loss": float(output["train_loss"]),
         "trained_tokens": int(output["trained_tokens"]),
         "compile_enabled": bool(output["compile_enabled"]),

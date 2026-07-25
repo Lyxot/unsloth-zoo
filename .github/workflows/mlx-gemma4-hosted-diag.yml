@@ -93,7 +93,7 @@ jobs:
           )
           PY
 
-      - name: Compare eager and compiled first step
+      - name: Compare eager and compiled four-step training
         run: |
           mkdir -p "$RESULT_DIR"
           ulimit -n 65536 || true
