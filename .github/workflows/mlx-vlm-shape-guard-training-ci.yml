@@ -61,6 +61,7 @@ jobs:
       PYTHONUNBUFFERED: "1"
       TOKENIZERS_PARALLELISM: "false"
       VLM_SHAPE_CASE_TIMEOUT_S: ${{ matrix.case_timeout_s }}
+      VLM_SHAPE_PREREQUISITE_SHA: 42362afd9172ae806a5a555d8ca2fd6539f40eeb
       VLM_SHAPE_RESULT_DIR: /tmp/vlm-shape-results/${{ matrix.key }}
 
     steps:
@@ -102,13 +103,38 @@ jobs:
           sysctl vm.swapusage || true
           df -h
 
-      - name: Fetch upstream main baseline
+      - name: Build hypothetical PR 893 merge sources
         run: |
           git remote add upstream https://github.com/unslothai/unsloth-zoo.git
-          git fetch --no-tags upstream main
-          git worktree add --detach /tmp/unsloth-zoo-upstream-main upstream/main
+          git fetch --no-tags upstream \
+            main \
+            pull/893/head:refs/remotes/upstream/pr-893
+          test "$(git rev-parse upstream/pr-893)" = \
+            "$VLM_SHAPE_PREREQUISITE_SHA"
+          git worktree add --detach \
+            /tmp/unsloth-zoo-main-pr893 upstream/main
+          git worktree add --detach \
+            /tmp/unsloth-zoo-feature-pr893 HEAD
+          merge_base=$(git merge-base upstream/main upstream/pr-893)
+          git diff "$merge_base"..upstream/pr-893 -- \
+            unsloth_zoo/mlx/compile.py \
+            unsloth_zoo/mlx/loader.py |
+            git -C /tmp/unsloth-zoo-main-pr893 apply -
+          git diff "$merge_base"..upstream/pr-893 -- \
+            unsloth_zoo/mlx/compile.py \
+            unsloth_zoo/mlx/loader.py |
+            git -C /tmp/unsloth-zoo-feature-pr893 apply -
+          cmp \
+            /tmp/unsloth-zoo-main-pr893/unsloth_zoo/mlx/compile.py \
+            /tmp/unsloth-zoo-feature-pr893/unsloth_zoo/mlx/compile.py
+          cmp \
+            /tmp/unsloth-zoo-main-pr893/unsloth_zoo/mlx/loader.py \
+            /tmp/unsloth-zoo-feature-pr893/unsloth_zoo/mlx/loader.py
+          git -C /tmp/unsloth-zoo-main-pr893 diff --check
+          git -C /tmp/unsloth-zoo-feature-pr893 diff --check
           echo "feature=$(git rev-parse HEAD)"
-          echo "main=$(git -C /tmp/unsloth-zoo-upstream-main rev-parse HEAD)"
+          echo "main=$(git rev-parse upstream/main)"
+          echo "pr893=$(git rev-parse upstream/pr-893)"
 
       - name: Install Studio release MLX stack
         run: |
@@ -153,8 +179,8 @@ jobs:
           ulimit -n 65536 || true
           python .github/scripts/mlx_vlm_shape_guard_training_ci.py \
             --model-key "${{ matrix.key }}" \
-            --feature-source "$GITHUB_WORKSPACE" \
-            --main-source /tmp/unsloth-zoo-upstream-main \
+            --feature-source /tmp/unsloth-zoo-feature-pr893 \
+            --main-source /tmp/unsloth-zoo-main-pr893 \
             --output-dir "$VLM_SHAPE_RESULT_DIR" \
             --max-model-gb "${{ matrix.max_model_gb }}" \
             --disk-multiplier "${{ matrix.disk_multiplier }}"

@@ -27,7 +27,15 @@ import traceback
 
 
 SEED = 3407
-ROWS = 140
+IMAGE_FAMILIES = 3
+TEXT_CHARACTER_BANDS = (
+    (80, 180),
+    (180, 300),
+    (300, 450),
+    (450, 700),
+)
+ROWS = IMAGE_FAMILIES * len(TEXT_CHARACTER_BANDS)
+COMPILE_VARIANT_CAP = 7
 MAX_SEQ_LENGTH = 384
 LOSS_RELATIVE_TOLERANCE = 0.008
 DATASET_REPO = "axolotl-ai-co/llava-instruct-mix-vsft-small"
@@ -38,6 +46,11 @@ MAX_TEXT_CHARACTERS = 1200
 RESULT_MARKER = "VLM_SHAPE_GUARD_RESULT:"
 STAGE_MARKER = "VLM_SHAPE_GUARD_STAGE:"
 GIB = 1024 ** 3
+PREREQUISITE_OVERLAY_FILES = (
+    "unsloth_zoo/mlx/compile.py",
+    "unsloth_zoo/mlx/loader.py",
+)
+EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 
 
 @dataclass(frozen=True)
@@ -257,6 +270,7 @@ def model_matrix(selected_keys: str | None = None) -> dict:
             {
                 **asdict(candidate),
                 "rows": ROWS,
+                "compile_variant_cap": COMPILE_VARIANT_CAP,
                 **policy,
                 "large_model": candidate.shard in {"large-a", "large-b", "moe"},
             }
@@ -272,21 +286,8 @@ def message_text_characters(messages) -> int:
     )
 
 
-def evenly_spaced_indices(length: int, count: int) -> list[int]:
-    if count < 1 or length < count:
-        raise ValueError(
-            f"Cannot select {count} evenly spaced items from {length}"
-        )
-    if count == 1:
-        return [0]
-    return [
-        round(index * (length - 1) / (count - 1))
-        for index in range(count)
-    ]
-
-
 def make_fixture():
-    """Select 140 deterministic, naturally diverse real VLM training rows."""
+    """Select a short real fixture with repeated media families and varied text."""
     from datasets import load_dataset
 
     dataset = load_dataset(
@@ -294,47 +295,88 @@ def make_fixture():
         revision=DATASET_REVISION,
         split=DATASET_SPLIT,
     )
-    first_index_by_text_length = {}
-    for dataset_index, messages in enumerate(dataset["messages"]):
-        text_characters = message_text_characters(messages)
-        if MIN_TEXT_CHARACTERS <= text_characters <= MAX_TEXT_CHARACTERS:
-            first_index_by_text_length.setdefault(
-                text_characters,
-                dataset_index,
+    lengths_by_image_size = {}
+    for dataset_index, source in enumerate(dataset):
+        text_characters = message_text_characters(source["messages"])
+        if not (
+            MIN_TEXT_CHARACTERS
+            <= text_characters
+            <= MAX_TEXT_CHARACTERS
+        ):
+            continue
+        if len(source["images"]) != 1:
+            continue
+        image = source["images"][0]
+        image_size = (int(image.width), int(image.height))
+        lengths_by_image_size.setdefault(image_size, {}).setdefault(
+            text_characters,
+            dataset_index,
+        )
+
+    candidates = []
+    for image_size, lengths in lengths_by_image_size.items():
+        selected = []
+        for lower, upper in TEXT_CHARACTER_BANDS:
+            band = [
+                value
+                for value in lengths
+                if lower <= value < upper
+            ]
+            if not band:
+                break
+            midpoint = (lower + upper - 1) / 2
+            text_characters = min(
+                band,
+                key=lambda value: (abs(value - midpoint), value),
             )
-    candidates = sorted(first_index_by_text_length.items())
-    selected = [
-        candidates[index]
-        for index in evenly_spaced_indices(len(candidates), ROWS)
-    ]
+            selected.append((text_characters, lengths[text_characters]))
+        if len(selected) == len(TEXT_CHARACTER_BANDS):
+            candidates.append(
+                (
+                    -len(lengths),
+                    -(max(lengths) - min(lengths)),
+                    image_size,
+                    selected,
+                )
+            )
+    candidates.sort()
+    if len(candidates) < IMAGE_FAMILIES:
+        raise RuntimeError(
+            "Real VLM dataset does not contain enough repeated image-size "
+            "families across the required text bands"
+        )
 
     records = []
-    for text_characters, dataset_index in selected:
-        source = dataset[int(dataset_index)]
-        if len(source["images"]) != 1:
-            raise RuntimeError(
-                f"Expected one image in dataset row {dataset_index}"
-            )
-        image = source["images"][0]
-        row_id = f"{DATASET_SPLIT}:{dataset_index}"
-        row = {
-            "messages": source["messages"],
-            "images": source["images"],
-            "_shape_guard_ci_row_id": row_id,
-        }
-        manifest = {
-            "dataset_repo": DATASET_REPO,
-            "dataset_revision": DATASET_REVISION,
-            "dataset_split": DATASET_SPLIT,
-            "dataset_index": int(dataset_index),
-            "row_id": row_id,
-            "text_characters": int(text_characters),
-            "message_count": len(source["messages"]),
-            "messages_sha256": stable_digest(source["messages"]),
-            "image_size": [int(image.width), int(image.height)],
-            "image_sha256": hashlib.sha256(image.tobytes()).hexdigest(),
-        }
-        records.append((row, manifest))
+    for family_rank, candidate in enumerate(candidates[:IMAGE_FAMILIES]):
+        image_size = candidate[2]
+        for band_index, (text_characters, dataset_index) in enumerate(
+            candidate[3]
+        ):
+            source = dataset[int(dataset_index)]
+            image = source["images"][0]
+            row_id = f"{DATASET_SPLIT}:{dataset_index}"
+            row = {
+                "messages": source["messages"],
+                "images": source["images"],
+                "_shape_guard_ci_row_id": row_id,
+            }
+            manifest = {
+                "dataset_repo": DATASET_REPO,
+                "dataset_revision": DATASET_REVISION,
+                "dataset_split": DATASET_SPLIT,
+                "dataset_index": int(dataset_index),
+                "row_id": row_id,
+                "text_characters": int(text_characters),
+                "text_character_band": list(
+                    TEXT_CHARACTER_BANDS[band_index]
+                ),
+                "image_family_rank": family_rank,
+                "message_count": len(source["messages"]),
+                "messages_sha256": stable_digest(source["messages"]),
+                "image_size": list(image_size),
+                "image_sha256": hashlib.sha256(image.tobytes()).hexdigest(),
+            }
+            records.append((row, manifest))
 
     random.Random(SEED).shuffle(records)
     return (
@@ -364,6 +406,9 @@ def fixture_summary(manifest: list[dict]) -> dict:
         "unique_image_sizes": len(
             {tuple(item["image_size"]) for item in manifest}
         ),
+        "image_sizes": sorted(
+            {tuple(item["image_size"]) for item in manifest}
+        ),
     }
 
 
@@ -380,6 +425,32 @@ def model_type(model) -> str | None:
     if isinstance(config, dict):
         return config.get("model_type")
     return getattr(config, "model_type", None)
+
+
+def source_identity(source: Path) -> tuple[str, str, str]:
+    prerequisite_sha = os.environ.get("VLM_SHAPE_PREREQUISITE_SHA", "")
+    if not prerequisite_sha:
+        raise RuntimeError("VLM_SHAPE_PREREQUISITE_SHA is required")
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=source,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    overlay = subprocess.run(
+        ["git", "diff", "--binary", "--", *PREREQUISITE_OVERLAY_FILES],
+        cwd=source,
+        check=True,
+        capture_output=True,
+    ).stdout
+    overlay_sha256 = hashlib.sha256(overlay).hexdigest()
+    if overlay_sha256 == EMPTY_SHA256:
+        raise RuntimeError(
+            "Pinned prerequisite overlay is absent from source "
+            f"{source}"
+        )
+    return commit, prerequisite_sha, overlay_sha256
 
 
 def child_main(payload_text: str) -> int:
@@ -412,6 +483,9 @@ def child_main(payload_text: str) -> int:
     fixture_digest = stable_digest(fixture_manifest)
     selected_fixture = fixture_summary(fixture_manifest)
     process = psutil.Process()
+    source_commit, prerequisite_sha, source_overlay_sha256 = source_identity(
+        source
+    )
 
     print(STAGE_MARKER + "model_load", flush=True)
     model, processor = FastMLXModel.from_pretrained(
@@ -470,7 +544,9 @@ def child_main(payload_text: str) -> int:
         completion_only_loss=False,
         append_eos=False,
         disable_memory_limits=True,
-        compile_max_variants=None,
+        compile_max_variants=(
+            COMPILE_VARIANT_CAP if mode == "planned" else None
+        ),
     )
     compile_decision = resolve_training_compile(model, args=training_args)
     if not compile_decision.enabled:
@@ -479,13 +555,9 @@ def child_main(payload_text: str) -> int:
             "mode": mode,
             "candidate": asdict(candidate),
             "source": str(source),
-            "source_commit": subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=source,
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip(),
+            "source_commit": source_commit,
+            "prerequisite_sha": prerequisite_sha,
+            "source_overlay_sha256": source_overlay_sha256,
             "imported_zoo": str(imported),
             "fixture_digest": fixture_digest,
             "fixture": selected_fixture,
@@ -678,12 +750,17 @@ def child_main(payload_text: str) -> int:
         action = guard.get("action")
         if action in ("exact", "bucket"):
             plan_supported = True
-            expected_action = "exact" if raw <= 128 else "bucket"
+            expected_action = (
+                "exact" if raw <= COMPILE_VARIANT_CAP else "bucket"
+            )
             checks = {
                 "threshold_action": action == expected_action,
                 "raw_positive": raw > 0,
                 "planned_positive": planned > 0,
-                "planned_at_most_128": planned <= 128,
+                "planned_at_most_cap": planned <= COMPILE_VARIANT_CAP,
+                "configured_cap": (
+                    guard.get("configured_cap") == COMPILE_VARIANT_CAP
+                ),
                 "raw_catalog_count": catalog_counts["raw"] == raw,
                 "planned_catalog_snapshot": (
                     catalog_counts["planned"] == planned
@@ -726,13 +803,9 @@ def child_main(payload_text: str) -> int:
         "mode": mode,
         "candidate": asdict(candidate),
         "source": str(source),
-        "source_commit": subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=source,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip(),
+        "source_commit": source_commit,
+        "prerequisite_sha": prerequisite_sha,
+        "source_overlay_sha256": source_overlay_sha256,
         "imported_zoo": str(imported),
         "fixture_digest": fixture_digest,
         "fixture": selected_fixture,
@@ -840,7 +913,19 @@ def run_child(
     return json.loads(matches[-1]), output
 
 
+def compare_source_overlays(main_result: dict, planned_result: dict) -> None:
+    for key in ("prerequisite_sha", "source_overlay_sha256"):
+        if not main_result.get(key) or (
+            main_result.get(key) != planned_result.get(key)
+        ):
+            raise RuntimeError(
+                f"Main and planned prerequisite overlays differ for {key}: "
+                f"{main_result.get(key)!r} != {planned_result.get(key)!r}"
+            )
+
+
 def compare_runs(main_result: dict, planned_result: dict) -> dict:
+    compare_source_overlays(main_result, planned_result)
     if main_result["fixture_digest"] != planned_result["fixture_digest"]:
         raise RuntimeError("Main and planned fixtures differ")
     if main_result["trained_token_series"] != planned_result["trained_token_series"]:
@@ -887,7 +972,9 @@ def compare_runs(main_result: dict, planned_result: dict) -> dict:
         "plan_supported": plan_supported,
         "plan_verified": bool(planned_result["plan_verified"]),
         "plan_skip_reason": planned_result.get("plan_skip_reason"),
+        "prerequisite_sha": planned_result["prerequisite_sha"],
         "action": guard["action"],
+        "configured_cap": guard["configured_cap"],
         "raw_signatures": guard["raw_signatures"],
         "planned_signatures": guard["planned_signatures"],
         "padding_work_fraction": guard["padding_work_fraction"],
@@ -914,12 +1001,14 @@ def compare_qualification(
     if not main_unqualified and not planned_unqualified:
         return None
     if main_unqualified and planned_unqualified:
+        compare_source_overlays(main_result, planned_result)
         if main_result["fixture_digest"] != planned_result["fixture_digest"]:
             raise RuntimeError("Main and planned fixtures differ")
         return {
             "plan_supported": False,
             "plan_verified": False,
             "plan_skip_reason": "vlm_compile_unqualified",
+            "prerequisite_sha": planned_result["prerequisite_sha"],
             "action": "not_applicable",
             "main_compile_reason": main_result.get("compile_reason"),
             "planned_compile_reason": planned_result.get("compile_reason"),
@@ -1178,11 +1267,19 @@ def summarize_main(results_dir: str) -> int:
         if result.get("status") in {"failed", "missing", "starting"}
     ]
     passed = [result for result in results if result.get("status") == "passed"]
+    bucket_passed = [
+        result
+        for result in passed
+        if result.get("comparison", {}).get("action") == "bucket"
+        and result.get("comparison", {}).get("plan_verified") is True
+    ]
     if malformed:
         print("Malformed artifacts:", json.dumps(malformed, indent=2))
     if not passed:
         print("No model produced a verified finite VLM shape plan")
-    if failed or malformed or not passed:
+    if not bucket_passed:
+        print("No model produced a verified bucketed VLM shape plan")
+    if failed or malformed or not passed or not bucket_passed:
         print("Failed results:", json.dumps(failed, indent=2, sort_keys=True))
         return 1
     return 0
