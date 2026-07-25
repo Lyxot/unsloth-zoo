@@ -59,9 +59,19 @@ jobs:
 
       - name: Install pinned MLX runtime
         run: |
-          python -m pip install \
-            -c .github/constraints/vlm-shape-guard-macos.txt \
-            -r .github/constraints/vlm-shape-guard-macos.txt
+          constraints=.github/constraints/vlm-shape-guard-macos.txt
+          python -m pip install -c "$constraints" pip
+          pip install -c "$constraints" \
+            anyio click setuptools \
+            torch torchvision \
+            datasets einops transformers tokenizers huggingface-hub safetensors \
+            sentencepiece protobuf pyyaml jinja2 \
+            numpy pillow opencv-python scipy pandas pyarrow pytz tzdata \
+            packaging requests tqdm psutil wheel hf-transfer \
+            regex msgspec typing-extensions filelock \
+            timm matplotlib
+          pip install --no-deps -c "$constraints" \
+            mlx mlx-metal mlx-lm mlx-vlm
 
       - name: Download pinned model and real fixture
         run: |
