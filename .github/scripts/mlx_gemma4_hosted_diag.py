@@ -52,6 +52,7 @@ def child_main(payload_text):
     source = Path(payload["source"]).resolve()
     model_path = Path(payload["model_path"]).resolve()
     compiled = bool(payload["compiled"])
+    use_cce = bool(payload["use_cce"])
     sys.path.insert(0, str(source))
 
     import mlx.core as mx
@@ -146,7 +147,7 @@ def child_main(payload_text):
             save_steps=0,
             eval_steps=0,
             max_seq_length=384,
-            use_cce=True,
+            use_cce=use_cce,
             compile=compiled,
             compile_mode="best_effort",
             compile_auto_tune=False,
@@ -197,7 +198,11 @@ def child_main(payload_text):
         shutil.rmtree(output_dir, ignore_errors=True)
 
     result = {
-        "mode": "compiled" if compiled else "eager",
+        "mode": (
+            f"{'cce' if use_cce else 'ce'}_"
+            f"{'compiled' if compiled else 'eager'}"
+        ),
+        "use_cce": use_cce,
         "model_revision": model_path.name,
         "fixture_row": manifest[0]["row_id"],
         "fixture_messages_sha256": manifest[0]["messages_sha256"],
@@ -214,12 +219,13 @@ def child_main(payload_text):
     print(RESULT_MARKER + json.dumps(result, sort_keys=True), flush=True)
 
 
-def run_child(source, model_path, compiled, log_path):
+def run_child(source, model_path, compiled, use_cce, log_path):
     payload = json.dumps(
         {
             "source": str(source),
             "model_path": str(model_path),
             "compiled": compiled,
+            "use_cce": use_cce,
         },
         separators=(",", ":"),
     )
@@ -259,25 +265,28 @@ def run_child(source, model_path, compiled, log_path):
 def parent_main(source, model_path, output_dir):
     output_dir.mkdir(parents=True, exist_ok=True)
     results = {}
-    for compiled in (False, True):
-        mode = "compiled" if compiled else "eager"
-        results[mode] = run_child(
-            source,
-            model_path,
-            compiled,
-            output_dir / f"{mode}.log",
-        )
-    if results["eager"]["batch"] != results["compiled"]["batch"]:
-        raise RuntimeError("eager and compiled batch digests differ")
-    if results["eager"]["trained_tokens"] != results["compiled"]["trained_tokens"]:
-        raise RuntimeError("eager and compiled trained-token counts differ")
+    for use_cce in (True, False):
+        for compiled in (False, True):
+            mode = (
+                f"{'cce' if use_cce else 'ce'}_"
+                f"{'compiled' if compiled else 'eager'}"
+            )
+            results[mode] = run_child(
+                source,
+                model_path,
+                compiled,
+                use_cce,
+                output_dir / f"{mode}.log",
+            )
+    reference = results["cce_eager"]
+    for mode, result in results.items():
+        if result["batch"] != reference["batch"]:
+            raise RuntimeError(f"{mode} batch digests differ")
+        if result["trained_tokens"] != reference["trained_tokens"]:
+            raise RuntimeError(f"{mode} trained-token counts differ")
     summary = {
         "status": "completed",
         **results,
-        "loss_relative_difference": abs(
-            results["compiled"]["loss"] - results["eager"]["loss"]
-        )
-        / max(abs(results["eager"]["loss"]), 1e-12),
     }
     (output_dir / "result.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True)
