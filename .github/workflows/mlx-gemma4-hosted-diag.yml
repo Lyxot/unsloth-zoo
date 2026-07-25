@@ -93,8 +93,9 @@ jobs:
           )
           PY
 
-      - name: Compare eager and compiled four-step training
+      - name: Run one-step eager standard-CE control
         run: |
+          set -o pipefail
           mkdir -p "$RESULT_DIR"
           ulimit -n 65536 || true
           python .github/scripts/mlx_gemma4_hosted_diag.py \

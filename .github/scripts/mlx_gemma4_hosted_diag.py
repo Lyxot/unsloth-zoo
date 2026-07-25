@@ -53,6 +53,7 @@ def child_main(payload_text):
     model_path = Path(payload["model_path"]).resolve()
     compiled = bool(payload["compiled"])
     use_cce = bool(payload["use_cce"])
+    max_steps = int(payload["max_steps"])
     sys.path.insert(0, str(source))
 
     import mlx.core as mx
@@ -134,7 +135,7 @@ def child_main(payload_text):
         args = MLXTrainingConfig(
             per_device_train_batch_size=1,
             gradient_accumulation_steps=1,
-            max_steps=4,
+            max_steps=max_steps,
             warmup_steps=5,
             learning_rate=2e-4,
             logging_steps=1,
@@ -219,13 +220,14 @@ def child_main(payload_text):
     print(RESULT_MARKER + json.dumps(result, sort_keys=True), flush=True)
 
 
-def run_child(source, model_path, compiled, use_cce, log_path):
+def run_child(source, model_path, compiled, use_cce, max_steps, log_path):
     payload = json.dumps(
         {
             "source": str(source),
             "model_path": str(model_path),
             "compiled": compiled,
             "use_cce": use_cce,
+            "max_steps": max_steps,
         },
         separators=(",", ":"),
     )
@@ -264,29 +266,18 @@ def run_child(source, model_path, compiled, use_cce, log_path):
 
 def parent_main(source, model_path, output_dir):
     output_dir.mkdir(parents=True, exist_ok=True)
-    results = {}
-    for use_cce in (True, False):
-        for compiled in (False, True):
-            mode = (
-                f"{'cce' if use_cce else 'ce'}_"
-                f"{'compiled' if compiled else 'eager'}"
-            )
-            results[mode] = run_child(
-                source,
-                model_path,
-                compiled,
-                use_cce,
-                output_dir / f"{mode}.log",
-            )
-    reference = results["cce_eager"]
-    for mode, result in results.items():
-        if result["batch"] != reference["batch"]:
-            raise RuntimeError(f"{mode} batch digests differ")
-        if result["trained_tokens"] != reference["trained_tokens"]:
-            raise RuntimeError(f"{mode} trained-token counts differ")
+    mode = "ce_eager"
+    result = run_child(
+        source,
+        model_path,
+        False,
+        False,
+        1,
+        output_dir / f"{mode}.log",
+    )
     summary = {
         "status": "completed",
-        **results,
+        mode: result,
     }
     (output_dir / "result.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True)
