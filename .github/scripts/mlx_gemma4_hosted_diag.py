@@ -267,12 +267,12 @@ def run_child(source, model_path, compiled, use_cce, max_steps, log_path):
 
 def parent_main(source, model_path, output_dir):
     output_dir.mkdir(parents=True, exist_ok=True)
-    mode = "ce_eager"
+    mode = "cce_eager"
     result = run_child(
         source,
         model_path,
         False,
-        False,
+        True,
         1,
         output_dir / f"{mode}.log",
     )
