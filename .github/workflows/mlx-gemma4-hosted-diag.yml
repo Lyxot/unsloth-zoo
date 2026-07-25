@@ -2,7 +2,7 @@ name: Gemma4 Hosted Metal Diagnostic
 
 on:
   pull_request:
-    branches: [feat/mlx-vlm-shape-guard]
+    branches: [ci/vlm-shape-guard-training-proof]
 
 permissions:
   contents: read

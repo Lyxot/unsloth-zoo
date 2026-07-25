@@ -73,6 +73,7 @@ def child_main(payload_text):
     model, processor = FastMLXModel.from_pretrained(
         str(model_path),
         max_seq_length=384,
+        dtype="float16",
         text_only=False,
         load_in_4bit=True,
         random_state=SEED,
