@@ -1,0 +1,102 @@
+name: Gemma4 Hosted Metal Diagnostic
+
+on:
+  pull_request:
+    branches: [feat/mlx-vlm-shape-guard]
+
+permissions:
+  contents: read
+
+jobs:
+  gemma4-diagnostic:
+    runs-on: macos-14
+    timeout-minutes: 90
+    env:
+      HF_HUB_DISABLE_XET: "1"
+      HF_HUB_ENABLE_HF_TRANSFER: "0"
+      HF_HOME: /tmp/gemma4-hosted-diag-hf
+      PIP_NO_CACHE_DIR: "1"
+      PYTHONUNBUFFERED: "1"
+      TOKENIZERS_PARALLELISM: "false"
+      RESULT_DIR: /tmp/gemma4-hosted-diag-results
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.13"
+
+      - name: Show runner
+        run: |
+          uname -a
+          sw_vers
+          sysctl -n hw.model hw.memsize
+          python --version
+
+      - name: Build pinned main with PR 893 overlay
+        run: |
+          git remote add upstream https://github.com/unslothai/unsloth-zoo.git
+          git fetch --no-tags upstream \
+            main \
+            pull/893/head:refs/remotes/upstream/pr-893
+          test "$(git rev-parse upstream/pr-893)" = \
+            42362afd9172ae806a5a555d8ca2fd6539f40eeb
+          git worktree add --detach \
+            /tmp/unsloth-zoo-gemma4-main \
+            7ad13f6fcd9076ebac1e1800641a41dd1f704ee2
+          merge_base=$(git merge-base \
+            7ad13f6fcd9076ebac1e1800641a41dd1f704ee2 \
+            upstream/pr-893)
+          git diff "$merge_base"..upstream/pr-893 -- \
+            unsloth_zoo/mlx/compile.py \
+            unsloth_zoo/mlx/loader.py |
+            git -C /tmp/unsloth-zoo-gemma4-main apply -
+          git -C /tmp/unsloth-zoo-gemma4-main diff --check
+
+      - name: Install pinned MLX runtime
+        run: |
+          python -m pip install \
+            -c .github/constraints/vlm-shape-guard-macos.txt \
+            -r .github/constraints/vlm-shape-guard-macos.txt
+
+      - name: Download pinned model and real fixture
+        run: |
+          model_path=$(python - <<'PY'
+          from huggingface_hub import snapshot_download
+          print(snapshot_download(
+              "unsloth/gemma-4-E2B-it-UD-MLX-4bit",
+              revision="4d0996cddd2f1fd9a28a9c76643b5a2bdbb51feb",
+          ))
+          PY
+          )
+          echo "MODEL_PATH=$model_path" >> "$GITHUB_ENV"
+          python - <<'PY'
+          from datasets import load_dataset
+          load_dataset(
+              "axolotl-ai-co/llava-instruct-mix-vsft-small",
+              revision="a3ca113612453f2624904f1c99d8b650a56cc430",
+              split="train",
+          )
+          PY
+
+      - name: Compare eager and compiled first step
+        run: |
+          mkdir -p "$RESULT_DIR"
+          ulimit -n 65536 || true
+          python .github/scripts/mlx_gemma4_hosted_diag.py \
+            --source /tmp/unsloth-zoo-gemma4-main \
+            --model-path "$MODEL_PATH" \
+            --output-dir "$RESULT_DIR" |
+            tee "$RESULT_DIR/job.log"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: gemma4-hosted-metal-diagnostic
+          path: /tmp/gemma4-hosted-diag-results
+          if-no-files-found: warn

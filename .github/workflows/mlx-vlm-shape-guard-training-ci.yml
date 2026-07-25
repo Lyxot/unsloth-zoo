@@ -5,7 +5,7 @@ name: MLX VLM Shape Guard Real Training
 
 on:
   pull_request:
-    branches: [feat/mlx-vlm-shape-guard]
+    branches: [__gemma4_hosted_diag_disabled__]
     types: [opened, synchronize, reopened]
   workflow_dispatch:
     inputs:
