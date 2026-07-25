@@ -10,6 +10,7 @@ the admitted finite signature catalog.
 from __future__ import annotations
 
 import argparse
+import ast
 from dataclasses import asdict, dataclass
 import hashlib
 import json
@@ -57,85 +58,225 @@ EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 class Candidate:
     key: str
     family: str
+    architecture: str
     repo: str
     shard: str
 
 
-# Image-capable model coverage mirrors Lyxot/unsloth-zoo#3. Video duplicates
-# and audio-only candidates are omitted because this workflow exercises
-# image+text training. Each repository gets an isolated runner so resource
-# failures on very large checkpoints do not hide smaller-family results.
+# One smallest suitable public checkpoint from its vendor, Unsloth, or
+# mlx-community represents every explicitly training-compile-qualified
+# architecture. Backend-only qualifications use a VLM whose nested text
+# backend has that architecture.
 CANDIDATES = (
     Candidate(
-        "idefics3-smolvlm",
-        "Idefics3 / SmolVLM",
-        "mlx-community/SmolVLM-256M-Instruct-4bit",
+        "aya-vision",
+        "Aya Vision",
+        "aya_vision",
+        "mlx-community/aya-vision-8b-4bit",
         "small",
     ),
-    Candidate("qwen2-vl", "Qwen2-VL", "mlx-community/Qwen2-VL-2B-Instruct-4bit", "small"),
-    Candidate("qwen3-vl", "Qwen3-VL", "unsloth/Qwen3-VL-2B-Instruct", "small"),
-    Candidate("qwen3-5-vl", "Qwen3.5-VL", "unsloth/Qwen3.5-0.8B", "small"),
-    Candidate("lfm2-vl", "LFM2-VL", "mlx-community/LFM2.5-VL-1.6B-4bit", "small"),
-    Candidate("jina-vlm", "Jina VLM", "jinaai/jina-vlm-mlx", "small"),
-    Candidate("internvl-chat", "InternVL Chat", "mlx-community/InternVL3-1B-4bit", "small"),
-    Candidate("fastvlm", "FastVLM", "mlx-community/FastVLM-0.5B-bf16", "small"),
-    Candidate("gemma4", "Gemma4", "unsloth/gemma-4-E2B-it-UD-MLX-4bit", "medium"),
-    Candidate("minicpm-v4-6", "MiniCPM-V 4.6", "mlx-community/MiniCPM-V-4.6-mxfp4", "medium"),
-    Candidate("glm4v", "GLM-4.6V", "mlx-community/GLM-4.6V-Flash-mxfp4", "medium"),
     Candidate(
-        "deepseek-vl-v2",
-        "DeepSeek-VL2 tiny",
-        "mlx-community/deepseek-vl2-tiny-4bit",
-        "medium",
+        "deepseekocr",
+        "DeepSeek-OCR",
+        "deepseekocr",
+        "mlx-community/DeepSeek-OCR-4bit",
+        "small",
     ),
-    Candidate("phi3-v", "Phi-3.5 Vision", "mlx-community/Phi-3.5-vision-instruct-4bit", "medium"),
     Candidate(
-        "granite-vision",
-        "Granite Vision",
-        "mlx-community/granite-vision-3.2-2b-4bit",
-        "medium",
+        "deepseekocr-2",
+        "DeepSeek-OCR-2",
+        "deepseekocr_2",
+        "mlx-community/DeepSeek-OCR-2-4bit",
+        "small",
     ),
-    Candidate("qwen2-5-vl", "Qwen2.5-VL", "mlx-community/Qwen2.5-VL-3B-Instruct-4bit", "medium"),
-    Candidate("gemma3", "Gemma3", "unsloth/gemma-3-4b-it", "medium"),
-    Candidate("llava", "LLaVA", "mlx-community/llava-1.5-7b-4bit", "large-a"),
-    Candidate("llava-next", "LLaVA-NeXT", "mlx-community/llava-v1.6-mistral-7b-4bit", "large-a"),
-    Candidate("llava-bunny", "LLaVA Bunny", "BAAI/Bunny-v1_1-Llama-3-8B-V", "large-a"),
-    Candidate("gemma3n", "Gemma3n", "mlx-community/gemma-3n-E2B-it-4bit", "large-a"),
-    Candidate("idefics2", "Idefics2", "mlx-community/idefics2-8b-4bit", "large-a"),
-    Candidate("molmo", "Molmo", "mlx-community/Molmo-7B-D-0924-4bit", "large-a"),
-    Candidate("aya-vision", "Aya Vision", "mlx-community/aya-vision-8b-4bit", "large-b"),
-    Candidate("mllama", "Mllama", "mlx-community/Llama-3.2-11B-Vision-Instruct-4bit", "large-b"),
-    Candidate("zaya1-vl", "ZAYA1-VL", "OsaurusAI/ZAYA1-VL-8B-MXFP4", "large-b"),
-    Candidate("youtu-vl", "Youtu-VL", "tencent/Youtu-VL-4B-Instruct", "large-b"),
-    Candidate("pixtral", "Pixtral", "mlx-community/pixtral-12b-4bit", "large-b"),
-    Candidate("molmo2", "Molmo2", "mlx-community/Molmo2-8B-4bit", "large-b"),
-    Candidate("kimi-vl", "Kimi-VL", "mlx-community/Kimi-VL-A3B-Thinking-4bit", "large-b"),
     Candidate(
-        "deepseek-vl-v2-small",
-        "DeepSeek-VL2 small",
-        "mlx-community/deepseek-vl2-small-4bit",
-        "large-b",
+        "gemma3",
+        "Gemma3",
+        "gemma3",
+        "mlx-community/gemma-3-4b-it-qat-4bit",
+        "small",
+    ),
+    Candidate(
+        "gemma3n",
+        "Gemma3n",
+        "gemma3n",
+        "mlx-community/gemma-3n-E2B-it-4bit",
+        "small",
+    ),
+    Candidate(
+        "gemma4",
+        "Gemma4",
+        "gemma4",
+        "mlx-community/gemma-4-e2b-it-4bit",
+        "small",
+    ),
+    Candidate(
+        "glm-ocr",
+        "GLM-OCR",
+        "glm_ocr",
+        "mlx-community/GLM-OCR-4bit",
+        "small",
+    ),
+    Candidate(
+        "idefics2",
+        "Idefics2",
+        "idefics2",
+        "mlx-community/idefics2-8b-4bit",
+        "small",
+    ),
+    Candidate(
+        "idefics3",
+        "Idefics3",
+        "idefics3",
+        "mlx-community/Idefics3-8B-Llama3-4bit",
+        "small",
+    ),
+    Candidate(
+        "llama4",
+        "Llama4",
+        "llama4",
+        "mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit",
+        "moe",
+    ),
+    Candidate(
+        "llava",
+        "LLaVA",
+        "llava",
+        "mlx-community/llava-interleave-qwen-0.5b-4bit",
+        "small",
+    ),
+    Candidate(
+        "llava-bunny",
+        "LLaVA Bunny",
+        "llava_bunny",
+        "mlx-community/Bunny-Llama-3-8B-V-4bit",
+        "small",
+    ),
+    Candidate(
+        "llava-next",
+        "LLaVA-NeXT",
+        "llava_next",
+        "mlx-community/llava-v1.6-mistral-7b-4bit",
+        "small",
     ),
     Candidate(
         "mistral3-vl",
-        "Mistral3-VL",
-        "mlx-community/Mistral-Small-3.1-24B-Instruct-2503-4bit",
-        "large-b",
+        "Mistral3",
+        "mistral3",
+        "mlx-community/Ministral-3-3B-Instruct-2512-4bit",
+        "small",
     ),
-    Candidate("qwen3-6-moe", "Qwen3.6 MoE", "unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit", "moe"),
+    Candidate(
+        "mistral4",
+        "Mistral4",
+        "mistral4",
+        "mlx-community/Mistral-Small-4-119B-2603-OptiQ-2bit",
+        "moe",
+    ),
+    Candidate(
+        "mllama",
+        "Mllama",
+        "mllama",
+        "mlx-community/Llama-3.2-11B-Vision-Instruct-4bit",
+        "small",
+    ),
+    Candidate(
+        "moondream3",
+        "Moondream3",
+        "moondream3",
+        "moondream/moondream3-preview",
+        "moe",
+    ),
+    Candidate(
+        "multi-modality",
+        "DeepSeek-VL",
+        "multi_modality",
+        "mlx-community/deepseek-vl-1.3b-chat-4bit",
+        "small",
+    ),
+    Candidate(
+        "paddleocr-vl",
+        "PaddleOCR-VL",
+        "paddleocr_vl",
+        "mlx-community/PaddleOCR-VL-4bit",
+        "small",
+    ),
+    Candidate(
+        "paligemma",
+        "PaliGemma",
+        "paligemma",
+        "mlx-community/paligemma2-3b-mix-224-4bit",
+        "small",
+    ),
+    Candidate(
+        "phi4-siglip",
+        "Phi-4 Reasoning Vision",
+        "phi4_siglip",
+        "microsoft/Phi-4-reasoning-vision-15B",
+        "moe",
+    ),
+    Candidate(
+        "phi4mm",
+        "Phi-4 Multimodal",
+        "phi4mm",
+        "microsoft/Phi-4-multimodal-instruct",
+        "large-a",
+    ),
+    Candidate(
+        "phi3-v",
+        "Phi-3.5 Vision",
+        "phi3_v",
+        "mlx-community/Phi-3.5-vision-instruct-4bit",
+        "small",
+    ),
+    Candidate(
+        "pixtral",
+        "Pixtral",
+        "pixtral",
+        "mlx-community/pixtral-12b-4bit",
+        "small",
+    ),
+    Candidate(
+        "qwen2-vl",
+        "Qwen2-VL",
+        "qwen2_vl",
+        "mlx-community/Qwen2-VL-2B-Instruct-4bit",
+        "small",
+    ),
+    Candidate(
+        "qwen2-5-vl",
+        "Qwen2.5-VL",
+        "qwen2_5_vl",
+        "mlx-community/Qwen2.5-VL-3B-Instruct-4bit",
+        "small",
+    ),
+    Candidate(
+        "qwen3-5-vl",
+        "Qwen3.5",
+        "qwen3_5",
+        "mlx-community/Qwen3.5-0.8B-MLX-4bit",
+        "small",
+    ),
+    Candidate(
+        "qwen3-6-moe",
+        "Qwen3.6 MoE",
+        "qwen3_5_moe",
+        "unsloth/Qwen3.6-35B-A3B-UD-MLX-3bit",
+        "large-a",
+    ),
     Candidate(
         "qwen3-vl-moe",
         "Qwen3-VL MoE",
+        "qwen3_vl_moe",
         "mlx-community/Qwen3-VL-30B-A3B-Instruct-3bit",
-        "moe",
+        "large-a",
     ),
-    Candidate("llama4", "Llama4", "mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit", "moe"),
-    Candidate("step3p7", "Step-3.7", "mlx-community/Step-3.7-Flash-4bit", "moe"),
     Candidate(
-        "ernie4-5-moe-vl",
-        "ERNIE-4.5 MoE VL",
-        "mlx-community/ERNIE-4.5-VL-28B-A3B-Thinking-4bit",
-        "moe",
+        "qwen3-vl",
+        "Qwen3-VL",
+        "qwen3_vl",
+        "mlx-community/Qwen3-VL-2B-Instruct-4bit",
+        "small",
     ),
 )
 
@@ -244,7 +385,42 @@ def stable_digest(value) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def verified_training_architectures() -> frozenset[str]:
+    compile_path = (
+        Path(__file__).resolve().parents[2]
+        / "unsloth_zoo"
+        / "mlx"
+        / "compile.py"
+    )
+    module = ast.parse(compile_path.read_text(), filename=str(compile_path))
+    for node in module.body:
+        target = getattr(node, "target", None)
+        if isinstance(target, ast.Name) and target.id == "_VERIFIED_TRAINING_ARCHES":
+            return frozenset(ast.literal_eval(node.value))
+    raise RuntimeError(f"Could not find _VERIFIED_TRAINING_ARCHES in {compile_path}")
+
+
+def validate_candidate_catalog() -> None:
+    architectures = [candidate.architecture for candidate in CANDIDATES]
+    duplicates = sorted(
+        architecture
+        for architecture in set(architectures)
+        if architectures.count(architecture) > 1
+    )
+    expected = verified_training_architectures()
+    actual = set(architectures)
+    missing = sorted(expected - actual)
+    extra = sorted(actual - expected)
+    if duplicates or missing or extra:
+        raise RuntimeError(
+            "Candidate catalog must cover each verified training architecture "
+            f"exactly once: duplicates={duplicates}, missing={missing}, "
+            f"extra={extra}"
+        )
+
+
 def candidate_for_key(key: str) -> Candidate:
+    validate_candidate_catalog()
     for candidate in CANDIDATES:
         if candidate.key == key:
             return candidate
@@ -252,6 +428,7 @@ def candidate_for_key(key: str) -> Candidate:
 
 
 def model_matrix(selected_keys: str | None = None) -> dict:
+    validate_candidate_catalog()
     selected = {
         key.strip()
         for key in str(selected_keys or "").split(",")
@@ -466,7 +643,11 @@ def child_main(payload_text: str) -> int:
     import psutil
     import unsloth_zoo
     from unsloth_zoo.mlx.loader import FastMLXModel
-    from unsloth_zoo.mlx.compile import resolve_training_compile
+    from unsloth_zoo.mlx.compile import (
+        get_backend_architectures,
+        get_model_architecture,
+        resolve_training_compile,
+    )
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
     import unsloth_zoo.mlx.utils as utils_module
 
@@ -497,6 +678,14 @@ def child_main(payload_text: str) -> int:
     )
     print(STAGE_MARKER + "model_loaded", flush=True)
     actual_arch = model_type(model)
+    loaded_arch = get_model_architecture(model)
+    backend_arches = get_backend_architectures(model)
+    loaded_arches = {loaded_arch, *backend_arches} - {None}
+    if candidate.architecture not in loaded_arches:
+        raise RuntimeError(
+            f"{candidate.repo} loaded architectures {sorted(loaded_arches)}; "
+            f"expected {candidate.architecture!r}"
+        )
     model = FastMLXModel.get_peft_model(
         model,
         r=4,
@@ -563,6 +752,8 @@ def child_main(payload_text: str) -> int:
             "fixture": selected_fixture,
             "rows": len(rows),
             "model_type": actual_arch,
+            "loaded_architecture": loaded_arch,
+            "backend_architectures": list(backend_arches),
             "compile_enabled": False,
             "compile_scope": "none",
             "compile_reason": compile_decision.reason,
@@ -811,6 +1002,8 @@ def child_main(payload_text: str) -> int:
         "fixture": selected_fixture,
         "rows": len(rows),
         "model_type": actual_arch,
+        "loaded_architecture": loaded_arch,
+        "backend_architectures": list(backend_arches),
         "train_loss": float(train_output["train_loss"]),
         "trained_tokens": int(train_output["trained_tokens"]),
         "train_runtime_seconds": float(train_output["train_runtime"]),
