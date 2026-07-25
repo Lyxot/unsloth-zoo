@@ -46,7 +46,7 @@ jobs:
   real-vlm-audio:
     name: Real MLX ${{ matrix.family }} (${{ matrix.modalities }})
     needs: plan
-    runs-on: macos-14
+    runs-on: macos-26
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
