@@ -8193,15 +8193,22 @@ def _create_default_text_plan(
     _reject_offset_row_window_transform(
         row_window_transform, "the default text plan",
     )
+    items = [dataset[index] for index in range(len(dataset))]
+    # A row shorter than two tokens has no target after the causal shift, so
+    # it trains nothing and only occupies a batch slot. The other finite
+    # builders drop such rows; this one padded them to the minimum width.
+    keep = [index for index, item in enumerate(items) if len(item[0]) >= 2]
     schedule, cycle_length = _shuffled_full_batch_schedule(
-        len(dataset),
+        len(keep),
         batch_size,
-        sort_key=dataset.itemlen,
+        # Indices are into the kept rows, so the original sort key is looked
+        # up through them and keeps mlx-lm's ordering for unfiltered data.
+        sort_key=lambda position: dataset.itemlen(keep[position]),
         num_batches=num_batches,
         seed=seed,
     )
     rows = _finite_text_rows(
-        [dataset[index] for index in range(len(dataset))],
+        [items[index] for index in keep],
         with_offsets=True,
     )
     return FiniteTextBatchPlan(
