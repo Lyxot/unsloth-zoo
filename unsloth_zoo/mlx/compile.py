@@ -1893,6 +1893,34 @@ def _try_import_module(module_name: str):
         return None
 
 
+_SDPA_MASK_COMPOSER = None
+
+
+def set_sdpa_mask_composer(composer):
+    """Install ``composer`` as the SDPA mask composer, returning the previous.
+
+    The composer is called as ``composer(q, k, mask)`` from inside the patched
+    ``mx.fast.scaled_dot_product_attention`` and returns either a replacement
+    mask or None to leave the call alone. It is a scope switch only: per-batch
+    data must reach it through compiled state, not through this hook, or a
+    compiled step would capture a stale value.
+    """
+    global _SDPA_MASK_COMPOSER
+    previous = _SDPA_MASK_COMPOSER
+    _SDPA_MASK_COMPOSER = composer
+    return previous
+
+
+def install_safe_sdpa_mask_patch():
+    """Install the SDPA mask patch alone, without the VLM pattern bundles.
+
+    Text models never load the bundles, so this is how a text run obtains the
+    patched attention entry point.
+    """
+    _install_safe_fused_sdpa_mask_patches()
+    _PATCHED_PATTERN_BUNDLES.add("safe_fused_sdpa_mask")
+
+
 def _install_safe_fused_sdpa_mask_patches():
     """Work around MLX SDPA NaN gradients on fully masked query rows.
 
@@ -1900,6 +1928,9 @@ def _install_safe_fused_sdpa_mask_patches():
     mlx-vlm caller inherits the fix. Upstream bug: an additive float mask with
     a fully `-inf` query row gives finite forward but non-finite backward.
     Fix: clear fully masked rows before SDPA, zero those output rows after.
+
+    The patched entry point also consults the SDPA mask composer, so a caller
+    that engages one can restrict attention to part of each row.
     """
     fast_ns = getattr(mx, "fast", None)
     current = getattr(fast_ns, "scaled_dot_product_attention", None) if fast_ns is not None else None
@@ -1911,6 +1942,11 @@ def _install_safe_fused_sdpa_mask_patches():
     # why: no @mx.compile — already reached from inside step_fn; nesting
     # mx.compile around **kwargs corrupts VLM gradients.
     def safe_scaled_dot_product_attention(q, k, v, scale=1.0, mask=None, **kwargs):
+        composer = _SDPA_MASK_COMPOSER
+        if composer is not None:
+            composed = composer(q, k, mask)
+            if composed is not None:
+                mask = composed
         row_all_masked = None
         if mask is not None and hasattr(mask, "dtype") and mx.issubdtype(mask.dtype, mx.floating):
             # Clear all-masked rows before SDPA (avoids the unstable backward),
@@ -6330,8 +6366,7 @@ def install_mlx_compile_patches():
     if _PATCHES_INSTALLED:
         return build_compile_qualifications()
 
-    _install_safe_fused_sdpa_mask_patches()
-    _PATCHED_PATTERN_BUNDLES.add("safe_fused_sdpa_mask")
+    install_safe_sdpa_mask_patch()
 
     for bundle in list_compile_pattern_bundles():
         _apply_compile_patch_plan(_resolve_compile_patch_plan(bundle))

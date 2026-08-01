@@ -8168,3 +8168,84 @@ def test_qwen3_prompt_rows_defer_to_the_native_deepstack_path():
     assert not filled[mc._QWEN3_VISUAL_STATE_KEY].any().item()
 
 
+def test_sdpa_mask_composer_is_inert_until_engaged(monkeypatch):
+    import mlx.core as mx
+    from unsloth_zoo.mlx import compile as mc
+
+    monkeypatch.setattr(mx.fast, "_unsloth_safe_sdpa_mask_patch", False,
+                        raising=False)
+    original = mx.fast.scaled_dot_product_attention
+    try:
+        mc._install_safe_fused_sdpa_mask_patches()
+        patched = mx.fast.scaled_dot_product_attention
+        # q, k and v must all differ, or an argument-order regression in the
+        # composer call is invisible.
+        q = mx.ones((1, 1, 2, 4))
+        k = mx.array([[[[2.0, 2.0, 2.0, 2.0], [3.0, 3.0, 3.0, 3.0]]]])
+        v = mx.array([[[[0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0]]]])
+        # A non-None incoming mask: declining must keep THIS mask, which is
+        # what distinguishes a decline from replacing the mask with None.
+        incoming = mx.array([[True, False], [True, True]])
+        baseline = patched(q, k, v, scale=1.0, mask=incoming)
+        assert not bool(mx.array_equal(
+            baseline, patched(q, k, v, scale=1.0, mask=None),
+        ))
+
+        seen = []
+
+        def _composer(q_arg, k_arg, mask_arg):
+            seen.append((q_arg, k_arg, mask_arg))
+            return None  # decline: this call is not the engaged batch
+
+        previous = mc.set_sdpa_mask_composer(_composer)
+        try:
+            declined = patched(q, k, v, scale=1.0, mask=incoming)
+        finally:
+            mc.set_sdpa_mask_composer(previous)
+
+        after = patched(q, k, v, scale=1.0, mask=incoming)
+
+        assert len(seen) == 1
+        seen_q, seen_k, seen_mask = seen[0]
+        # The composer must receive the call's own q, k and mask, not v or a
+        # reordering of them.
+        assert bool(mx.array_equal(seen_q, q))
+        assert bool(mx.array_equal(seen_k, k))
+        assert bool(mx.array_equal(seen_mask, incoming))
+        # Declining must leave the call byte-identical, and unsetting the
+        # composer must restore the un-consulted path.
+        assert bool(mx.array_equal(declined, baseline))
+        assert bool(mx.array_equal(after, baseline))
+    finally:
+        mx.fast.scaled_dot_product_attention = original
+        mx.fast._unsloth_safe_sdpa_mask_patch = False
+
+
+def test_sdpa_mask_composer_replaces_the_mask_when_it_returns_one(monkeypatch):
+    import mlx.core as mx
+    from unsloth_zoo.mlx import compile as mc
+
+    monkeypatch.setattr(mx.fast, "_unsloth_safe_sdpa_mask_patch", False,
+                        raising=False)
+    original = mx.fast.scaled_dot_product_attention
+    try:
+        mc._install_safe_fused_sdpa_mask_patches()
+        patched = mx.fast.scaled_dot_product_attention
+        q = mx.ones((1, 1, 2, 4))
+        v = mx.array([[[[0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0]]]])
+        blocked = mx.array([[True, False], [False, True]])
+
+        previous = mc.set_sdpa_mask_composer(lambda *_: blocked)
+        try:
+            composed = patched(q, q, v, scale=1.0, mask=None)
+        finally:
+            mc.set_sdpa_mask_composer(previous)
+
+        assert bool(mx.array_equal(
+            composed, patched(q, q, v, scale=1.0, mask=blocked),
+        ))
+    finally:
+        mx.fast.scaled_dot_product_attention = original
+        mx.fast._unsloth_safe_sdpa_mask_patch = False
+
+
