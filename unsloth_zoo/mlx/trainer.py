@@ -7527,7 +7527,8 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                             preserve_dataset_order=False,
                             num_epochs=None, return_dataset=False,
                             comm_group=None, distributed_pad_mode="cycle",
-                            return_plan=False):
+                            return_plan=False, row_window_transform=None,
+                            row_window_size=None):
     """Create padded batches with label masks for train_on_responses_only.
 
     Tokenizes each dataset item, applies the masking closure to get labels,
@@ -7618,6 +7619,13 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             f"(no response found after truncation). "
             f"This prevents NaN loss during training."
         )
+
+    from .utils import DEFAULT_ROW_WINDOW_SIZE, _prepare_sized_text_rows
+    all_items = _prepare_sized_text_rows(
+        all_items,
+        row_window_transform,
+        DEFAULT_ROW_WINDOW_SIZE if row_window_size is None else row_window_size,
+    )
 
     if not all_items:
         raise ValueError(

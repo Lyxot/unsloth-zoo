@@ -4602,6 +4602,10 @@ def _labeled_row_has_supervision(labels, max_seq_length):
 # TEXT_SEGMENT_PAD_ID so they never share a segment with real tokens.
 TEXT_SEGMENT_PAD_ID = -1
 
+# Rows reach a row-window transform in this many arrival-ordered rows at a
+# time; the last window of a pass may be shorter.
+DEFAULT_ROW_WINDOW_SIZE = 1000
+
 
 def text_batch_segments(batch):
     """Per-token segment ids carried by a text batch, or None when absent."""
@@ -5106,13 +5110,27 @@ def _shuffled_full_batch_schedule(
             return tuple(schedule), len(groups)
 
 
+def _prepare_sized_text_rows(rows, row_window_transform, row_window_size):
+    """Apply a row-window transform to a materialized sized row list."""
+    if row_window_transform is None:
+        return rows
+    return list(_apply_row_window_transform(
+        rows, row_window_transform, _validate_row_window_size(row_window_size),
+    ))
+
+
 def _create_tokenized_text_plan(tokenized, batch_size, max_seq_length,
-                                num_batches=None, seed=42, pad_id=0):
+                                num_batches=None, seed=42, pad_id=0,
+                                row_window_transform=None,
+                                row_window_size=DEFAULT_ROW_WINDOW_SIZE):
     """Plan pretokenized rows with mlx-lm's sorting and shuffle contract."""
     tokenized = [
         row for row in tokenized
         if _labeled_row_has_supervision(row[1], max_seq_length)
     ]
+    tokenized = _prepare_sized_text_rows(
+        tokenized, row_window_transform, row_window_size,
+    )
     schedule, cycle_length = _shuffled_full_batch_schedule(
         len(tokenized),
         batch_size,
@@ -8152,6 +8170,16 @@ def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
     )
 
 
+def _reject_offset_row_window_transform(row_window_transform, builder):
+    """Refuse a row-window transform on the label-free sized paths."""
+    if row_window_transform is not None:
+        raise ValueError(
+            f"Unsloth MLX: {builder} builds rows without a label channel, "
+            "whose supervision comes from the lengths span, so a row-window "
+            "transform cannot be applied to them."
+        )
+
+
 def _create_default_text_plan(
     dataset,
     batch_size,
@@ -8159,8 +8187,12 @@ def _create_default_text_plan(
     *,
     num_batches=None,
     seed=42,
+    row_window_transform=None,
 ):
     """Build the CPU equivalent of mlx-lm's finite text batch schedule."""
+    _reject_offset_row_window_transform(
+        row_window_transform, "the default text plan",
+    )
     schedule, cycle_length = _shuffled_full_batch_schedule(
         len(dataset),
         batch_size,
@@ -8195,7 +8227,9 @@ def _create_text_batch_plan(dataset, tokenizer, batch_size, max_seq_length,
                             model_type=None, append_eos=True,
                             completion_only_loss=None,
                             assistant_only_loss=False, comm_group=None,
-                            distributed_pad_mode="cycle"):
+                            distributed_pad_mode="cycle",
+                            row_window_transform=None,
+                            row_window_size=DEFAULT_ROW_WINDOW_SIZE):
     """Build a finite CPU-backed text batch plan.
 
     Uses iterate_batches from mlx_lm for efficient dynamic-padding batching:
@@ -8228,6 +8262,8 @@ def _create_text_batch_plan(dataset, tokenizer, batch_size, max_seq_length,
             num_batches=num_batches,
             seed=seed,
             pad_id=_mlx_text_pad_id(tokenizer),
+            row_window_transform=row_window_transform,
+            row_window_size=row_window_size,
         )
     if assistant_only_loss:
         _validate_mlx_text_assistant_only_dataset(dataset)
@@ -8258,6 +8294,8 @@ def _create_text_batch_plan(dataset, tokenizer, batch_size, max_seq_length,
                 num_batches=num_batches,
                 seed=seed,
                 pad_id=_mlx_text_pad_id(tokenizer),
+                row_window_transform=row_window_transform,
+                row_window_size=row_window_size,
             )
         if assistant_only_loss:
             raise ValueError(
@@ -8295,6 +8333,7 @@ def _create_text_batch_plan(dataset, tokenizer, batch_size, max_seq_length,
             comm_group=comm_group,
             distributed_pad_mode=distributed_pad_mode,
             tokenizer=tokenizer,
+            row_window_transform=row_window_transform,
         )
     return _create_default_text_plan(
         ds,
@@ -8302,6 +8341,7 @@ def _create_text_batch_plan(dataset, tokenizer, batch_size, max_seq_length,
         max_seq_length,
         num_batches=num_batches,
         seed=seed,
+        row_window_transform=row_window_transform,
     )
 
 
@@ -8491,8 +8531,12 @@ def _create_distributed_text_plan(
     comm_group=None,
     distributed_pad_mode="cycle",
     tokenizer=None,
+    row_window_transform=None,
 ):
     """Distributed variant of mlx-lm's length-sorted text batch iterator."""
+    _reject_offset_row_window_transform(
+        row_window_transform, "the distributed text plan",
+    )
     # Length is measured on the tokenized row. CacheDataset.itemlen returns
     # len(raw_row), which for the {"text": ...} rows _prepare_dataset produces
     # is the dict key count (1), not the token count, so it cannot gate the
@@ -8627,6 +8671,8 @@ def _create_ordered_text_plan(
     completion_only_loss=None,
     assistant_only_loss=False,
     comm_group=None,
+    row_window_transform=None,
+    row_window_size=DEFAULT_ROW_WINDOW_SIZE,
 ):
     """Plan text batches with an explicit dataset order.
 
@@ -8714,6 +8760,13 @@ def _create_ordered_text_plan(
             row for row in tokenized
             if _labeled_row_has_supervision(row[1], max_seq_length)
         ]
+        tokenized = _prepare_sized_text_rows(
+            tokenized, row_window_transform, row_window_size,
+        )
+    else:
+        _reject_offset_row_window_transform(
+            row_window_transform, "an unlabeled ordered text plan",
+        )
 
     if not tokenized:
         raise ValueError(
@@ -9516,11 +9569,6 @@ class _LazyTextPrefetcher:
 
     def orphan_alive(self):
         return self.orphaned and self._thread is not None and self._thread.is_alive()
-
-
-# Rows reach a row-window transform in this many arrival-ordered rows at a
-# time; the last window of a pass may be shorter.
-DEFAULT_ROW_WINDOW_SIZE = 1000
 
 
 def _validate_row_window_size(value):
