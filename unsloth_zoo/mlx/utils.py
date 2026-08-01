@@ -9518,6 +9518,36 @@ class _LazyTextPrefetcher:
         return self.orphaned and self._thread is not None and self._thread.is_alive()
 
 
+# Rows reach a row-window transform in this many arrival-ordered rows at a
+# time; the last window of a pass may be shorter.
+DEFAULT_ROW_WINDOW_SIZE = 1000
+
+
+def _validate_row_window_size(value):
+    """Validate the row-window size before source consumption."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(
+            "Unsloth MLX: row_window_size must be an integer >= 1 "
+            f"(got {value!r})."
+        )
+    return int(value)
+
+
+def _apply_row_window_transform(rows, transform, window_size):
+    """Feed prepared rows through ``transform`` in arrival-ordered windows."""
+    if transform is None:
+        yield from rows
+        return
+    window = []
+    for row in rows:
+        window.append(row)
+        if len(window) >= window_size:
+            yield from transform(window)
+            window = []
+    if window:
+        yield from transform(window)
+
+
 def _validate_streaming_length_window(value):
     """Validate streaming_text_length_window_batches before source consumption."""
     if isinstance(value, bool) or not isinstance(value, int):
@@ -9567,6 +9597,8 @@ def _iterate_lazy_text_training_batches(
     include_epoch=False,
     length_window_batches=1,
     window_seed=0,
+    row_window_transform=None,
+    row_window_size=DEFAULT_ROW_WINDOW_SIZE,
     yield_host_staged=False,
     reject_mlx_valued=False,
     should_stop=None,
@@ -9589,6 +9621,20 @@ def _iterate_lazy_text_training_batches(
     if dataset_order not in (None, "default", "sequential"):
         raise ValueError(f"Unsupported MLX dataset_order: {dataset_order!r}")
 
+    row_window_size = _validate_row_window_size(row_window_size)
+    if (
+        row_window_transform is not None
+        and expected_rows_per_pass is not None
+        and row_window_size > 1
+    ):
+        # Buffering more than one row emits nothing until the window fills, so
+        # the per-row source and prepared counts interleave and trip the one-
+        # row-per-source-row check even for a cardinality-preserving transform.
+        raise ValueError(
+            "Unsloth MLX: a row-window transform with row_window_size > 1 "
+            "cannot keep one trainable text row per declared source row. Use "
+            "max_steps instead of epoch training, or a window of one."
+        )
     length_window = _validate_streaming_length_window(length_window_batches)
     if dataset_order == "sequential":
         # Sequential contract: exact source order, length grouping off.
@@ -9777,7 +9823,13 @@ def _iterate_lazy_text_training_batches(
                 if expected_rows_per_pass is not None
                 else _tokenized_rows(pass_source)
             )
-            rows_pending = iter(row_iterator)
+            # Placed on the row stream rather than on an emit path so every
+            # batch route inherits it: the length-window flush, the direct
+            # emit used when the window is one batch, and both pass-tail
+            # routes all draw from here.
+            rows_pending = iter(_apply_row_window_transform(
+                row_iterator, row_window_transform, row_window_size,
+            ))
             while True:
                 if should_stop is not None and should_stop():
                     return
@@ -10319,7 +10371,9 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
                              length_window_batches=1,
                              prefetch_batches=0,
                              prefetch_skip_batches=0,
-                             prefetch_control=None):
+                             prefetch_control=None,
+                             row_window_transform=None,
+                             row_window_size=DEFAULT_ROW_WINDOW_SIZE):
     """Streaming batch generator for MLX training.
 
     Map-style datasets retain the existing mlx-lm batching behavior. Unsized
@@ -10355,6 +10409,8 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
             expected_rows_per_pass=expected_rows_per_pass,
             length_window_batches=length_window_batches,
             window_seed=seed,
+            row_window_transform=row_window_transform,
+            row_window_size=row_window_size,
         )
         prefetch_depth = _validate_streaming_prefetch(prefetch_batches)
         if prefetch_depth and _distributed_rank_size(comm_group)[1] == 1:

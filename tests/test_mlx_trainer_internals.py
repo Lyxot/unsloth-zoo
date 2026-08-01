@@ -8166,3 +8166,5 @@ def test_qwen3_prompt_rows_defer_to_the_native_deepstack_path():
     mask_only = {"inputs_embeds": mx.zeros((1, 4, 1)), "visual_pos_masks": masks}
     filled = mc._pad_qwen3_prompt_rows([mask_only, compact_row])[0]
     assert not filled[mc._QWEN3_VISUAL_STATE_KEY].any().item()
+
+
