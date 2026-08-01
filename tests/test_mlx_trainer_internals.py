@@ -102,6 +102,47 @@ def test_finite_text_batch_plan_preserves_label_padding():
     assert labels.dtype == mx.int64
 
 
+@pytest.mark.parametrize("with_segments", [False, True])
+def test_text_batch_segment_channel_is_optional_and_compile_distinct(
+    with_segments,
+):
+    from unsloth_zoo.mlx.utils import (
+        TEXT_SEGMENT_PAD_ID,
+        FiniteTextBatchPlan,
+        _FiniteTextRow,
+        text_batch_segments,
+    )
+
+    rows = (
+        (
+            _FiniteTextRow((1, 2, 3), segments=(0, 0, 1)),
+            _FiniteTextRow((4, 5), segments=(0, 1)),
+        )
+        if with_segments
+        else (_FiniteTextRow((1, 2, 3)), _FiniteTextRow((4, 5)))
+    )
+    plan = FiniteTextBatchPlan(
+        rows, ((0, 1),), max_seq_length=8, pad_id=9,
+    )
+
+    batch = plan[0]
+    family = plan.batch_family(0)
+    assert len(batch) == (4 if with_segments else 3)
+    if not with_segments:
+        assert text_batch_segments(batch) is None
+        assert family[0] == "text_tuple_3"
+        assert len(family) == 4
+        return
+    # The shorter row's padding column must not join a real segment.
+    assert text_batch_segments(batch).tolist() == [
+        [0, 0, 1], [0, 1, TEXT_SEGMENT_PAD_ID],
+    ]
+    # The descriptor must describe the extra array, not merely be named for it.
+    assert family[0] == "text_tuple_4"
+    assert len(family) == 5
+    assert family[4] == ((2, "sequence"), "int32")
+
+
 def test_finite_text_training_plan_keeps_long_schedule_cpu_only():
     import mlx.core as mx
     from unsloth_zoo.mlx.utils import (

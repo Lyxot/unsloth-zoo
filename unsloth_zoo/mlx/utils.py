@@ -4597,6 +4597,23 @@ def _labeled_row_has_supervision(labels, max_seq_length):
     return any(int(x) != -100 for x in labels[1:max_seq_length])
 
 
+# Text batches are (ids, lengths_info, labels) and may carry a fourth entry of
+# per-token segment ids. Padding columns and padding rows carry
+# TEXT_SEGMENT_PAD_ID so they never share a segment with real tokens.
+TEXT_SEGMENT_PAD_ID = -1
+
+
+def text_batch_segments(batch):
+    """Per-token segment ids carried by a text batch, or None when absent."""
+    return batch[3] if len(batch) > 3 else None
+
+
+def text_batch_with_segments(batch, segments):
+    """Return ``batch`` carrying ``segments``, or without the channel if None."""
+    head = (batch[0], batch[1], batch[2])
+    return head if segments is None else head + (segments,)
+
+
 class _HostStagedTextBatch:
     """Host-side (python/numpy) text batch awaiting MLX finalization.
 
@@ -4604,13 +4621,15 @@ class _HostStagedTextBatch:
     synchronous mode accepts those unchanged, the prefetch producer rejects them.
     """
 
-    __slots__ = ("ids", "lengths_info", "labels", "host_valued")
+    __slots__ = ("ids", "lengths_info", "labels", "host_valued", "segments")
 
-    def __init__(self, ids, lengths_info, labels, host_valued=True):
+    def __init__(self, ids, lengths_info, labels, host_valued=True,
+                 segments=None):
         self.ids = ids
         self.lengths_info = lengths_info
         self.labels = labels
         self.host_valued = host_valued
+        self.segments = segments
 
 
 def _is_host_valued_field(value):
@@ -4622,7 +4641,10 @@ def _finalize_text_batch(staged):
     labels_array = (
         mx.array(staged.labels) if staged.labels is not None else None
     )
-    return mx.array(staged.ids), mx.array(staged.lengths_info), labels_array
+    batch = (mx.array(staged.ids), mx.array(staged.lengths_info), labels_array)
+    if staged.segments is None:
+        return batch
+    return batch + (mx.array(staged.segments),)
 
 
 def _stage_tokenized_text_batch(
@@ -4631,6 +4653,7 @@ def _stage_tokenized_text_batch(
     pad_id=0,
     labels_expected=None,
     host_valued=None,
+    segments=None,
 ):
     """Host staging of one pretokenized text batch (no MLX work).
 
@@ -4669,6 +4692,12 @@ def _stage_tokenized_text_batch(
         np.full((len(batch_items), max_length), -100, dtype=np.int64)
         if has_labels else None
     )
+    batch_segments = (
+        np.full(
+            (len(batch_items), max_length), TEXT_SEGMENT_PAD_ID, dtype=np.int32,
+        )
+        if segments is not None else None
+    )
     for row_idx, item in enumerate(batch_items):
         if item is None:
             continue
@@ -4677,8 +4706,13 @@ def _stage_tokenized_text_batch(
         batch_ids[row_idx, :length] = ids[:length]
         if batch_labels is not None:
             batch_labels[row_idx, :length] = labels[:length]
+        if batch_segments is not None and segments[row_idx] is not None:
+            batch_segments[row_idx, :length] = segments[row_idx][:length]
     lengths_info = [[0, length] for length in lengths]
-    return _HostStagedTextBatch(batch_ids, lengths_info, batch_labels, host_valued)
+    return _HostStagedTextBatch(
+        batch_ids, lengths_info, batch_labels, host_valued,
+        segments=batch_segments,
+    )
 
 
 def _create_tokenized_text_batch(batch_items, max_seq_length, pad_id=0,
@@ -4701,6 +4735,7 @@ class _FiniteTextRow:
     input_ids: tuple
     offset: int = 0
     labels: tuple | None = None
+    segments: tuple | None = None
 
 
 def _finite_text_pad_width(raw_width, *, pad_to_multiple=0, minimum_width=1,
@@ -4897,15 +4932,27 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
                 and self._rows[0].labels is not None
             )
         )
+        has_segments = bool(
+            (real_rows and real_rows[0].segments is not None)
+            or (
+                not real_rows
+                and self._rows
+                and self._rows[0].segments is not None
+            )
+        )
         batch_size = len(batch_indices)
+        # The name tracks the arity so batches carrying segments never share a
+        # compiled-argument identity with batches that do not.
         return (
-            "text_tuple_3",
+            "text_tuple_4" if has_segments else "text_tuple_3",
             ((batch_size, "sequence"), "int32"),
             ((batch_size, 2), "int32"),
             (
                 ((batch_size, "sequence"), self.label_dtype.name)
                 if has_labels else None
             ),
+        ) + (
+            (((batch_size, "sequence"), "int32"),) if has_segments else ()
         )
 
     def set_shape_plan(self, shape_plan):
@@ -4956,6 +5003,18 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
             np.full((len(selected), width), -100, dtype=self.label_dtype)
             if has_labels else None
         )
+        has_segments = bool(
+            (real_rows and real_rows[0].segments is not None)
+            or (
+                not real_rows
+                and self._rows
+                and self._rows[0].segments is not None
+            )
+        )
+        batch_segments = (
+            np.full((len(selected), width), TEXT_SEGMENT_PAD_ID, dtype=np.int32)
+            if has_segments else None
+        )
         lengths_info = np.zeros((len(selected), 2), dtype=np.int32)
 
         for row_index, (row, length) in enumerate(zip(selected, lengths)):
@@ -4965,12 +5024,17 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
             batch_ids[row_index, :length] = row.input_ids[:length]
             if batch_labels is not None:
                 batch_labels[row_index, :length] = row.labels[:length]
+            if batch_segments is not None and row.segments is not None:
+                batch_segments[row_index, :length] = row.segments[:length]
 
-        return (
+        batch = (
             mx.array(batch_ids),
             mx.array(lengths_info),
             mx.array(batch_labels) if batch_labels is not None else None,
         )
+        if batch_segments is None:
+            return batch
+        return batch + (mx.array(batch_segments),)
 
     def __getitem__(self, index):
         return self.materialize(index)
@@ -4978,9 +5042,14 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
     def materialize_all(self):
         batches = [self[index] for index in range(len(self))]
         mx.eval(
-            [batch for batch, _lengths, _labels in batches]
-            + [lengths for _batch, lengths, _labels in batches]
-            + [labels for _batch, _lengths, labels in batches if labels is not None]
+            [batch[0] for batch in batches]
+            + [batch[1] for batch in batches]
+            + [batch[2] for batch in batches if batch[2] is not None]
+            + [
+                segments
+                for segments in (text_batch_segments(batch) for batch in batches)
+                if segments is not None
+            ]
         )
         return batches
 
@@ -9860,11 +9929,17 @@ def _pad_dispatched_text_batch(
     cycle_source=None,
 ):
     """Pad one owner-built global text batch before rank dispatch."""
-    input_ids, lengths, labels = batch
+    input_ids, lengths, labels = batch[0], batch[1], batch[2]
+    segments = text_batch_segments(batch)
     row_count = int(input_ids.shape[0])
     if row_count >= target_size:
-        return input_ids[:target_size], lengths[:target_size], (
-            None if labels is None else labels[:target_size]
+        return text_batch_with_segments(
+            (
+                input_ids[:target_size],
+                lengths[:target_size],
+                None if labels is None else labels[:target_size],
+            ),
+            None if segments is None else segments[:target_size],
         )
     if row_count == 0:
         raise ValueError("Unsloth MLX: cannot dispatch an empty text batch.")
@@ -9886,8 +9961,20 @@ def _pad_dispatched_text_batch(
                 (missing, int(labels.shape[1])), -100, dtype=labels.dtype,
             )
         )
+        padded_segments = (
+            None
+            if segments is None
+            else mx.full(
+                (missing, int(segments.shape[1])), TEXT_SEGMENT_PAD_ID,
+                dtype=segments.dtype,
+            )
+        )
     else:
-        source_ids, source_lengths, source_labels = cycle_source or batch
+        source = cycle_source or batch
+        source_ids, source_lengths, source_labels = (
+            source[0], source[1], source[2],
+        )
+        source_segments = text_batch_segments(source)
         if (labels is None) != (source_labels is None):
             raise ValueError(
                 "Unsloth MLX: streaming text labels changed within one pass."
@@ -9902,6 +9989,11 @@ def _pad_dispatched_text_batch(
             None
             if source_labels is None
             else mx.take(source_labels, indices, axis=0)
+        )
+        padded_segments = (
+            None
+            if source_segments is None
+            else mx.take(source_segments, indices, axis=0)
         )
 
     width = max(int(input_ids.shape[1]), int(padded_ids.shape[1]))
@@ -9920,12 +10012,20 @@ def _pad_dispatched_text_batch(
     if labels is not None:
         labels = _pad_width(labels, -100)
         padded_labels = _pad_width(padded_labels, -100)
-    return (
-        mx.concatenate((input_ids, padded_ids), axis=0),
-        mx.concatenate((lengths, padded_lengths), axis=0),
+    if segments is not None:
+        segments = _pad_width(segments, TEXT_SEGMENT_PAD_ID)
+        padded_segments = _pad_width(padded_segments, TEXT_SEGMENT_PAD_ID)
+    return text_batch_with_segments(
+        (
+            mx.concatenate((input_ids, padded_ids), axis=0),
+            mx.concatenate((lengths, padded_lengths), axis=0),
+            None
+            if labels is None
+            else mx.concatenate((labels, padded_labels), axis=0),
+        ),
         None
-        if labels is None
-        else mx.concatenate((labels, padded_labels), axis=0),
+        if segments is None
+        else mx.concatenate((segments, padded_segments), axis=0),
     )
 
 
@@ -9994,10 +10094,11 @@ def _iterate_dispatched_lazy_text_training_batches(
             rows = 0
             width = 0
             has_labels = 0
+            has_segments = 0
             status = 0
             # Drop the previous fetch before pulling, so dispatch never holds
             # two batches alongside the window.
-            owner_batch = input_ids = lengths = labels = None
+            owner_batch = input_ids = lengths = labels = segments = None
             if rank == 0:
                 try:
                     if owner_contract_error is not None:
@@ -10013,10 +10114,14 @@ def _iterate_dispatched_lazy_text_training_batches(
                         pad_mode=distributed_pad_mode,
                         cycle_source=cycle_source,
                     )
-                    input_ids, lengths, labels = owner_batch
+                    input_ids, lengths, labels = (
+                        owner_batch[0], owner_batch[1], owner_batch[2],
+                    )
+                    segments = text_batch_segments(owner_batch)
                     rows = int(input_ids.shape[0])
                     width = int(input_ids.shape[1])
                     has_labels = int(labels is not None)
+                    has_segments = int(segments is not None)
                     status = 1
                 except StopIteration:
                     pass
@@ -10028,13 +10133,13 @@ def _iterate_dispatched_lazy_text_training_batches(
                     status = -1
 
             metadata = mx.array(
-                [status, rows, width, has_labels]
-                if rank == 0 else [0, 0, 0, 0],
+                [status, rows, width, has_labels, has_segments]
+                if rank == 0 else [0, 0, 0, 0, 0],
                 dtype=mx.int32,
             )
             metadata = mx.distributed.all_sum(metadata, group=comm_group)
             mx.eval(metadata)
-            status, rows, width, has_labels = (
+            status, rows, width, has_labels, has_segments = (
                 int(value) for value in metadata.tolist()
             )
             if status < 0:
@@ -10059,19 +10164,31 @@ def _iterate_dispatched_lazy_text_training_batches(
                     mx.zeros((rows, width), dtype=mx.int64)
                     if has_labels else None
                 )
+                segments = (
+                    mx.zeros((rows, width), dtype=mx.int32)
+                    if has_segments else None
+                )
             input_ids = mx.distributed.all_sum(input_ids, group=comm_group)
             lengths = mx.distributed.all_sum(lengths, group=comm_group)
+            reduced = [input_ids, lengths]
             if has_labels:
                 labels = mx.distributed.all_sum(labels, group=comm_group)
-                mx.eval(input_ids, lengths, labels)
-            else:
-                mx.eval(input_ids, lengths)
-            yield (
-                input_ids[rank:target_size:world_size],
-                lengths[rank:target_size:world_size],
+                reduced.append(labels)
+            if has_segments:
+                segments = mx.distributed.all_sum(segments, group=comm_group)
+                reduced.append(segments)
+            mx.eval(*reduced)
+            yield text_batch_with_segments(
+                (
+                    input_ids[rank:target_size:world_size],
+                    lengths[rank:target_size:world_size],
+                    None
+                    if labels is None
+                    else labels[rank:target_size:world_size],
+                ),
                 None
-                if labels is None
-                else labels[rank:target_size:world_size],
+                if not has_segments
+                else segments[rank:target_size:world_size],
             )
     finally:
         _close_mlx_owned_iterator(owner_iterator)

@@ -3551,7 +3551,9 @@ class MLXTrainer:
                     if is_vlm:
                         loss, ntoks = loss_fn(self.model, batch_data)
                     else:
-                        batch, lengths, labels = batch_data
+                        batch, lengths, labels = (
+                            batch_data[0], batch_data[1], batch_data[2],
+                        )
                         loss, ntoks = loss_fn(self.model, batch, lengths, labels)
                     # Zero-token eval batches (distributed_pad_mode="empty" padding
                     # rows) make loss NaN; mask them so NaN * 0 does not poison the
