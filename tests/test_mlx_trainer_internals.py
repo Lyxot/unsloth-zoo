@@ -8249,3 +8249,6 @@ def test_sdpa_mask_composer_replaces_the_mask_when_it_returns_one(monkeypatch):
         mx.fast._unsloth_safe_sdpa_mask_patch = False
 
 
+_ROWS = [((1, 2, 3), (-100, 2, 3)), ((4, 5, 6), (-100, 5, 6))]
+
+

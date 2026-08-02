@@ -53,6 +53,8 @@ import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 _PAD_MULTIPLE = 32
+# Bumped when the digest's contents change meaning.
+_DATA_SHAPING_VERSION = 1
 SUPPORTED_MLX_OPTIMIZERS = ("adafactor", "adamw", "adam", "sgd", "muon", "lion")
 SUPPORTED_MLX_LR_SCHEDULERS = ("linear", "cosine", "constant")
 
@@ -490,6 +492,7 @@ def _mlx_declared_iterable_length(dataset):
 
 
 from .utils import (
+    TEXT_SEGMENT_PAD_ID,
     make_cce_loss_fn,
     make_baseline_loss_fn,
     make_vlm_cce_loss_fn,
@@ -2996,6 +2999,205 @@ class MLXTrainer:
             self.args, self.state, self.control,
         )
 
+    def _data_shaping_digest(self, batches, planned_visits=None):
+        """Record how a resume would rebuild its batches."""
+        digest = {
+            "version": _DATA_SHAPING_VERSION,
+            # A route that cannot be digested still refuses a route change.
+            "route": (
+                "streaming" if batches is None else type(batches).__name__
+            ),
+            "grad_accum": int(
+                getattr(self.args, "gradient_accumulation_steps", 1) or 1
+            ),
+        }
+        if isinstance(batches, FiniteTextBatchPlan):
+            # Micro-batches the run intends to consume, which is not the
+            # schedule's length: an epoch-count run revisits one stored cycle,
+            # so a grown dataset lengthens the schedule without lengthening the
+            # run, and comparing a schedule prefix would line up batches the
+            # two runs never visit in the same order.
+            digest["planned_visits"] = int(
+                planned_visits or len(batches.schedule)
+            )
+
+        return digest
+
+    def _row_digest(self, batches, index, segmented):
+        """Hash one row's contribution: what it puts into a batch, truncated.
+
+        ``segmented`` says whether the batch carries the segment channel at
+        all, because that decides what a row with no segments of its own
+        emits: materialization fills it with the segment pad id, so storing
+        those values explicitly is the same batch and must hash the same.
+        """
+        row = batches.rows[index]
+        length = min(len(row.input_ids), batches.max_seq_length)
+        if not segmented:
+            segments = None
+        elif row.segments is None:
+            segments = (TEXT_SEGMENT_PAD_ID,) * length
+        else:
+            segments = tuple(int(value) for value in row.segments[:length])
+        return hashlib.blake2b(repr((
+            int(row.offset), length,
+            tuple(int(token) for token in row.input_ids[:length]),
+            None if row.labels is None
+            else tuple(int(token) for token in row.labels[:length]),
+            segments,
+        )).encode(), digest_size=16).digest()
+
+    def _plan_stream_digest(self, batches, visits):
+        """Hash the first ``visits`` batches the run visits, as they emit.
+
+        Hashing what the rows contribute, rather than the plan behind them,
+        is what keeps this honest in both directions: two plans that store
+        their rows in a different order but schedule them inversely supply the
+        same batches and must resume, while two plans whose rows carry
+        different tokens must not, however alike their schedules look.
+        """
+        cache = {}
+
+        def row_digest(index, segmented):
+            key = (index, segmented)
+            if key not in cache:
+                cache[key] = self._row_digest(batches, index, segmented)
+            return cache[key]
+
+        stream = hashlib.blake2b(digest_size=16)
+        if not batches.schedule:
+            return stream.hexdigest()
+        for visit in range(int(visits)):
+            index = batches.batch_index_for_visit(visit)
+            slots = batches.schedule[index]
+            # What the rows put into the batch, not the padding around them.
+            real = [int(slot) for slot in slots if slot is not None]
+            segmented = bool(
+                real and batches.rows[real[0]].segments is not None
+            )
+            stream.update(repr(tuple(
+                None if slot is None else row_digest(int(slot), segmented)
+                for slot in slots
+            )).encode())
+        return stream.hexdigest()
+
+    @staticmethod
+    def _recorded_length(saved):
+        """The recorded visit count, or None for anything that is not one."""
+        if not isinstance(saved, dict):
+            return None
+        count = saved.get("planned_visits")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            return None
+        return count
+
+
+
+    def _check_resume_stream(self, load_trainer_state, batches=None):
+        """Refuse a resume whose batches differ from the checkpoint's.
+
+        The batches, and not the position a resume restarts from. Where a run
+        restarts depends on the epoch length and the accumulation, which move
+        for reasons the batches do not -- measured, a one-batch cycle gives the
+        same cursors under accumulation 1 and 2, while cycle lengths 2 and 4
+        give different ones over identical batches. Verifying that is the
+        resume cursor's own problem and is not attempted here; what packing
+        needs is that enabling it cannot resume onto a stream whose rows now
+        contain something else.
+
+        Single-process only. Under DDP each rank builds its own shard, so
+        verifying one means comparing per-rank digests and refusing on a
+        verdict every rank agrees on -- and every step of that has to happen
+        where all ranks meet, or one rank leaves a collective another is
+        waiting in. That is its own change; running half of it here would put
+        the deadlock in rather than the guard.
+        """
+        if int(getattr(self, "_distributed_world_size", 1) or 1) > 1:
+            print(
+                "Unsloth: resuming across multiple ranks, so the batch stream "
+                "is not verified against the checkpoint's."
+            )
+            return
+        mismatch = self._resume_stream_mismatch(
+            (load_trainer_state() or {}).get("data_shaping"), batches,
+        )
+        if mismatch is not None:
+            raise ValueError(mismatch)
+
+    def _resume_stream_mismatch(self, saved, batches):
+        """Describe how the rebuilt stream differs, or None when it matches."""
+        if saved is None:
+            print(
+                "Unsloth: this checkpoint predates data-shaping digests, so "
+                "the resumed run's batch stream cannot be verified."
+            )
+            return None
+        saved_version = int(saved.get("version", 0) or 0)
+        if saved_version > _DATA_SHAPING_VERSION:
+            return (
+                "Unsloth MLX: this checkpoint records a newer data-shaping "
+                f"digest (version {saved_version}) than this build "
+                f"understands (version {_DATA_SHAPING_VERSION})."
+            )
+        if saved_version < _DATA_SHAPING_VERSION:
+            print(
+                "Unsloth: this checkpoint records an older data-shaping "
+                "digest, so the resumed run's batch stream is not verified."
+            )
+            return None
+
+        current = getattr(self, "_data_shaping_state", None) \
+            or self._data_shaping_digest(batches)
+        if saved.get("route") != current.get("route"):
+            return (
+                "Unsloth MLX: resume would rebuild the batch stream through a "
+                f"different route ({saved.get('route')!r} -> "
+                f"{current.get('route')!r}). Resume with the original "
+                "configuration, or start a new run."
+            )
+
+        differences = []
+        recorded_length = self._recorded_length(saved)
+        horizon = recorded_length or 0
+        planned = int(current.get("planned_visits", 0) or 0)
+        if not isinstance(batches, FiniteTextBatchPlan):
+            print(
+                "Unsloth: this run's batch stream is built by a route that "
+                "cannot be digested, so the resume is not verified."
+            )
+        elif recorded_length is None:
+            differences.append(
+                f"the checkpoint records {saved.get('planned_visits')!r} "
+                "planned visits, which is not a count"
+            )
+        elif saved.get("stream_digest") is None:
+            # Every checkpoint this version writes records one, so a finite
+            # text digest without it is malformed rather than merely older.
+            differences.append("the checkpoint records no digest of its stream")
+
+        elif planned < horizon:
+            # A shorter run cannot be checked against a longer checkpoint: one
+            # hash covers the recorded visits and cannot answer for a prefix,
+            # and the plan cannot supply the rest either -- a bounded schedule
+            # truncated to a smaller budget cycles its own prefix instead of
+            # continuing the checkpoint's.
+            differences.append(
+                f"a run of {planned} batches where the checkpoint recorded "
+                f"{horizon}, which leaves nothing common to compare"
+            )
+        elif saved["stream_digest"] != self._plan_stream_digest(
+            batches, horizon,
+        ):
+            differences.append(f"the first {horizon} batches it visits")
+
+        if not differences:
+            return None
+        return (
+            "Unsloth MLX: resume would replay a different batch stream "
+            f"than the checkpoint was written from ({'; '.join(differences)}). "
+            "Resume with the original configuration, or start a new run."
+        )
+
     def _callback_batches_per_epoch(self, batches):
         """Return the finite micro-batch count for one callback epoch."""
         if batches is None:
@@ -4727,6 +4929,25 @@ class MLXTrainer:
         # resume starts clean (else run-1's early-stop flag breaks the loop at
         # step 0). The resume block below re-seeds the persisted fields.
         self._reset_run_state()
+        # Computed once, while the plan that produced this run's stream is in
+        # hand, and unchanged as the run advances, so every checkpoint of the
+        # run records it as it stands here.
+        _grad_accum = max(1, int(args.gradient_accumulation_steps))
+        _planned_visits = (
+            _mlx_microstep_for_step(
+                total_steps, _epoch_flush_microbatches, _grad_accum,
+            )
+            if _epoch_flush_microbatches
+            else int(total_steps) * _grad_accum
+        )
+        self._data_shaping_state = self._data_shaping_digest(
+            batches, _planned_visits,
+        )
+        if isinstance(batches, FiniteTextBatchPlan):
+            self._data_shaping_state["stream_digest"] = \
+                self._plan_stream_digest(
+                    batches, self._data_shaping_state["planned_visits"],
+                )
 
         _resume_step = 0
         _resume_from = getattr(self, "_resume_from_checkpoint", None)
@@ -4734,7 +4955,21 @@ class MLXTrainer:
         if _resume_from:
             # Up front: a missing file otherwise surfaces as a generic mx.load
             # RuntimeError that the handler below does not catch.
+            # Before any of it is loaded: a refusal must leave the model and
+            # optimizer as they were, or a caller that handles it and starts
+            # fresh would train on the rejected checkpoint's weights.
+            _cached_state = getattr(self, "_mlx_resume_state_cache", None)
+
             _require_complete_resume_checkpoint(_resume_from)
+            self._check_resume_stream(
+                lambda: (
+                    _cached_state[1]
+                    if _cached_state is not None
+                    and _cached_state[0] == _resume_from
+                    else load_trainer_state(_resume_from)
+                ),
+                batches,
+            )
             try:
                 # 1. Load trained adapter weights into the model. The model
                 #    already has LoRA wrappers applied (Unsloth pipeline does
@@ -5988,6 +6223,7 @@ class MLXTrainer:
                             save_trainer_state(
                                 {
                                     "global_step": current_step,
+                                    "data_shaping": self._data_shaping_state,
                                     # HF checkpoints TrainerState wholesale, so
                                     # epoch travels with global_step and a resumed
                                     # run reports progress from on_train_begin.

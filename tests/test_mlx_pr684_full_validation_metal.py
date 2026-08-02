@@ -109,6 +109,11 @@ def test_resume_from_checkpoint_matches_fresh_run(tmp_path):
     with open(os.path.join(ckpt, "trainer_state.json")) as f:
         saved_state = json.load(f)
     assert saved_state["global_step"] == 3
+    # A resume replays the data stream, so the checkpoint has to record the
+    # batches it trained on or a changed one cannot be detected.
+    shaping = saved_state["data_shaping"]
+    assert shaping["stream_digest"]
+    assert shaping["planned_visits"] == 6 * shaping["grad_accum"]
 
     # Fresh process state: new base model, same seeds, resume from step 3.
     resumed = _make_text_trainer(
