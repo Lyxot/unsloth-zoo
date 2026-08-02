@@ -26,6 +26,7 @@ compile-ready only once explicitly verified.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache, wraps
 from pathlib import Path
@@ -1945,13 +1946,36 @@ class SegmentMaskBuffers:
     Train and eval keep separate buffers. Sharing one would leave an
     eval-shaped array sitting in the training step's captured state, and a
     captured input changing shape is what forces a recompile.
+
+    Engagement is also SCOPED, and it is worth being exact about what that
+    buys. The attention entry point is process-wide and serves every consumer
+    in the run, and the composer can only tell the packed batch apart by
+    geometry -- so a consumer sharing that geometry receives the isolation
+    mask. ``within`` opens the buffer for one model's own forward, which
+    closes the case of a consumer running *outside* that forward: it reads
+    nothing whatever its shapes are.
+
+    It does NOT close the case of a consumer running *inside* the forward,
+    because the window is temporal and ownership is not. Nothing here can
+    distinguish the text stack's own attention from an auxiliary call made
+    during the same forward at the same geometry. The interception count is
+    the only check that would see one, and it can be defeated: a layer
+    bypassing the entry point and an extra consumer reaching it cancel.
+    Closing that needs discrimination the composer does not have -- knowing
+    which module is asking -- and is not attempted here.
     """
 
-    __slots__ = ("_buffers", "_phase")
+    __slots__ = ("_buffers", "_engaged", "_phase", "_inside")
 
     def __init__(self):
         self._buffers = {"train": [None], "eval": [None]}
+        # What each phase would use, held apart from what its buffer holds.
+        # The buffer is the registered compile input, so moving ids into it
+        # only inside the window is what makes the window boundary visible to
+        # a compiled graph rather than to Python alone.
+        self._engaged = {"train": None, "eval": None}
         self._phase = None
+        self._inside = None
 
     def buffer(self, phase):
         """The list a compiled step should carry in its state for ``phase``."""
@@ -1963,15 +1987,48 @@ class SegmentMaskBuffers:
         return self._buffers[phase]
 
     def engage(self, phase, segments):
-        """Point the composer at ``segments`` for ``phase``, or disengage."""
-        self.buffer(phase)[0] = segments
+        """Say what ``phase`` will use, or that it will use nothing.
+
+        This records the ids; the window is what puts them where attention
+        can read them. Recording and exposing are separate so that entering
+        and leaving a window changes the registered buffer, which is what a
+        compiled graph watches -- gating on Python state alone would let a
+        graph traced outside the window keep running unmasked inside it.
+        """
+        self.buffer(phase)
+        self._engaged[phase] = segments
+        if self._inside == phase:
+            self.buffer(phase)[0] = segments
         self._phase = phase if segments is not None else None
 
+    @contextmanager
+    def within(self, phase):
+        """Open ``phase``'s buffer for one forward, and close it after.
+
+        Outside every window the buffer reads empty, so a consumer running
+        before or after this forward gets nothing whatever its shapes are.
+        A consumer running *inside* it is not excluded -- see the class
+        docstring for what this does and does not establish.
+
+        The phase is the window's, not whichever was engaged most recently,
+        so evaluation cannot read training's ids by opening its own window
+        while training's engagement is still standing.
+        """
+        buffer = self.buffer(phase)
+        previous, restored = self._inside, buffer[0]
+        self._inside = phase
+        buffer[0] = self._engaged[phase]
+        try:
+            yield
+        finally:
+            self._inside = previous
+            buffer[0] = restored
+
     def read(self):
-        """The engaged phase's ids, or None when nothing is engaged."""
-        if self._phase is None:
+        """The open window's ids, or None when no window is open."""
+        if self._inside is None:
             return None
-        return self._buffers[self._phase][0]
+        return self._buffers[self._inside][0]
 
 
 def _mask_kind(mask):
@@ -2270,7 +2327,7 @@ def _probe_segments(packed_length, cuts, rows=1):
 
 
 def _backward_isolation_refusal(model, tokens, disturbed, observed,
-                               normaliser, replay=None):
+                               normaliser, replay=None, window=None):
     """Whether isolation survives the backward, with the mask already engaged.
 
     A loss reading only the second document must have the same gradient
@@ -2286,10 +2343,13 @@ def _backward_isolation_refusal(model, tokens, disturbed, observed,
         return (scores * scores).sum() / normaliser
 
     state = [model.state]
-    gradients = mx.compile(
-        lambda inputs: nn.value_and_grad(model, tail_loss)(model, inputs)[1],
-        inputs=state, outputs=state,
-    )
+    def take_gradients(inputs):
+        if window is None:
+            return nn.value_and_grad(model, tail_loss)(model, inputs)[1]
+        with window():
+            return nn.value_and_grad(model, tail_loss)(model, inputs)[1]
+
+    gradients = mx.compile(take_gradients, inputs=state, outputs=state)
     if replay is not None:
         replay()
     clean = dict(tree_flatten(gradients(tokens)))
@@ -2478,7 +2538,10 @@ def _probe_refusal(model, packed_length, vocab_size, batch_size=1,
             # from different buffers differ for a reason that is not the one
             # under test.
             replay()
-            out = model(inputs)
+            # Inside the engagement window, so the probe measures what a
+            # caller scoping its own forward the same way will get.
+            with buffers.within(phase):
+                out = model(inputs)
             mx.eval(out)
             return out
 
@@ -2536,6 +2599,7 @@ def _probe_refusal(model, packed_length, vocab_size, batch_size=1,
             lambda probe: _backward_isolation_refusal(
                 model, tokens, probe[0], probe[2],
                 float(packed_length * vocab_size), replay,
+                lambda: buffers.within(phase),
             ),
         )
     except Exception as error:

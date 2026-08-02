@@ -248,6 +248,7 @@ def test_isolation_is_required_to_survive_the_backward():
         buffers.engage("train", segments)
         assert _backward_isolation_refusal(
             model, tokens, disturbed, observed, normaliser,
+            window=lambda: buffers.within("train"),
         ) is None
 
         # The same call with nothing masking the documents apart: the first
@@ -255,6 +256,7 @@ def test_isolation_is_required_to_survive_the_backward():
         buffers.engage("train", None)
         leaked = _backward_isolation_refusal(
             model, tokens, disturbed, observed, normaliser,
+            window=lambda: buffers.within("train"),
         )
     finally:
         buffers.engage("train", None)
@@ -302,6 +304,79 @@ def test_a_single_wrongly_permitted_position_is_caught(length):
 
     assert refusal is not None
     assert "moved another document" in refusal
+
+
+def test_engagement_retraces_the_compiled_step():
+    """Why registering the buffer is what makes the window safe under compile."""
+    from unsloth_zoo.mlx.compile import (
+        SegmentMaskBuffers, install_safe_sdpa_mask_patch,
+        make_segment_mask_composer, set_sdpa_mask_composer,
+    )
+
+    buffers = SegmentMaskBuffers()
+    composed = []
+    honest = make_segment_mask_composer(buffers.read)
+
+    def watching(q, k, mask):
+        result = honest(q, k, mask)
+        composed.append(result is not None)
+        return result
+
+    install_safe_sdpa_mask_patch()
+    previous = set_sdpa_mask_composer(watching)
+    try:
+        state = [buffers.buffer("train")]
+
+        def attend(q, k, v):
+            return mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=1.0, mask="causal",
+            )
+
+        step = mx.compile(attend, inputs=state, outputs=state)
+        ones = mx.zeros((1, 2, 4, 8))
+
+        buffers.engage("train", None)
+        with buffers.within("train"):
+            mx.eval(step(ones, ones, ones))
+        assert composed == [False]
+
+        # Same shapes, so the graph would be reused if the buffer were not an input.
+        buffers.engage("train", mx.array([[0, 0, 1, 1]]))
+        with buffers.within("train"):
+            mx.eval(step(ones, ones, ones))
+        assert composed == [False, True]
+
+        # Crossing the window with the engagement unchanged must retrace.
+        crossing = SegmentMaskBuffers()
+        crossing.engage("train", mx.array([[0, 0, 1, 1]]))
+        seen = []
+        honest_again = make_segment_mask_composer(crossing.read)
+
+        def counting(q, k, mask):
+            result = honest_again(q, k, mask)
+            seen.append(result is not None)
+            return result
+
+        set_sdpa_mask_composer(counting)
+        def attend_again(q, k, v):
+            return mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=1.0, mask="causal",
+            )
+
+        crossed = mx.compile(
+            attend_again, inputs=[crossing.buffer("train")],
+            outputs=[crossing.buffer("train")],
+        )
+        varied = mx.random.normal((1, 2, 4, 8))
+        outside = crossed(varied, varied, varied)
+        with crossing.within("train"):
+            inside = crossed(varied, varied, varied)
+        mx.eval(outside, inside)
+
+        assert seen == [False, True]
+        assert not mx.allclose(outside, inside).item()
+    finally:
+        set_sdpa_mask_composer(previous)
 
 
 def test_resume_from_checkpoint_matches_fresh_run(tmp_path):

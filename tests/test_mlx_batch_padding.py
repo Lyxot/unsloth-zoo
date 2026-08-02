@@ -142,10 +142,11 @@ def test_segments_reach_the_composer_by_buffer_not_by_capture():
 
     # The composer is built once and the ids change every batch, so it has to
     # read them each call. Capturing them would freeze the first batch's.
-    buffers.engage("train", mx.array([[0, 0, 1, 1]]))
-    first = np.array(compose(q, k, "causal"))
-    buffers.engage("train", mx.array([[0, 1, 1, 1]]))
-    second = np.array(compose(q, k, "causal"))
+    with buffers.within("train"):
+        buffers.engage("train", mx.array([[0, 0, 1, 1]]))
+        first = np.array(compose(q, k, "causal"))
+        buffers.engage("train", mx.array([[0, 1, 1, 1]]))
+        second = np.array(compose(q, k, "causal"))
 
     assert not (first == second).all()
 
@@ -161,11 +162,12 @@ def test_disengaging_leaves_attention_untouched():
     compose = make_segment_mask_composer(buffers.read)
     q = k = mx.zeros((1, 2, 4, 8))
 
-    buffers.engage("train", mx.array([[0, 0, 1, 1]]))
-    assert compose(q, k, "causal") is not None
-    # Declining returns the call to exactly what it was, which is what lets
-    # this live on a patch shared with vision-tower attention.
-    buffers.engage("train", None)
-    assert compose(q, k, "causal") is None
+    with buffers.within("train"):
+        buffers.engage("train", mx.array([[0, 0, 1, 1]]))
+        assert compose(q, k, "causal") is not None
+        # Declining returns the call to exactly what it was.
+        # lets this live on a patch shared with vision-tower attention.
+        buffers.engage("train", None)
+        assert compose(q, k, "causal") is None
 
 
