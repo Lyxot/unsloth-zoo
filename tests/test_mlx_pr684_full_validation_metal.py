@@ -35,6 +35,20 @@ if not _METAL:
 
 metal_only = pytest.mark.skipif(not _METAL, reason="requires Apple Silicon Metal")
 
+
+def _simulation_shim_installed():
+    """Whether another test module has swapped MLX for the torch double."""
+    import sys
+
+    return "mlx_simulation" in sys.modules or "mlx_simulation" in getattr(
+        sys.modules.get("mlx.core"), "__name__", "",
+    )
+
+
+real_runtime_only = pytest.mark.skipif(
+    not _METAL, reason="requires Apple Silicon Metal",
+)
+
 TEXT_MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
 # Qwen2-VL: smallest VLM whose processor resolves cleanly under current
 # transformers (the mlx-community SmolVLM-256M repo ships a preprocessor
@@ -86,6 +100,208 @@ def _assert_finite(hist):
     assert all(
         isinstance(l, float) and l == l and abs(l) != float("inf") for l in hist
     ), f"non-finite losses: {hist}"
+
+
+def _tiny_text_model(family, **overrides):
+    """A real architecture at toy size, with random weights and no download."""
+    import importlib
+
+    if _simulation_shim_installed():
+        pytest.skip("the MLX simulation shim is installed in this process")
+    module = importlib.import_module(f"mlx_lm.models.{family}")
+    return module.Model(module.ModelArgs(model_type=family, **overrides))
+
+
+def _tiny_qwen2(layers=2, vocab=128):
+    return _tiny_text_model(
+        "qwen2", hidden_size=32, num_hidden_layers=layers, intermediate_size=64,
+        num_attention_heads=2, rms_norm_eps=1e-5, vocab_size=vocab,
+        num_key_value_heads=2,
+    )
+
+
+def test_attention_that_bypasses_the_patch_is_refused():
+    """The interception count is what keeps non-text attention out."""
+    from unsloth_zoo.mlx.compile import _probe_refusal
+
+    import mlx.nn as nn
+
+    class HandRolledAttention(nn.Module):
+        """Attends without the fused entry point, as gemma2 and olmo do."""
+
+        def __call__(self, x, *args, **kwargs):
+            return x
+
+    model = _tiny_qwen2(layers=2)
+    # Whatever this model's verdict is, it is not about the layer count, so
+    # the assertion below cannot be satisfied by an unrelated refusal.
+    baseline = _probe_refusal(model, 32, 128)
+    assert baseline is None or "layers" not in baseline
+
+    model.model.layers.append(HandRolledAttention())
+
+    refusal = _probe_refusal(model, 32, 128)
+    assert refusal is not None
+    assert "3 layers" in refusal and "2 calls" in refusal
+
+    # The other direction is the load-bearing one, and an under-count-only
+    # check would pass everything above while still admitting it: a second
+    # consumer of this entry point sharing the batch's geometry is exactly
+    # what the mask composer cannot tell apart by itself.
+    class SecondConsumer(nn.Module):
+        """A layer that reaches the shared entry point one extra time."""
+
+        def __init__(self, wrapped):
+            super().__init__()
+            self.wrapped = wrapped
+
+        def __call__(self, x, *args, **kwargs):
+            spare = mx.fast.scaled_dot_product_attention(
+                x[:, None], x[:, None], x[:, None], scale=1.0, mask=None,
+            )
+            return self.wrapped(x, *args, **kwargs) + 0 * spare[:, 0]
+
+    extra = _tiny_qwen2(layers=2)
+    extra.model.layers[0] = SecondConsumer(extra.model.layers[0])
+
+    surplus = _probe_refusal(extra, 32, 128)
+    assert surplus is not None
+    assert "3 calls" in surplus and "2 layers" in surplus
+
+    class TrainingOnlyConsumer(nn.Module):
+        """Switched by the mode hook, not by the flag."""
+
+        modes_seen = []
+
+        def _set_training_mode(self, mode):
+            type(self).modes_seen.append(mode)
+            super()._set_training_mode(mode)
+
+        """Reaches the entry point only while training, as a dropout-guarded
+        or checkpointing attention path would."""
+
+        def __init__(self, wrapped):
+            super().__init__()
+            self.wrapped = wrapped
+
+        def __call__(self, x, *args, **kwargs):
+            out = self.wrapped(x, *args, **kwargs)
+            if self.training:
+                spare = mx.fast.scaled_dot_product_attention(
+                    x[:, None], x[:, None], x[:, None], scale=1.0, mask=None,
+                )
+                out = out + 0 * spare[:, 0]
+            return out
+
+    # The whole probe runs in training mode, so a consumer that only appears
+    # there is seen by the ordinary count. Dropout stays active and the
+    # comparisons replay the same random state rather than switching it off.
+    hidden = _tiny_qwen2(layers=2)
+    hidden.model.layers[0] = TrainingOnlyConsumer(hidden.model.layers[0])
+    # Left in evaluation mode, which is how a loaded model arrives: the
+    # trainer switches it afterwards. Calling train() here first would let the
+    # probe inherit the right answer instead of establishing it.
+    hidden.eval()
+    assert hidden.training is False
+
+    while_training = _probe_refusal(hidden, 32, 128)
+    assert while_training is not None
+    assert "3 calls" in while_training and "2 layers" in while_training
+    assert hidden.training is False
+    # The transition went through the module's own hook in both directions,
+    # which is what the trainer's mode switch does.
+    assert set(TrainingOnlyConsumer.modes_seen) == {True, False}
+
+
+def test_isolation_is_required_to_survive_the_backward():
+    """Forward isolation does not imply backward isolation, so both are asked.
+
+    Exercised directly rather than through the whole probe: with a mask that
+    leaks, the forward checks refuse first and this stage is never reached, so
+    a test going through the front door would pass without running it.
+    """
+    import numpy as np
+
+    from unsloth_zoo.mlx.compile import (
+        SegmentMaskBuffers, _backward_isolation_refusal, _probe_document_cuts,
+        _probe_segments, install_safe_sdpa_mask_patch,
+        make_segment_mask_composer, set_sdpa_mask_composer,
+    )
+
+    model = _tiny_qwen2(layers=2)
+    length, boundary, vocab = 64, 32, 128
+    tokens = (mx.arange(length, dtype=mx.int32) % vocab)[None]
+    disturbed = mx.array(np.array(tokens))
+    disturbed[0, boundary - 8:boundary] = (
+        disturbed[0, boundary - 8:boundary] + 1
+    ) % boundary
+    cuts = _probe_document_cuts(length)
+    segments = _probe_segments(length, cuts)
+    # The last document, observed while an earlier one is disturbed.
+    observed = mx.array(list(range(cuts[-1], length)))
+    normaliser = float(length * vocab)
+
+    install_safe_sdpa_mask_patch()
+    buffers = SegmentMaskBuffers()
+    previous = set_sdpa_mask_composer(make_segment_mask_composer(buffers.read))
+    try:
+        buffers.engage("train", segments)
+        assert _backward_isolation_refusal(
+            model, tokens, disturbed, observed, normaliser,
+        ) is None
+
+        # The same call with nothing masking the documents apart: the first
+        # document now reaches the second, so the second's gradient moves.
+        buffers.engage("train", None)
+        leaked = _backward_isolation_refusal(
+            model, tokens, disturbed, observed, normaliser,
+        )
+    finally:
+        buffers.engage("train", None)
+        set_sdpa_mask_composer(previous)
+
+    assert leaked is not None
+    assert "does not survive the backward" in leaked
+
+
+@pytest.mark.parametrize("length", [64, 256])
+def test_a_single_wrongly_permitted_position_is_caught(length):
+    """Isolation is bitwise, and the perturbation has to be able to see it."""
+    import unsloth_zoo.mlx.compile as compile_module
+    from unsloth_zoo.mlx.compile import _probe_refusal
+
+    # Vocabulary covering the row, so the two documents hold separate
+    # embedding rows and the probe will build a stimulus at all.
+    model = _tiny_qwen2(layers=2, vocab=512)
+    assert _probe_refusal(model, length, 512) is None
+
+    honest = compile_module.make_segment_mask_composer
+
+    def leaking(read):
+        inner = honest(read)
+
+        def compose(q, k, mask):
+            composed = inner(q, k, mask)
+            if composed is None or composed.dtype != mx.bool_:
+                return composed
+            if composed.shape[2] < 4:
+                return composed
+            leaked = mx.array(composed)
+            # One position of the first document, reachable by a late query of
+            # the second, and far from the boundary between them.
+            leaked[:, :, composed.shape[2] - 2, 0] = True
+            return leaked
+
+        return compose
+
+    try:
+        compile_module.make_segment_mask_composer = leaking
+        refusal = _probe_refusal(model, length, 512)
+    finally:
+        compile_module.make_segment_mask_composer = honest
+
+    assert refusal is not None
+    assert "moved another document" in refusal
 
 
 def test_resume_from_checkpoint_matches_fresh_run(tmp_path):

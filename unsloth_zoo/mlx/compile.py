@@ -32,9 +32,11 @@ from pathlib import Path
 from itertools import accumulate
 import ast
 import importlib
+import importlib.metadata
 import inspect
 import mlx.core as mx
 import numpy as np
+from mlx.utils import tree_flatten, tree_map
 import pkgutil
 import re
 import textwrap
@@ -1975,9 +1977,8 @@ class SegmentMaskBuffers:
 def _mask_kind(mask):
     """``"permit"``, ``"bias"``, or ``None`` when the mask is not recognised.
 
-    Asked by name rather than through dtype predicates, so the answer is the
-    same under the real runtime and the torch-backed test double, which do not
-    agree on what a dtype object is.
+    Asked by name rather than by dtype, so the real runtime and the
+    torch-backed test double agree.
     """
     dtype = str(getattr(mask, "dtype", "")).lower()
     if "bool" in dtype:
@@ -2036,6 +2037,608 @@ def make_segment_mask_composer(read_segments):
         return mx.where(isolation, mask, -mx.inf)
 
     return compose
+
+
+PACKING_MASK_MEMORY_FRACTION = 0.125
+AUTOMATIC_MEMORY_LIMIT_SHARE = 0.85
+PACKING_MLX_FLOOR = (0, 32, 0)
+PACKING_MLX_LM_FLOOR = (0, 31, 2)
+
+# Families whose packed attention has been validated, with the domain each was
+# validated in.
+PACKING_VERIFIED_FAMILIES = {
+    # Validated on Qwen2.5-0.5B-Instruct: budgets 64 through 2048 in bfloat16
+    # and 64 through 512 in float32, plus depths 2, 8 and 24 at both
+    # precisions.
+    "qwen2": {
+        "max_packed_length": {"bfloat16": 2048, "float32": 512},
+    },
+}
+
+
+class PackingQualification:
+    """Whether packing may engage, and if not, why not.
+
+    What an admitted verdict is worth, stated here because a caller reading
+    "qualified" should not skip a check of its own: the probe found no
+    cross-document movement in outputs or gradients when whole documents were
+    disturbed at the boundaries **it constructs**. That refuses a model whose
+    coupling spans positions uniformly -- a convolutional or recurrent mixer
+    reaching outside attention does so at every position, so it crosses every
+    boundary and one layout finds it. It is not a proof that no coupling
+    exists at the boundaries a real packed batch will use: one confined
+    between two positions inside a single probe document is invisible.
+
+    The mask's own guarantee is separate and stronger, and must not be
+    confused with this one: the composed mask permits zero cross-document
+    positions, enumerated over every pair rather than sampled.
+    """
+
+    __slots__ = ("admitted", "reason")
+
+    def __init__(self, admitted, reason=""):
+        self.admitted = bool(admitted)
+        self.reason = reason
+
+    def __bool__(self):
+        return self.admitted
+
+    def __repr__(self):
+        if self.admitted:
+            return "PackingQualification(admitted=True)"
+        return f"PackingQualification(admitted=False, reason={self.reason!r})"
+
+
+def _version_tuple(text):
+    """A comparable version, where a prerelease sorts below its release."""
+    parts = []
+    for piece in str(text).split(".")[:3]:
+        digits = ""
+        for char in piece:
+            if not char.isdigit():
+                break
+            digits += char
+        if not digits:
+            break
+        parts.append(int(digits))
+    if not parts:
+        return ()
+    # A post-release or a local build is later than the release, not earlier;
+    # only a prerelease sorts below it.
+    core = str(text).strip().split("+", 1)[0]
+    numbers = ".".join(str(part) for part in parts)
+    released = core == numbers or core.startswith(numbers + ".post")
+    while len(parts) < 3:
+        parts.append(0)
+    return (tuple(parts), released)
+
+
+def _runtime_refusal():
+    for name, floor in (("mlx", PACKING_MLX_FLOOR),
+                        ("mlx_lm", PACKING_MLX_LM_FLOOR)):
+        try:
+            found = _version_tuple(importlib.metadata.version(name.replace("_", "-")))
+        except Exception:
+            return f"the installed {name} does not report a version"
+        if not found or found < (floor, True):
+            expected = ".".join(str(part) for part in floor)
+            return (f"{name} {importlib.metadata.version(name.replace('_', '-'))} "
+                    f"is below {expected}, where packed attention was validated")
+    return None
+
+
+_MULTIMODAL_TOWER_NAMES = (
+    "vision_tower", "vision_model", "vision_encoder", "visual",
+    "multi_modal_projector", "audio_tower",
+)
+
+
+def _structural_refusal(model):
+    """Refusals of scope, decidable without running the model."""
+    from .utils import _get_text_model, _is_vlm_model
+
+    if _is_vlm_model(model):
+        return "packing is text-only, and this is a multimodal model"
+    text_model = _get_text_model(model)
+    if text_model is model and any(
+        hasattr(model, name) for name in _MULTIMODAL_TOWER_NAMES
+    ):
+        # A wrapper carrying a tower but exposing no language model: the text
+        # stack cannot be identified, so no check below can be scoped to it.
+        return ("this multimodal model exposes no language model, so packing "
+                "cannot identify its text stack")
+    return None
+
+
+def _mask_memory_refusal(batch_size, packed_length, memory_limit_bytes):
+    """Refuse a packed mask too large for the run's memory budget."""
+    if memory_limit_bytes is None or memory_limit_bytes <= 0:
+        return None
+    estimate = 2 * int(batch_size) * int(packed_length) ** 2
+    budget = memory_limit_bytes * PACKING_MASK_MEMORY_FRACTION
+    if estimate <= budget:
+        return None
+    return (f"the packed attention mask needs about "
+            f"{estimate / 1e9:.2f} GB at batch {batch_size} x "
+            f"{packed_length} tokens, above the "
+            f"{PACKING_MASK_MEMORY_FRACTION:.3g} share of this run's "
+            f"{memory_limit_bytes / 1e9:.2f} GB budget it is allowed")
+
+
+def resolved_memory_limit_bytes(args=None):
+    """The denominator the mask-memory rule measures against.
+
+    The configured Metal limit when there is one, the device's recommended
+    working set when limits are off, and None when neither is knowable -- in
+    which case the rule is skipped rather than the run refused.
+    """
+    capped = True
+    limit_gb = None
+    if args is not None:
+        if getattr(args, "disable_memory_limits", False):
+            capped = False
+        else:
+            limit_gb = getattr(args, "memory_limit_gb", None)
+            if limit_gb is not None and limit_gb <= 0:
+                # Non-positive disables the cap rather than setting one.
+                limit_gb, capped = None, False
+    if limit_gb is not None:
+        return int(limit_gb * 1e9)
+    try:
+        recommended = mx.device_info().get("max_recommended_working_set_size")
+    except Exception:
+        return None
+    if not recommended:
+        return None
+    # The share the trainer installs when nothing is configured. With limits
+    # switched off it installs none, so the ceiling is the whole device and
+    # measuring against a cap that will not exist would refuse a mask that fits.
+    if not capped:
+        return int(recommended)
+    return int(recommended * AUTOMATIC_MEMORY_LIMIT_SHARE)
+
+
+def _model_config(model):
+    for name in ("args", "config"):
+        found = getattr(model, name, None)
+        if found is not None:
+            return found
+    return None
+
+
+def _dtype_name(dtype, model=None):
+    """The precision's plain name, whatever form it arrives in."""
+    if dtype is None and model is not None:
+        try:
+            parameters = tree_flatten(model.parameters())
+        except Exception:
+            parameters = []
+        for _, value in parameters:
+            # The first floating parameter, not the first parameter: a
+            # quantized model stores integers but still computes in float.
+            if "float" in str(value.dtype):
+                dtype = value.dtype
+                break
+    return str(dtype).rsplit(".", 1)[-1]
+
+
+def _family_refusal(model, packed_length, dtype):
+    """Fail-closed membership: unknown families are refused, not admitted."""
+    family = getattr(_model_config(model), "model_type", None)
+    entry = PACKING_VERIFIED_FAMILIES.get(family)
+    if entry is None:
+        return (f"packed attention has not been validated for model family "
+                f"{family!r}")
+    actual = _dtype_name(None, model)
+    dtype = _dtype_name(dtype, model)
+    if actual != "None" and dtype != actual:
+        return (f"packing was asked about {dtype} but this model computes in "
+                f"{actual}, so the answer would not be about the run")
+    budgets = entry["max_packed_length"]
+    # Keyed by dtype, because the budget a family was validated to is not the
+    # same in every precision and one shared maximum admits the difference.
+    largest = budgets.get(dtype)
+    if largest is None:
+        return (f"{family} was validated at {sorted(budgets)}, not {dtype}")
+    if packed_length > largest:
+        return (f"{family} was validated up to {largest} packed tokens in "
+                f"{dtype}, not {packed_length}")
+    axis = entry.get("config_axis")
+    if axis is not None:
+        found = getattr(_model_config(model), axis, None)
+        if found != entry.get("config_value"):
+            return (f"{family} was validated with {axis}="
+                    f"{entry.get('config_value')!r}, not {found!r}")
+    return None
+
+
+def _probe_document_cuts(packed_length):
+    """Where the probe's row is divided into documents."""
+    if packed_length < 6:
+        return []
+    first = max(1, packed_length // 4)
+    second = max(first + 1, packed_length // 2)
+    return [first, second]
+
+
+def _probe_segments(packed_length, cuts, rows=1):
+    ids = []
+    for index, start in enumerate([0] + list(cuts)):
+        stop = cuts[index] if index < len(cuts) else packed_length
+        ids.extend([index] * (stop - start))
+    return mx.array([ids] * max(1, rows))
+
+
+def _backward_isolation_refusal(model, tokens, disturbed, observed,
+                               normaliser, replay=None):
+    """Whether isolation survives the backward, with the mask already engaged.
+
+    A loss reading only the second document must have the same gradient
+    however the first document's tokens change; exact under a correct mask,
+    so no tolerance beyond representation error. Both calls keep the same
+    shape and engaged mask, so neither retraces.
+    """
+    import mlx.nn as nn
+
+
+    def tail_loss(module, inputs):
+        scores = module(inputs).astype(mx.float32)[:, observed]
+        return (scores * scores).sum() / normaliser
+
+    state = [model.state]
+    gradients = mx.compile(
+        lambda inputs: nn.value_and_grad(model, tail_loss)(model, inputs)[1],
+        inputs=state, outputs=state,
+    )
+    if replay is not None:
+        replay()
+    clean = dict(tree_flatten(gradients(tokens)))
+    mx.eval(clean)
+    for name, value in clean.items():
+        if not bool(mx.all(mx.isfinite(value)).item()):
+            return (f"the compiled packed backward produced non-finite "
+                    f"gradients at {name}")
+
+    if replay is not None:
+        replay()
+    moved = dict(tree_flatten(gradients(disturbed)))
+    mx.eval(moved)
+    # Scaled by the largest gradient anywhere rather than per tensor: a tensor
+    # whose own gradient is near zero, or formed by cancellation, makes a per-
+    # tensor ratio unstable exactly where it is least meaningful.
+    allowed = 0.0
+    for name, value in clean.items():
+        difference = mx.max(mx.abs(
+            value.astype(mx.float32) - moved[name].astype(mx.float32)
+        )).item()
+        if not difference <= allowed:
+            return (f"changing one document moved another document's "
+                    f"gradients by {difference:.3g} at {name}, so "
+                    f"isolation does not survive the backward")
+    return None
+
+
+def _isolated_under_every_disturbance(disturbances, observe):
+    """Run ``observe`` over the whole disturbance set, or not at all."""
+    for candidate in disturbances:
+        refusal = observe(candidate)
+        if refusal is not None:
+            return refusal
+    return None
+
+
+def _probe_stimulus(packed_length, cuts, rows, vocab_size, needs_backward):
+    """The probe's input, built to satisfy what it has to guarantee."""
+    if not cuts:
+        return None, (
+            f"a {packed_length}-token row is too short to divide into "
+            f"documents the probe can tell apart"
+        )
+    if vocab_size < 2:
+        return None, "this model's vocabulary is too small to disturb"
+    if needs_backward and vocab_size < packed_length * rows:
+        return None, (
+            f"this model's vocabulary of {vocab_size} cannot fill {rows} rows "
+            f"of {packed_length} tokens without repeating, so packing cannot "
+            f"build a probe whose documents use separate embedding rows"
+        )
+
+    tokens = (
+        mx.arange(rows * packed_length, dtype=mx.int32) % vocab_size
+    ).reshape(rows, packed_length)
+    baseline = np.array(tokens)
+
+    spans = []
+    for index, start in enumerate([0] + list(cuts)):
+        stop = cuts[index] if index < len(cuts) else packed_length
+        spans.append((start, stop))
+
+    probes = []
+    for start, stop in spans:
+        moved = np.arange(start, stop)
+        observed = np.array(
+            [i for i in range(packed_length) if not start <= i < stop]
+        )
+        block = baseline[:, start:stop]
+        base = block.min(axis=1, keepdims=True)
+        # Inside each row's own block, so rows that started disjoint stay so.
+        span = max(2, min(stop - start, vocab_size))
+        rotated = baseline.copy()
+        rotated[:, start:stop] = base + (block - base + 1) % span
+        filled = baseline.copy()
+        filled[:, start:stop] = base + (span - 1)
+        for candidate in (rotated, filled):
+            if candidate.max() >= vocab_size or candidate.min() < 0:
+                return None, (
+                    "packing could not build a probe within this vocabulary"
+                )
+            if (candidate[:, moved] == baseline[:, moved]).all():
+                return None, (
+                    "packing could not build a probe that changes one of its "
+                    "documents, so it cannot tell the documents apart"
+                )
+            if (candidate[:, observed] != baseline[:, observed]).any():
+                return None, (
+                    "packing built a probe that disturbs more than one document"
+                )
+            probes.append((
+                mx.array(candidate), mx.array(moved), mx.array(observed),
+            ))
+    return tokens, probes
+
+
+def _probe_refusal(model, packed_length, vocab_size, batch_size=1,
+                   phase="train"):
+    """Run the packed mask path and refuse unless it behaves as packing needs.
+
+    Exercises the shipped composer rather than a duplicate. Any exception
+    refuses: a probe that cannot answer is not an answer. One boundary layout
+    is deliberate -- the couplings real architectures carry reach outside
+    attention at every position, so they cross every boundary, while a
+    coupling at a single position pair is an adversary rather than an
+    architecture.
+    """
+    from .utils import _get_text_model
+
+    text_model = _get_text_model(model)
+    layers = getattr(text_model, "layers", None)
+    if layers is None:
+        return "this model exposes no layer list, so attention cannot be counted"
+    # Bound before the try so the cleanup below can run whatever fails, and
+    # everything fallible sits inside it: a probe that raises has not answered,
+    # and an unanswered probe is a refusal rather than an escaping exception.
+    buffers = SegmentMaskBuffers()
+    # Per module: eval() recurses, so a single flag would flatten a model
+    # that deliberately holds some submodules in a different mode.
+    try:
+        was_training = [(m, bool(m.training)) for _, m in model.named_modules()]
+        # The whole state, not only the flags: a training forward can move
+        # buffers a module carries -- running statistics being the usual one --
+        # and a capability query that leaves them moved has trained on the
+        # model it was only asked about.
+        caller_state = tree_map(
+            lambda a: mx.array(a) if isinstance(a, mx.array) else a,
+            model.state,
+        )
+        borrowed_state = None
+    except Exception:
+        return ("this model does not expose its modules, so packing cannot "
+                "run the probe in a known mode or put the model back as it found it")
+    random_state = mx.random.state[0]
+    previous_composer = None
+    installed = False
+    try:
+        cuts = _probe_document_cuts(packed_length)
+        rows = max(1, int(batch_size))
+        segments = _probe_segments(packed_length, cuts, rows)
+        intercepted = [0]
+        compose_masks = make_segment_mask_composer(buffers.read)
+
+        def counting_composer(q, k, mask):
+            intercepted[0] += 1
+            return compose_masks(q, k, mask)
+
+        # Through the same hook the trainer's own mode switch goes through: a
+        # module may override it to do more than set a flag, and assigning the
+        # flag would silently skip that -- including for the mode this probe
+        # then measures the attention call graph in.
+        model.train(phase == "train")
+        # Captured AFTER the mode is set, because a mode hook may install the
+        # very state the comparisons then read; captured before, every forward
+        # would be replayed to the value the model held in the other mode.
+        borrowed_state = tree_map(
+            lambda a: mx.array(a) if isinstance(a, mx.array) else a,
+            model.state,
+        )
+        install_safe_sdpa_mask_patch()
+        previous_composer = set_sdpa_mask_composer(counting_composer)
+        installed = True
+        buffers.engage(phase, segments)
+
+        tokens, probes = _probe_stimulus(
+            packed_length, cuts, rows, vocab_size, phase == "train",
+        )
+        if tokens is None:
+            return probes
+
+        # Every forward below is compared against another, so each starts from
+        # the same random state.
+        entry_state = mx.random.state[0]
+
+        def replay():
+            mx.random.state[0] = entry_state
+            try:
+                model.update(borrowed_state)
+            except Exception:
+                pass
+
+        def forward(inputs):
+            # The whole execution input, not only the random draw: a module
+            # may advance a buffer on every forward, and two runs starting
+            # from different buffers differ for a reason that is not the one
+            # under test.
+            replay()
+            out = model(inputs)
+            mx.eval(out)
+            return out
+
+        packed = forward(tokens)
+        if intercepted[0] != len(layers):
+            return (f"the attention patch saw {intercepted[0]} calls for "
+                    f"{len(layers)} layers, so some attention does not pass "
+                    f"through the mask packing relies on")
+
+        if not bool(mx.all(mx.isfinite(packed)).item()):
+            return "the packed forward produced non-finite values"
+
+        # Determinism is established rather than assumed, because the checks
+        # below read differences between forwards and dropout would make every
+        # one of them meaningless.
+        intercepted[0] = 0
+        repeat = forward(tokens)
+        if intercepted[0] != len(layers):
+            return (f"the attention patch saw {intercepted[0]} calls for "
+                    f"{len(layers)} layers on a second identical forward, so "
+                    f"the attention call graph is not stable")
+        if not bool(mx.all(mx.equal(repeat, packed)).item()):
+            return ("this model does not repeat itself on identical input "
+                    "while training, so packing cannot be told apart from "
+                    "the variation")
+        def forward_isolation(probe):
+            candidate, _, observed = probe
+            after = forward(candidate)
+            drift = mx.max(mx.abs(
+                after[:, observed].astype(mx.float32)
+                - packed[:, observed].astype(mx.float32)
+            )).item()
+            if drift != 0.0:
+                return (f"changing one document moved another document's "
+                        f"outputs by {drift:.3g}, so the two are not isolated")
+            return None
+
+        refusal = _isolated_under_every_disturbance(
+            probes, forward_isolation,
+        )
+        if refusal is not None:
+            return refusal
+
+        if phase != "train":
+            # Evaluation runs no backward, so requiring one of it would refuse
+            # a model for behaviour the phase never reaches.
+            return None
+
+        buffers.engage(phase, segments)
+        # MLX has a documented class of masks that are finite forward and
+        # non-finite backward, and the training step is compiled, so a
+        # forward-only probe would miss exactly that class.
+        return _isolated_under_every_disturbance(
+            probes,
+            lambda probe: _backward_isolation_refusal(
+                model, tokens, probe[0], probe[2],
+                float(packed_length * vocab_size), replay,
+            ),
+        )
+    except Exception as error:
+        return f"the packed attention probe failed: {type(error).__name__}: {error}"
+    finally:
+        buffers.engage(phase, None)
+        if installed:
+            set_sdpa_mask_composer(previous_composer)
+        mx.random.state[0] = random_state
+        # Modes first, then state. A module may override the mode hook to
+        # touch a buffer, so restoring state before the hooks run lets the
+        # hooks move it again.
+        for module, flag in was_training:
+            try:
+                # Per module and through the hook, since a model may hold some
+                # submodules in a mode of their own that one recursive call
+                # would flatten.
+                module._set_training_mode(flag)
+            except Exception as mode_error:
+                print(f"Unsloth: packing qualification could not restore a "
+                      f"module's training mode ({mode_error}); reload before "
+                      f"training.")
+        try:
+            if caller_state is None:
+                raise RuntimeError("no state was captured to restore")
+            appeared = set(dict(tree_flatten(model.state))) - set(
+                dict(tree_flatten(caller_state))
+            )
+            if appeared:
+                print(f"Unsloth: packing qualification left state this model "
+                      f"created while probing ({sorted(appeared)[:3]}); it "
+                      f"cannot be removed, so reload before training.")
+            model.update(caller_state)
+        except Exception as restore_error:
+            # Said out loud rather than swallowed: the caller's model may have
+            # been left as the probe had it, and that is worth knowing even
+            # though raising from here would mask the probe's own verdict.
+            print(f"Unsloth: packing qualification could not restore this "
+                  f"model's state ({restore_error}); reload it before "
+                  f"training.")
+
+
+def qualify_packing(
+    model,
+    *,
+    packed_length,
+    batch_size=1,
+    eval_batch_size=None,
+    dtype=None,
+    args=None,
+    vocab_size=None,
+):
+    """Whether bin-packing may engage for ``model`` at this configuration.
+
+    Fail-closed at every layer: an unrecognised family, an unreadable runtime
+    or a probe that raises all refuse. Ordered cheapest first, so the probe --
+    which runs real forwards, and a compiled backward when training packs -- is reached only by a
+    configuration everything else already admits.
+    """
+    # Only the phases that will actually pack, each at the batch it will use.
+    phases = {}
+    if batch_size:
+        phases["train"] = batch_size
+    if eval_batch_size:
+        phases["eval"] = eval_batch_size
+    if not phases:
+        return PackingQualification(
+            False, "packing was asked about, but no phase would pack",
+        )
+
+    for refusal in (
+        _runtime_refusal(),
+        _structural_refusal(model),
+        _family_refusal(model, packed_length, dtype),
+        # Every phase's own batch: evaluation's mask is a different size and
+        # has to fit the same budget.
+        *(
+            _mask_memory_refusal(
+                rows, packed_length, resolved_memory_limit_bytes(args),
+            )
+            for rows in phases.values()
+        ),
+    ):
+        if refusal is not None:
+            return PackingQualification(False, refusal)
+    # Each phase that will engage, at the batch it will engage with:
+    # evaluation has its own buffer and its own configurable batch, so
+    # qualifying training alone leaves a second geometry unobserved.
+    if vocab_size is None:
+        vocab_size = getattr(_model_config(model), "vocab_size", None)
+    if not vocab_size:
+        return PackingQualification(
+            False, "this model does not report a vocabulary size to probe with",
+        )
+    for phase, rows in phases.items():
+        refusal = _probe_refusal(
+            model, packed_length, int(vocab_size), rows, phase,
+        )
+        if refusal is not None:
+            return PackingQualification(
+                False, f"while qualifying {phase}: {refusal}",
+            )
+    return PackingQualification(True)
 
 
 _SDPA_MASK_COMPOSER = None

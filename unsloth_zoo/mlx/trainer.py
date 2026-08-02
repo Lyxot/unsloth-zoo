@@ -570,6 +570,7 @@ from .utils import (
     _rank_slice_distributed_batch,
 )
 from .compile import (
+    AUTOMATIC_MEMORY_LIMIT_SHARE,
     build_compile_policy,
     explain_compile_support,
     get_compile_qualification,
@@ -3986,7 +3987,7 @@ class MLXTrainer:
         memory_limit_gb = getattr(args, "memory_limit_gb", None)
         memory_disabled = memory_limit_gb is not None and memory_limit_gb <= 0
         if memory_limit_gb is None:
-            memory_limit_gb = recommended_gb * 0.85
+            memory_limit_gb = recommended_gb * AUTOMATIC_MEMORY_LIMIT_SHARE
         elif memory_disabled:
             memory_limit_gb = None
         if memory_limit_gb is not None:
