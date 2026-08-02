@@ -4742,6 +4742,185 @@ class _FiniteTextRow:
     segments: tuple | None = None
 
 
+
+# Packing algorithms vendored from TRL rather than called through it.
+PACKING_WINDOW = 1000
+
+
+class _PackingSegmentTree:
+    """Smallest free bin at least ``val`` wide, over [1, maxval]."""
+
+    def __init__(self, maxval):
+        self.maxval = maxval
+        self.tree_size = 1 << (maxval - 1).bit_length()
+        self.tree = [0] * (2 * self.tree_size)
+
+    def _refresh(self, i):
+        while i > 1:
+            i >>= 1
+            left, right = self.tree[i << 1], self.tree[(i << 1) + 1]
+            self.tree[i] = left if left >= right else right
+
+    def add(self, val):
+        i = self.tree_size + val - 1
+        self.tree[i] = val
+        self._refresh(i)
+
+    def remove(self, val):
+        i = self.tree_size + val - 1
+        self.tree[i] = 0
+        self._refresh(i)
+
+    def search(self, val):
+        i = 1
+        while i < self.tree_size:
+            i = (i << 1) if self.tree[i << 1] >= val else (i << 1) + 1
+        return self.tree[i]
+
+
+def _pack_bfd_window(examples, seq_length):
+    """Best-fit-decreasing binning; emits the ``seq_lengths`` boundary column."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    columns, list_column_idx = [], None
+    for idx, column in enumerate(examples.columns):
+        if pa.types.is_list(column.type) or pa.types.is_large_list(column.type):
+            column = pc.list_slice(column, 0, seq_length)
+            if list_column_idx is None:
+                list_column_idx = idx
+        columns.append(column)
+    examples = pa.Table.from_arrays(columns, names=examples.column_names)
+
+    if len(examples) == 0:
+        # Nothing to bin, but the boundary column is part of what this strategy
+        # emits, so an empty result still carries it -- with the value type a
+        # non-empty window would have produced, which follows the list width:
+        # list gives int32 lengths, large_list int64.
+        length_type = pc.list_value_length(
+            examples.column(list_column_idx).combine_chunks(),
+        ).type
+        return examples.append_column(
+            "seq_lengths", pa.array([], type=pa.list_(length_type)),
+        )
+
+    ids = np.arange(len(examples))
+    lengths = pc.list_value_length(examples[list_column_idx]).combine_chunks()
+    examples = examples.append_column("seq_lengths", lengths)
+    lengths = pc.make_struct(lengths, ids).sort("descending", by=0)
+
+    segment_tree = _PackingSegmentTree(seq_length)
+    segment_tree.add(seq_length)
+    space_to_bin = collections.defaultdict(collections.deque)
+    bins = []
+    for length, idx in zip(lengths.field(0).to_numpy(),
+                           lengths.field(1).to_numpy()):
+        space = segment_tree.search(length)
+        if space < seq_length:
+            bin_ = space_to_bin[space].popleft()
+        else:
+            bin_ = {"ids": [], "length": 0}
+            bins.append(bin_)
+        bin_["ids"].append(idx)
+        bin_["length"] += length
+        if space < seq_length and not space_to_bin[space]:
+            segment_tree.remove(space)
+        space -= length
+        space_to_bin[space].append(bin_)
+        if space > 0:
+            segment_tree.add(space)
+
+    examples = pc.take(examples, [i for b in bins for i in b["ids"]])
+    offsets = np.cumsum(np.array([0] + [b["length"] for b in bins]))
+    lengths = examples["seq_lengths"].chunks[0]
+    examples = examples.drop_columns("seq_lengths")
+    lengths = pa.ListArray.from_arrays(
+        np.cumsum([0] + [len(b["ids"]) for b in bins], dtype=np.int32), lengths,
+    )
+    columns = []
+    for column in examples.columns:
+        column = column.chunks[0]
+        if pa.types.is_list(column.type) or pa.types.is_large_list(column.type):
+            dtype = column.offsets.type.to_pandas_dtype()
+            column = type(column).from_arrays(
+                offsets.astype(dtype), column.values,
+            )
+        columns.append(column)
+    return pa.Table.from_arrays(
+        columns + [lengths], names=examples.column_names + ["seq_lengths"],
+    )
+
+
+def _pack_wrapped_window(examples, seq_length):
+    """Concatenate and re-chunk; no boundaries survive, so no length column."""
+    import pyarrow as pa
+    import pyarrow.compute as pc  # noqa: F401  (parity with the bfd import set)
+
+    columns = []
+    for column in examples.columns:
+        if pa.types.is_list(column.type) or pa.types.is_large_list(column.type):
+            if isinstance(column, pa.ChunkedArray):
+                column = column.combine_chunks()
+            offsets, values = column.offsets, column.values
+            values = values[offsets[0].as_py():offsets[-1].as_py()]
+            dtype = offsets.type.to_pandas_dtype()
+            offsets = np.concatenate((
+                np.arange(0, len(values), seq_length, dtype=dtype),
+                [len(values)],
+            ))
+            column = type(column).from_arrays(offsets, values)
+        columns.append(column)
+    return pa.Table.from_arrays(columns, names=examples.column_names)
+
+
+def pack_rows(examples, seq_length, strategy="bfd", window=PACKING_WINDOW):
+    """Pack a table one window of rows at a time, in arrival order.
+
+    Windowing is owned here rather than inherited from a dataset map: the
+    reference bounds bin membership by its map batch size, and with process
+    sharding by contiguous shards before that, so "which rows may share a bin"
+    is a property of how the caller happened to iterate. Fixing the window
+    makes the same input produce the same packed rows every time.
+    """
+    import pyarrow as pa
+
+    if strategy not in ("bfd", "wrapped"):
+        raise ValueError(
+            f"Unsloth MLX: unknown packing strategy {strategy!r}; "
+            "expected 'bfd' or 'wrapped'."
+        )
+    import pyarrow.compute as pc
+
+    first_list = next(
+        (name for name, column in zip(examples.column_names, examples.columns)
+         if pa.types.is_list(column.type)
+         or pa.types.is_large_list(column.type)),
+        None,
+    )
+
+    def pack(rows):
+        if strategy == "wrapped":
+            return _pack_wrapped_window(rows, seq_length)
+        # Upstream's later behaviour: a zero-length row cannot contribute to a
+        # bin and the segment tree has no slot for it, so drop it rather than
+        # assert inside the search.
+        if first_list is not None:
+            rows = rows.filter(
+                pc.greater(pc.list_value_length(rows[first_list]), 0),
+            )
+        return _pack_bfd_window(rows, seq_length)
+
+    window = max(1, int(window))
+    packed = [
+        pack(examples.slice(start, window))
+        for start in range(0, len(examples), window)
+    ] or [pack(examples)]
+    # Concatenated even for one window, so the schema is whatever the strategy
+    # produces rather than whatever the input happened to carry -- an input
+    # with nothing left to bin still owes the boundary column.
+    return packed[0] if len(packed) == 1 else pa.concat_tables(packed)
+
+
 def _finite_text_pad_width(raw_width, *, pad_to_multiple=0, minimum_width=1,
                            max_seq_length):
     """Shared finite text pad-width policy.

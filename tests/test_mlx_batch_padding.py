@@ -81,3 +81,50 @@ def test_pad_multiple_constant_still_32():
     """mlx-lm uses pad_to=32; we must too."""
     from unsloth_zoo.mlx import trainer
     assert trainer._PAD_MULTIPLE == 32
+
+
+def _packing_table(rows):
+    import pyarrow as pa
+
+    if not isinstance(rows, pa.Array):
+        rows = pa.array(rows, type=pa.list_(pa.int64()))
+    return pa.table({"input_ids": rows, "labels": rows})
+
+
+def _trl_packers():
+    trl = pytest.importorskip("trl", minversion="0.20.0")
+    from trl.data_utils import _pack_bfd, _pack_wrapped
+
+    return _pack_bfd, _pack_wrapped, trl
+
+
+@pytest.mark.parametrize("list_type", ["list", "large_list"])
+def test_vendored_packers_match_the_reference_byte_for_byte(list_type):
+    import random
+
+    import pyarrow as pa
+
+    from unsloth_zoo.mlx.utils import _pack_bfd_window, _pack_wrapped_window
+
+    reference_bfd, reference_wrapped, _ = _trl_packers()
+    random.seed(7)
+    # Varied lengths so binning has real decisions to make, and enough rows
+    # that a difference in any but the first would show. Both list widths,
+    # because wrapped takes a different branch for large_list.
+    build = pa.list_ if list_type == "list" else pa.large_list
+    rows = pa.array(
+        [list(range(i, i + random.randint(1, 9))) for i in range(40)],
+        type=build(pa.int64()),
+    )
+    table = _packing_table(rows)
+
+    for mine, reference in ((_pack_bfd_window, reference_bfd),
+                            (_pack_wrapped_window, reference_wrapped)):
+        assert mine(table, 8).equals(reference(table, 8))
+
+    # The column asymmetry is part of the contract: boundaries survive binning
+    # and are emitted, and do not survive concatenation, so are not.
+    assert "seq_lengths" in _pack_bfd_window(table, 8).column_names
+    assert "seq_lengths" not in _pack_wrapped_window(table, 8).column_names
+
+
