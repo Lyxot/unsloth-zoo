@@ -473,6 +473,33 @@ class _MLXLazyEvalBatchView:
                 close()
 
 
+def _mlx_streaming_epoch_batches(declared, global_batch_size, grad_accum,
+                                 prefix, source):
+    """Micro-batches in one streaming pass, or the refusal explaining why not.
+
+    The divisor is the global batch size on every path. The VLM route cannot
+    reach a world size above one today -- lazy VLM dispatch refuses it -- so
+    this is the arithmetic it already did, and whatever lifts that restriction
+    inherits the right divisor instead of a per-device one that would
+    undercount every rank but the first.
+    """
+    if declared is None:
+        raise ValueError(
+            f"{prefix}: num_train_epochs requires a {source} with an explicit "
+            "reliable __len__. Use max_steps for an unsized source."
+        )
+    if declared == 0:
+        raise ValueError(f"{prefix}: {source} declares zero rows.")
+    per_pass = math.ceil(declared / global_batch_size)
+    if per_pass % grad_accum:
+        raise ValueError(
+            "Unsloth MLX: streaming num_train_epochs requires the total epoch "
+            "micro-batches to be divisible by gradient_accumulation_steps. "
+            "Use max_steps or adjust the accumulation factor."
+        )
+    return per_pass
+
+
 def _mlx_declared_iterable_length(dataset):
     """Return a declared source length without probing a truly unsized source."""
     source = getattr(dataset, "_mlx_source_dataset", dataset)
@@ -7358,28 +7385,13 @@ class MLXTrainer:
                 vlm_expected_rows = None
                 if vlm_lazy and args.max_steps <= 0 and args.num_train_epochs > 0:
                     declared = _mlx_declared_iterable_length(train_dataset)
-                    if declared is None:
-                        raise ValueError(
-                            "Unsloth MLX VLM: num_train_epochs requires a "
-                            "streaming iterable with an explicit reliable "
-                            "__len__. Use max_steps for an unsized source."
-                        )
-                    if declared == 0:
-                        raise ValueError(
-                            "Unsloth MLX VLM: streaming iterable declares zero rows."
-                        )
-                    self._streaming_epoch_batch_count = math.ceil(
-                        declared / args.per_device_train_batch_size
-                    )
-                    if (
-                        self._streaming_epoch_batch_count
-                        % args.gradient_accumulation_steps
-                    ):
-                        raise ValueError(
-                            "Unsloth MLX: streaming num_train_epochs requires "
-                            "the total epoch micro-batches to be divisible by "
-                            "gradient_accumulation_steps. Use max_steps or "
-                            "adjust the accumulation factor."
+                    self._streaming_epoch_batch_count = \
+                        _mlx_streaming_epoch_batches(
+                            declared,
+                            args.per_device_train_batch_size
+                            * self.distributed_world_size,
+                            args.gradient_accumulation_steps,
+                            "Unsloth MLX VLM", "streaming iterable",
                         )
                     vlm_expected_rows = declared
                     vlm_require_replayable = True
@@ -7481,32 +7493,15 @@ class MLXTrainer:
                         _resolve_source_length,
                         "resolving the streaming text source length",
                     )
-                    if source_length < 0:
-                        raise ValueError(
-                            "Unsloth MLX: num_train_epochs requires a streaming "
-                            "text iterable with an explicit reliable __len__. Use "
-                            "max_steps for an unsized source."
-                        )
-                    if source_length == 0:
-                        raise ValueError(
-                            "Unsloth MLX: streaming text iterable declares zero rows."
-                        )
-                    global_batch_size = (
-                        args.per_device_train_batch_size
-                        * self.distributed_world_size
-                    )
-                    self._streaming_epoch_batch_count = math.ceil(
-                        source_length / global_batch_size
-                    )
-                    if (
-                        self._streaming_epoch_batch_count
-                        % args.gradient_accumulation_steps
-                    ):
-                        raise ValueError(
-                            "Unsloth MLX: streaming num_train_epochs requires "
-                            "the total epoch micro-batches to be divisible by "
-                            "gradient_accumulation_steps. Use max_steps or "
-                            "adjust the accumulation factor."
+                    self._streaming_epoch_batch_count = \
+                        _mlx_streaming_epoch_batches(
+                            # -1 is the rank-0 sentinel for "no reliable
+                            # __len__", which the helper reports as unsized.
+                            None if source_length < 0 else source_length,
+                            args.per_device_train_batch_size
+                            * self.distributed_world_size,
+                            args.gradient_accumulation_steps,
+                            "Unsloth MLX", "streaming text iterable",
                         )
                     expected_rows_per_pass = source_length
                     require_replayable = True
