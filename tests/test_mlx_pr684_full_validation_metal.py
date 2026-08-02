@@ -88,7 +88,6 @@ def _assert_finite(hist):
     ), f"non-finite losses: {hist}"
 
 
-@metal_only
 def test_resume_from_checkpoint_matches_fresh_run(tmp_path):
     """Stop+resume reproduces the fresh run's losses step for step."""
     fresh_dir = tmp_path / "fresh"

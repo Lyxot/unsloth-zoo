@@ -1893,6 +1893,151 @@ def _try_import_module(module_name: str):
         return None
 
 
+
+from .utils import TEXT_SEGMENT_PAD_ID
+
+
+def segment_isolation_mask(segments, offset=0):
+    """``causal AND same-segment`` for packed rows, as a boolean mask.
+
+    ``segments`` is ``[B, T]`` of per-token document ids, with
+    ``TEXT_SEGMENT_PAD_ID`` where a row is padding. Returns ``[B, 1, T_q, T_kv]``
+    so it broadcasts over heads, matching what the attention entry point
+    expects. Boolean rather than an additive float mask: a fully masked row is
+    forward- and backward-safe as a boolean, where the additive form produces
+    a non-finite backward.
+
+    ``offset`` is the position of the first query in the key sequence, which is
+    zero while training a full row and non-zero only when a cache is in play.
+    """
+    segments = mx.array(segments)
+    if segments.ndim != 2:
+        raise ValueError("segment ids must be [batch, sequence]")
+    keys = segments[:, None, None, :]
+    queries = segments[:, None, :, None]
+    if offset:
+        queries = queries[:, :, offset:, :]
+    same_segment = mx.logical_and(
+        mx.equal(queries, keys),
+        # Padding shares an id with other padding; it is nobody's document.
+        mx.not_equal(queries, TEXT_SEGMENT_PAD_ID),
+    )
+    total = segments.shape[1]
+    query_positions = mx.arange(offset, total)[None, None, :, None]
+    key_positions = mx.arange(total)[None, None, None, :]
+    return mx.logical_and(
+        same_segment, mx.less_equal(key_positions, query_positions),
+    )
+
+
+
+
+class SegmentMaskBuffers:
+    """Per-phase holders carrying packed segment ids into a compiled step.
+
+    The ids change every batch, so they cannot be captured by the composer
+    closure: a compiled step would freeze the first batch's. They travel
+    instead as buffers registered in the step's state, which is how the
+    compiled graph is told a value is expected to change.
+
+    Train and eval keep separate buffers. Sharing one would leave an
+    eval-shaped array sitting in the training step's captured state, and a
+    captured input changing shape is what forces a recompile.
+    """
+
+    __slots__ = ("_buffers", "_phase")
+
+    def __init__(self):
+        self._buffers = {"train": [None], "eval": [None]}
+        self._phase = None
+
+    def buffer(self, phase):
+        """The list a compiled step should carry in its state for ``phase``."""
+        if phase not in self._buffers:
+            raise ValueError(
+                f"Unsloth MLX: unknown packing phase {phase!r}; "
+                "expected 'train' or 'eval'."
+            )
+        return self._buffers[phase]
+
+    def engage(self, phase, segments):
+        """Point the composer at ``segments`` for ``phase``, or disengage."""
+        self.buffer(phase)[0] = segments
+        self._phase = phase if segments is not None else None
+
+    def read(self):
+        """The engaged phase's ids, or None when nothing is engaged."""
+        if self._phase is None:
+            return None
+        return self._buffers[self._phase][0]
+
+
+def _mask_kind(mask):
+    """``"permit"``, ``"bias"``, or ``None`` when the mask is not recognised.
+
+    Asked by name rather than through dtype predicates, so the answer is the
+    same under the real runtime and the torch-backed test double, which do not
+    agree on what a dtype object is.
+    """
+    dtype = str(getattr(mask, "dtype", "")).lower()
+    if "bool" in dtype:
+        return "permit"
+    if "float" in dtype:
+        return "bias"
+    return None
+
+
+def make_segment_mask_composer(read_segments):
+    """A composer restricting attention to each token's own document.
+
+    ``read_segments`` returns the engaged batch's ``[B, T]`` segment ids, or
+    None when nothing is engaged. It is called per attention call rather than
+    captured, because a compiled step would otherwise hold the first batch's
+    ids forever.
+
+    The patched attention entry point is process-wide and also serves vision
+    towers, so this declines every call whose geometry is not the engaged text
+    batch's -- same batch size, same key length, and queries either the whole
+    row or a suffix of it. Declining leaves the call byte-identical.
+    """
+
+    def compose(q, k, mask):
+        segments = read_segments()
+        if segments is None:
+            return None
+        batch, sequence = segments.shape
+        if q.ndim != 4 or k.ndim != 4:
+            return None
+        if q.shape[0] != batch or k.shape[0] != batch or k.shape[2] != sequence:
+            return None
+        queries = q.shape[2]
+        if queries > sequence:
+            return None
+        isolation = segment_isolation_mask(segments, offset=sequence - queries)
+        if mask is None or mask == "causal":
+            # mlx-lm text models pass the literal "causal" and build the
+            # triangle inside attention; the composed mask already contains it.
+            return isolation
+        if isinstance(mask, str):
+            # "causal" is the only string the kernel takes, so composing any
+            # other would turn its rejection into a silent success.
+            return None
+        kind = _mask_kind(mask)
+        if kind == "permit":
+            return mx.logical_and(mask, isolation)
+        if kind is None:
+            # The kernel also takes integer biases, but composing one needs
+            # -inf, which no integer dtype holds, and the dtype it would move
+            # to has to promote to the kernel's joint q/k/v result -- and v is
+            # not passed here.
+            return None
+        # An additive bias cannot be ANDed: the disallowed positions go to
+        # -inf and the rest keep whatever bias they carried.
+        return mx.where(isolation, mask, -mx.inf)
+
+    return compose
+
+
 _SDPA_MASK_COMPOSER = None
 
 
