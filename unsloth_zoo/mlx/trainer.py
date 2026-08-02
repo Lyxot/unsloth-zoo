@@ -1080,7 +1080,9 @@ class MLXTrainingConfig:
     dataset_text_field: str = "text"
     max_seq_length: int = 2048
     packing: bool = False
-    dataset_num_proc: int = 2
+    # Unset, as the reference default is: no MLX code resolves this, so a
+    # concrete number claimed a worker count nothing honors.
+    dataset_num_proc: int | None = None
     chat_template: object = None  # Unsloth template name/tuple or raw Jinja string
 
     # MLX-specific
