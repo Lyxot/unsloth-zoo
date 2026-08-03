@@ -492,21 +492,6 @@ def _mlx_effective_packing(args):
     }
 
 
-def _mlx_streaming_packing_refusal(args, streaming_phases):
-    """Refuse a phase that would pack through the streaming producer."""
-    packing = _mlx_effective_packing(args)
-    blocked = sorted(
-        phase for phase, streaming in streaming_phases.items()
-        if streaming and packing.get(phase)
-    )
-    if not blocked:
-        return None
-    names = " and ".join(blocked)
-    return (f"Unsloth: packing is not yet supported for streaming data, and "
-            f"{names} would be served by the streaming producer. Pass a "
-            f"sized (non-lazy) dataset for {names}, or disable packing for "
-            f"it.")
-
 
 def _mlx_any_split_is_lazy(dataset):
     """Whether ``dataset`` reaches the streaming producer."""
@@ -592,6 +577,7 @@ def _mlx_declared_iterable_length(dataset):
 
 
 from .utils import (
+    _minimum_prepared_row_length,
     TEXT_SEGMENT_PAD_ID,
     _labeled_row_has_supervision,
     make_cce_loss_fn,
@@ -1987,6 +1973,78 @@ class MLXTrainer:
                 f"needs no attention isolation, or disable packing."
             )
 
+    def _mlx_tokenized_view(self, source, tokenizer=None):
+        """Build a lazy tokenized view already wired to this run's live config.
+
+        Views are built at construction and iterated at train() time, so one
+        built without the reader answers preparation questions with the
+        configuration the run started with. Constructed only here so a call
+        site cannot forget to attach it.
+        """
+        args = self.args
+        view = _MLXIterableTokenizedDatasetView(
+            source,
+            self.tokenizer if tokenizer is None else tokenizer,
+            dataset_text_field=args.dataset_text_field,
+            formatting_func=self.formatting_func,
+            append_eos=bool(getattr(args, "append_eos", True)),
+            completion_only_loss=_text_completion_only_loss_arg(args),
+            assistant_only_loss=_text_assistant_only_loss_arg(args),
+            max_seq_length=args.max_seq_length,
+        )
+        view.set_live_preparation_reader(
+            lambda: (
+                self._mlx_live_packing_strategy("train"),
+                getattr(self.args, "max_seq_length", None),
+                _text_completion_only_loss_arg(self.args),
+                _text_assistant_only_loss_arg(self.args),
+                bool(getattr(self.args, "append_eos", True)),
+                getattr(self.args, "dataset_text_field", None),
+                self.formatting_func,
+            ),
+        )
+        return view
+
+    def _mlx_live_packing_strategy(self, phase="train"):
+        """The strategy this phase prepares rows with, or None if it packs none.
+
+        Row preparation, the packer and the resume digest all ask here, so a
+        run that enables or disables packing between construction and
+        ``train()`` cannot have one of them acting on the other's answer.
+        """
+        if not self._mlx_packing_phases().get(phase):
+            return None
+        return getattr(self.args, "packing_strategy", "bfd")
+
+    def _prepare_data_or_disengage(self, *args, **kwargs):
+        """Prepare data, releasing this run's engagement if preparation fails.
+
+        Packing preparation can still refuse after the gates have passed --
+        a packed batch may reduce to fewer rows than the schedule needs, for
+        one. Ordering cannot cover that: every future fallible step would
+        have to be remembered and placed before engagement. Releasing on the
+        way out does not depend on remembering.
+        """
+        try:
+            return self._prepare_data(*args, **kwargs)
+        except BaseException:
+            self._mlx_disengage_segments()
+            raise
+
+    def _mlx_disengage_segments(self):
+        """Undo this run's process-wide engagement, if it engaged.
+
+        Ordering alone cannot express "after all fallible preparation":
+        every new fallible step would have to be remembered and placed
+        before the engagement call. Releasing on the way out does not
+        depend on remembering.
+        """
+        release = getattr(self, "_mlx_release_segment_reader", None)
+        if release is not None:
+            release()
+            self._mlx_release_segment_reader = None
+            self._mlx_segment_reader_registered = False
+
     def _mlx_segment_buffers_for_run(self):
         """The buffers this run's compiled steps register, created once.
 
@@ -2011,7 +2069,9 @@ class MLXTrainer:
             )
 
             install_safe_sdpa_mask_patch()
-            register_segment_mask_reader(existing.read)
+            self._mlx_release_segment_reader = (
+                register_segment_mask_reader(existing.read)
+            )
             self._mlx_segment_reader_registered = True
         if existing is None:
             from .compile import (
@@ -2029,7 +2089,9 @@ class MLXTrainer:
                 # Registered rather than installed: the composer is one
                 # process-wide slot, so replacing it would take isolation
                 # away from any trainer that installed before this one.
-                register_segment_mask_reader(existing.read)
+                self._mlx_release_segment_reader = (
+                    register_segment_mask_reader(existing.read)
+                )
         return existing
 
     def _mlx_engaged_segments(self, phase, batch):
@@ -2117,17 +2179,46 @@ class MLXTrainer:
         # Which phase the streaming producer will actually serve, which is not
         # the same question as which dataset is lazy.
         streaming = bool(getattr(self.args, "streaming", False))
-        streaming_phases = {
-            "train": streaming and self.train_dataset is not None,
-            "eval": bool(
-                streaming
-                and getattr(self, "eval_dataset", None) is not None
-                and _mlx_any_split_is_lazy(self.eval_dataset)
-            ),
-        }
-        refusal = _mlx_streaming_packing_refusal(self.args, streaming_phases)
-        if refusal is not None:
-            raise ValueError(refusal)
+        # A stream driven by epoch counts rather than max_steps reaches the
+        # producer's declared-length path, which owes exactly one prepared row
+        # per source row.
+        if (
+            streaming
+            and self._mlx_packing_phases().get("train")
+            and getattr(self, "_batches", None) is None
+            and int(getattr(self.args, "max_steps", 0) or 0) <= 0
+        ):
+            raise ValueError(
+                "Unsloth: packing a streaming run needs max_steps. This run "
+                "is driven by num_train_epochs, which asks the stream for one "
+                "prepared row per source row, and packing combines several "
+                "source rows into one. Set max_steps, or disable packing."
+            )
+        # The streaming producer serves map-style datasets through a branch
+        # with no row-window seam, so a packer handed to it is ignored and
+        # the run trains unpacked while reporting packing. Refused rather
+        # than threaded, because that branch has nowhere to put it.
+        if (
+            streaming
+            and self._mlx_packing_phases().get("train")
+            # Prebuilt batches take precedence over every dataset path, so a
+            # run that already holds packed batches never reaches the branch
+            # this refusal is about and must not be refused for it.
+            and getattr(self, "_batches", None) is None
+            and self._train_dataset_for_batches() is not None
+            # The dataset the producer will consume, not the public attribute:
+            # construction may wrap one and leave the other raw, and a refusal
+            # that classifies the wrapper admits a run the raw dataset then
+            # trains unpacked.
+            and not _mlx_any_split_is_lazy(self._train_dataset_for_batches())
+        ):
+            raise ValueError(
+                "Unsloth: packing a streaming run needs a lazy training "
+                "dataset. A map-style dataset with streaming=True is served "
+                "by a producer that cannot pack, so the run would train "
+                "unpacked. Pass a lazy dataset, disable streaming so the "
+                "sized builders pack it, or disable packing."
+            )
 
     def _mlx_check_packing_labels(self):
         """Refuse a phase whose rows cannot carry labels.
@@ -2157,11 +2248,19 @@ class MLXTrainer:
 
     def _mlx_dataset_can_carry_labels(self, dataset):
         """Whether ``dataset``'s rows will reach the builders that carry labels."""
-        if getattr(self.args, "completion_only_loss", False):
+        # Resolved through the producer's own accessors, not read raw. The
+        # flag is tri-state and carries aliases, so `None` here means "decide
+        # from the row's prompt/completion boundary" rather than "off", and
+        # reading it raw refuses ordinary datasets the producer labels fine.
+        completion_only = _text_completion_only_loss_arg(self.args)
+        if completion_only:
             return True
-        if getattr(self.args, "assistant_only_loss", False):
+        if _text_assistant_only_loss_arg(self.args):
             return True
-        if getattr(self, "_mlx_response_only_marker", None) is not None:
+        # The mask function response-only labelling actually stores. The
+        # name checked before this was never assigned, so a valid
+        # response-only source was refused for want of a marker nothing set.
+        if getattr(self, "_mlx_response_mask_fn", None) is not None:
             return True
         # A mapping of splits carries its rows one level down; iterating it
         # yields split names, which say nothing about labels.
@@ -2178,8 +2277,22 @@ class MLXTrainer:
             first = next(iter(dataset))
         except Exception:
             return False
-        return isinstance(first, dict) and (
-            "labels" in first or "completion" in first
+        # Through the formatter first, because the producer normalizes that
+        # way: inspecting the raw row asks about keys the run never sees, so a
+        # formatter that builds a prompt/completion pair from arbitrary source
+        # fields was refused for lacking keys it exists to create.
+        if getattr(self, "formatting_func", None) is not None:
+            return True
+        # Refuses only what it can see is unlabelable.
+        if not isinstance(first, dict):
+            return True
+        if "labels" in first or "assistant_masks" in first:
+            return True
+        # `completion` counts only when the flag is unset.
+        return (
+            completion_only is None
+            and "prompt" in first
+            and "completion" in first
         )
 
     def __init__(
@@ -2219,8 +2332,7 @@ class MLXTrainer:
             self.args.packing = packing
 
         if any(self._mlx_packing_phases().values()):
-            self._mlx_check_packing_configuration()
-            self._mlx_segment_buffers_for_run()
+            # Neither admission nor engagement happens here.
             engaged = " and ".join(
                 phase for phase, packs in self._mlx_packing_phases().items()
                 if packs
@@ -2247,16 +2359,7 @@ class MLXTrainer:
                 is_vlm=False,
                 strict=False,
             )
-            self.train_dataset = _MLXIterableTokenizedDatasetView(
-                self.train_dataset,
-                self.tokenizer,
-                dataset_text_field=self.args.dataset_text_field,
-                formatting_func=self.formatting_func,
-                append_eos=bool(getattr(self.args, "append_eos", True)),
-                completion_only_loss=_text_completion_only_loss_arg(self.args),
-                assistant_only_loss=_text_assistant_only_loss_arg(self.args),
-                max_seq_length=self.args.max_seq_length,
-            )
+            self.train_dataset = self._mlx_tokenized_view(self.train_dataset)
             self._mlx_train_dataset_for_batches = self.train_dataset
         elif (
             not self._is_vlm
@@ -3425,6 +3528,10 @@ class MLXTrainer:
             self.args, self.state, self.control,
         )
 
+    # Distinguishes "this checkpoint recorded no packing" from "it recorded
+    # that nothing packed", which are different claims.
+    _UNRECORDED = object()
+
     def _data_shaping_digest(self, batches, planned_visits=None):
         """Record how a resume would rebuild its batches."""
         digest = {
@@ -3433,6 +3540,16 @@ class MLXTrainer:
             "route": (
                 "streaming" if batches is None else type(batches).__name__
             ),
+            # The recordable preparation settings, since two streams differing
+            # only in `append_eos` emit different tokens.
+            "packing": [
+                getattr(self.args, "packing_strategy", "bfd"),
+                int(getattr(self.args, "max_seq_length", 0) or 0),
+                bool(getattr(self.args, "append_eos", True)),
+                getattr(self.args, "dataset_text_field", None),
+                _text_completion_only_loss_arg(self.args),
+                bool(_text_assistant_only_loss_arg(self.args)),
+            ] if self._mlx_packing_phases().get("train") else None,
             "grad_accum": int(
                 getattr(self.args, "gradient_accumulation_steps", 1) or 1
             ),
@@ -3519,7 +3636,112 @@ class MLXTrainer:
 
 
 
-    def _check_resume_stream(self, load_trainer_state, batches=None):
+    def _packing_resume_refusal(self, saved_shaping, batches, compared=True):
+        """Why packing forbids this resume, or None.
+
+        Every case in one place, because the answer depends on all four
+        inputs together: whether this run packs, whether it streams, whether
+        the checkpoint packed, and which route it packed on.
+
+        A run where neither side packs needs no row of its own: every rule
+        below is conditioned on packing, so it falls through to None.
+
+        A stream records no batches, so nothing can establish that a packed
+        one rebuilds the same rows -- neither for itself nor for anything
+        resuming it. A sized plan does record them, and the digest compared
+        further down does that comparison, so two sized packed runs need no
+        refusal here.
+        """
+        current_packs = bool(self._mlx_packing_phases().get("train"))
+        current_streams = batches is None
+        saved_packs = saved_shaping.get("packing") is not None
+        saved_streams = saved_shaping.get("route") == "streaming"
+
+        if current_packs and current_streams:
+            return (
+                "Unsloth: a packed streaming run cannot prove on resume that "
+                "it rebuilds the same rows, because a stream records no "
+                "batches to compare and the settings that produced them are "
+                "not evidence of them. Resume from a sized dataset, which "
+                "records its batches, or start a fresh run."
+            )
+        if saved_packs and saved_streams:
+            return (
+                "Unsloth: this checkpoint was written by a run that packed a "
+                "streaming dataset, which recorded no batches, so no resume "
+                "can establish that it rebuilds the same rows. Start a fresh "
+                "run, or resume a checkpoint written from a sized dataset."
+            )
+        if current_streams != saved_streams and (current_packs or saved_packs):
+            return (
+                "Unsloth: packing is in use and this checkpoint was written "
+                f"from a {'streaming' if saved_streams else 'sized'} dataset "
+                f"while this run uses a "
+                f"{'streaming' if current_streams else 'sized'} one, so the "
+                "two group documents differently and no record spans both. "
+                "Resume with the original dataset, or start a fresh run."
+            )
+        current_record = self._data_shaping_digest(batches).get("packing")
+        # Absence means different things by route and by whether a record
+        # exists.
+        saved_record = (
+            saved_shaping.get(
+                "packing",
+                None if saved_streams else self._UNRECORDED,
+            )
+            if saved_shaping else None
+        )
+        if not compared and saved_record is self._UNRECORDED:
+            return (
+                "Unsloth: this checkpoint predates the packing record, so "
+                "whether it packed its training rows is unknown, and nothing "
+                "here can compare the batches to settle it -- the digest is "
+                "absent, older, or unreachable across ranks. Resume on a "
+                "single process, or start a fresh run."
+            )
+        if not compared and list(
+            [] if saved_record is self._UNRECORDED else saved_record or []
+        ) != list(current_record or []):
+            # Same route, but nothing downstream will compare the batches --
+            # under multiple ranks the plan digest is never reached.
+            return (
+                "Unsloth: this checkpoint recorded packing as "
+                f"{saved_shaping.get('packing')!r} and this run resolves it "
+                f"to {current_record!r}, and nothing here can compare the "
+                "batches to settle whether the rows match -- the digest is "
+                "absent, older, or unreachable across ranks. Restore the "
+                "original settings, resume on a single process, or start a "
+                "fresh run."
+            )
+        # Same route, and neither side is a packed stream: the plan digest
+        # below compares the batches themselves.
+        return None
+
+    def _resume_consumes_nothing(self, load_trainer_state, total_steps):
+        """Whether this resume rebuilds no rows at all.
+
+        Only when prefetch owns the cursor. Without it, reaching the resume
+        position pulls `_resume_step` micro-batches through the producer
+        before the loop condition is tested, so even a run that trains
+        nothing rebuilds the stream. With it, that fast-forward is skipped and
+        a generator that never starts consumes nothing -- so a checkpoint
+        already at the step budget touches no unverifiable rows and has
+        nothing for identity to be wrong about.
+
+        Reads the eligibility preparation already resolved rather than
+        deciding it again: a second copy of that rule would be free to
+        disagree with the one the run actually uses.
+        """
+        if total_steps is None:
+            return False
+        control = getattr(self, "_mlx_prefetch_control", None)
+        if not (control and control.get("eligible")):
+            return False
+        saved = load_trainer_state() or {}
+        return int(saved.get("global_step", 0) or 0) >= int(total_steps)
+
+    def _check_resume_stream(self, load_trainer_state, batches=None,
+                             total_steps=None):
         """Refuse a resume whose batches differ from the checkpoint's.
 
         The batches, and not the position a resume restarts from. Where a run
@@ -3538,6 +3760,22 @@ class MLXTrainer:
         waiting in. That is its own change; running half of it here would put
         the deadlock in rather than the guard.
         """
+        # Nothing below applies to a resume that rebuilds no rows: identity is
+        # what cannot be shown, and a run that reads none has none to show.
+        if self._resume_consumes_nothing(load_trainer_state, total_steps):
+            return
+        # One decision for packing identity rather than separate guards: the
+        # answer depends on all four inputs at once, so guards owning one
+        # condition each leave configurations falling between them.
+        saved_state = load_trainer_state() or {}
+        refusal = self._packing_resume_refusal(
+            saved_state.get("data_shaping") or {}, batches,
+            compared=self._resume_digest_settles_rows(
+                saved_state.get("data_shaping"), batches,
+            ),
+        )
+        if refusal is not None:
+            raise ValueError(refusal)
         if int(getattr(self, "_distributed_world_size", 1) or 1) > 1:
             print(
                 "Unsloth: resuming across multiple ranks, so the batch stream "
@@ -3545,10 +3783,30 @@ class MLXTrainer:
             )
             return
         mismatch = self._resume_stream_mismatch(
-            (load_trainer_state() or {}).get("data_shaping"), batches,
+            saved_state.get("data_shaping"), batches,
         )
         if mismatch is not None:
             raise ValueError(mismatch)
+
+    def _resume_digest_settles_rows(self, saved, batches):
+        """Whether the comparison below will actually decide this resume.
+
+        Not whether one is nominally reached: every way it declines -- more
+        than one rank, no digest at all, a digest from an older build --
+        leaves the rows uncompared, and a verdict that assumed otherwise
+        would defer to evidence that never arrives. Asking the question this
+        way keeps one answer for it rather than a topology check standing in.
+        """
+        if int(getattr(self, "_distributed_world_size", 1) or 1) > 1:
+            return False
+        if not saved:
+            return False
+        if int(saved.get("version", 0) or 0) != _DATA_SHAPING_VERSION:
+            return False
+        # And the comparison only compares a finite plan's batches: a stream
+        # reaches it and it declines. Asking about the digest's version alone
+        # answers "is this current", not "will this settle the rows".
+        return isinstance(batches, FiniteTextBatchPlan)
 
     def _resume_stream_mismatch(self, saved, batches):
         """Describe how the rebuilt stream differs, or None when it matches."""
@@ -3574,6 +3832,8 @@ class MLXTrainer:
 
         current = getattr(self, "_data_shaping_state", None) \
             or self._data_shaping_digest(batches)
+        # What an absent field means depends on what the route could do when it
+        # was written.
         if saved.get("route") != current.get("route"):
             return (
                 "Unsloth MLX: resume would rebuild the batch stream through a "
@@ -4685,6 +4945,22 @@ class MLXTrainer:
         return None
 
     def train(self, resume_from_checkpoint: str | None = None):
+        """Run training, owning this run's process-wide mask engagement.
+
+        Engagement is held for the run rather than released at a chosen
+        point. Three earlier attempts placed the release after a particular
+        step, and each was falsified by a later fallible step that had to be
+        remembered and placed before it -- a lazy stream refusing on its
+        first pull, distributed setup, step resolution. Ownership needs no
+        such list: whatever raises, the run gives back what it installed.
+        """
+        try:
+            return self._train_engaged(resume_from_checkpoint)
+        except BaseException:
+            self._mlx_disengage_segments()
+            raise
+
+    def _train_engaged(self, resume_from_checkpoint: str | None = None):
         """Run MLX-native training loop following mlx-lm's compiled-step pattern
         with gradient accumulation. Returns a dict of training metrics."""
         # Clear a PRIOR run's stale stop at the EARLIEST point, before any setup,
@@ -4699,10 +4975,12 @@ class MLXTrainer:
         # model to decide.
         if any(self._mlx_packing_phases().values()):
             self._mlx_check_packing_configuration()
-            self._mlx_segment_buffers_for_run()
         self._mlx_refuse_stale_prepared_packing()
         self._mlx_check_packing_labels()
         self._mlx_qualify_packing_or_refuse(self.model)
+        # After every gate that can reject.
+        if any(self._mlx_packing_phases().values()):
+            self._mlx_segment_buffers_for_run()
         # Then release the previous run's iterator/prefetch producer. Ordered
         # after the stop clear because that clear is a local assignment that
         # cannot fail, while this can block or propagate an interrupt; running it
@@ -4726,7 +5004,7 @@ class MLXTrainer:
             try:
                 if self._batches is None:
                     self._prepared_batches_include_epochs = False
-                batches, batch_iter = self._prepare_data(False)
+                batches, batch_iter = self._prepare_data_or_disengage(False)
                 total_steps = _resolve_training_steps(
                     args,
                     batches,
@@ -4877,7 +5155,7 @@ class MLXTrainer:
                     # Deferred checker: preparation stays collective-free, so the
                     # status reduction below is the FIRST collective on every rank
                     # and the checker's all-reduce runs strictly after it.
-                    batches, batch_iter = self._prepare_data(
+                    batches, batch_iter = self._prepare_data_or_disengage(
                         True, defer_vlm_checker=True,
                     )
                     total_steps = _resolve_training_steps(
@@ -5267,7 +5545,7 @@ class MLXTrainer:
             # Keep prebuilt completion/assistant batches and epoch metadata.
             if self._batches is None:
                 self._prepared_batches_include_epochs = False
-            batches, batch_iter = self._prepare_data(is_vlm)
+            batches, batch_iter = self._prepare_data_or_disengage(is_vlm)
             _stream_epochs = getattr(self, "_streaming_epoch_batch_count", None)
             if (
                 batches is None
@@ -5417,6 +5695,7 @@ class MLXTrainer:
                     else load_trainer_state(_resume_from)
                 ),
                 batches,
+                total_steps,
             )
             try:
                 # 1. Load trained adapter weights into the model. The model
@@ -7961,9 +8240,21 @@ class MLXTrainer:
                     int(getattr(self, "_mlx_resume_step_for_prefetch", 0))
                     * args.gradient_accumulation_steps
                 )
-                return None, iterate_training_batches(
+                # One owner: the view's setter, refreshed here so a tokenizer
+                # replaced after construction does not pack stale ids.
+                if isinstance(
+                    train_dataset, _MLXIterableTokenizedDatasetView,
+                ):
+                    train_dataset.set_tokenizer(getattr(
+                        self, "_mlx_response_mask_tokenizer", None,
+                    ) or self.tokenizer)
+                stream_kwargs = dict(
                     dataset=train_dataset,
                     tokenizer=self.tokenizer,
+                    row_window_transform=self._mlx_packing_row_transform(
+                        phase="train",
+                    ),
+                    packing_strategy=self._mlx_live_packing_strategy("train"),
                     batch_size=args.per_device_train_batch_size,
                     max_seq_length=args.max_seq_length,
                     seed=args.seed,
@@ -7989,6 +8280,7 @@ class MLXTrainer:
                     prefetch_skip_batches=resume_skip if prefetch_depth else 0,
                     prefetch_control=self._mlx_prefetch_control,
                 )
+                return None, iterate_training_batches(**stream_kwargs)
             else:
                 batch_kwargs = dict(
                     dataset=train_dataset,
@@ -8272,7 +8564,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         # binning, so it does not need this either once packing is on.
         if packing_strategy is None and len(encoded) > max_seq_length:
             encoded = encoded[:max_seq_length]
-        if len(encoded) < (1 if packing_strategy == "wrapped" else 2):
+        if len(encoded) < _minimum_prepared_row_length(packing_strategy):
             return None
         result = mask_fn({"input_ids": [encoded]})
         labels = result["labels"]
@@ -8782,15 +9074,8 @@ def train_on_responses_only(
             trainer._mlx_response_mask_tokenizer = _tokenizer
         if args.streaming and _is_mlx_lazy_text_source(train_dataset):
             if not isinstance(train_dataset, _MLXIterableTokenizedDatasetView):
-                train_dataset = _MLXIterableTokenizedDatasetView(
-                    train_dataset,
-                    _tokenizer,
-                    dataset_text_field=args.dataset_text_field,
-                    formatting_func=trainer.formatting_func,
-                    append_eos=bool(getattr(args, "append_eos", True)),
-                    completion_only_loss=_text_completion_only_loss_arg(args),
-                    assistant_only_loss=_text_assistant_only_loss_arg(args),
-                    max_seq_length=args.max_seq_length,
+                train_dataset = trainer._mlx_tokenized_view(
+                    train_dataset, _tokenizer,
                 )
                 trainer.train_dataset = train_dataset
                 trainer._mlx_train_dataset_for_batches = train_dataset

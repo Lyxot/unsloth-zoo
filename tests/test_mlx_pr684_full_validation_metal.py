@@ -340,7 +340,7 @@ def test_engagement_retraces_the_compiled_step():
             mx.eval(step(ones, ones, ones))
         assert composed == [False]
 
-        # Same shapes, so the graph would be reused if the buffer were not an input.n input.n input.
+        # Same shapes, so the graph would be reused if the buffer were not an input.n input.n input.n input.n input.
         buffers.engage("train", mx.array([[0, 0, 1, 1]]))
         with buffers.within("train"):
             mx.eval(step(ones, ones, ones))

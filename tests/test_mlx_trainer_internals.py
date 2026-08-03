@@ -4785,7 +4785,7 @@ def test_train_bumps_run_generation_in_finally():
 
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
-    src = inspect.getsource(MLXTrainer.train)
+    src = inspect.getsource(MLXTrainer._train_engaged)
     bump = "self._run_generation = getattr(self, \"_run_generation\", 0) + 1"
     assert bump in src
     assert src.rindex("finally:") < src.index(bump)
@@ -8301,7 +8301,201 @@ def test_the_trainer_refuses_a_packing_configuration_it_cannot_honour():
 
     # A marker set after construction is honoured, which is the whole point.
     late = Run([{"text": "hi"}])
-    late._mlx_response_only_marker = object()
+    late._mlx_response_mask_fn = lambda *args, **kwargs: None
     late._mlx_check_packing_labels()
+
+
+def test_packing_a_source_without_labels_says_so():
+    """A lazy source cannot be inspected before it is read."""
+    from unsloth_zoo.mlx.utils import packed_row_transform
+
+    with pytest.raises(ValueError, match="rows that carry labels"):
+        packed_row_transform(8)([([1, 2], None)])
+
+    # Labelled rows are unaffected.
+    assert packed_row_transform(8)([([1, 2], [1, 2])])
+
+
+def test_a_packed_run_hands_its_packer_to_the_producer():
+    """Configuration alone proves nothing: the transform must reach the rows."""
+    import numpy as np
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    rows = _CountingTextRows(tuple(
+        {"input_ids": [1, 2, 3], "labels": [1, 2, 3]} for _ in range(4)
+    ))
+    trainer = MLXTrainer(
+        _MinimalTextModel(), _StreamingTextTokenizer(), rows,
+        args=MLXTrainingConfig(
+            streaming=True, max_steps=1, per_device_train_batch_size=1,
+            completion_only_loss=False, dataset_order="sequential",
+            max_seq_length=8, packing=True, packing_strategy="bfd",
+        ),
+    )
+    _, batches = trainer._prepare_data(False)
+    batch = next(iter(batches))
+
+    # The segment channel is the packer's output; an unpacked producer emits
+    # three fields and several documents never share a row.
+    assert len(batch) == 4, len(batch)
+    ids, segments = np.array(batch[0]), np.array(batch[3])
+    assert segments.shape == ids.shape
+    assert len(set(segments.reshape(-1).tolist())) > 1, segments
+
+def test_packing_decides_a_resume_from_all_four_inputs_together():
+    """Every combination, because the answer needs all four at once."""
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class Run(MLXTrainer):
+        def __init__(self, packs):
+            self.train_dataset = [{"input_ids": [1, 2], "labels": [1, 2]}]
+            self.eval_dataset = None
+            self.args = MLXTrainingConfig()
+            self.args.max_seq_length = 64
+            self.args.packing = packs
+
+    # The production plan type: the digest reads its name, the comparison its type.
+    SIZED = _make_shape_guard_text_plan([2])
+
+    def saved(packs, route):
+        """A checkpoint record, taken from a run rather than transcribed."""
+        batches = None if route == "streaming" else SIZED
+        record = Run(packs)._data_shaping_digest(batches)
+        assert record["route"] == route
+        assert (record.get("packing") is not None) is packs
+        return record
+
+    STREAM, PLAN = "streaming", "FiniteTextBatchPlan"
+
+    import pytest
+
+    class Boundary(Run):
+        def __init__(self, packs, ranks):
+            super().__init__(packs)
+            self._distributed_world_size = ranks
+
+    # current packs, current streams, saved packs, saved route -> refused?
+    NONE, PROVE, SAVED, ROUTE = (
+        None, "cannot prove on resume", "no resume can establish",
+        "group documents differently",
+    )
+    for current_packs, streams, saved_packs, route, expected, why in (
+        (False, True,  False, STREAM, NONE,  "neither packs"),
+        (False, False, False, PLAN,   NONE,  "neither packs, sized"),
+        (True,  True,  True,  STREAM, PROVE, "a packed stream cannot prove its rows"),
+        (True,  True,  False, STREAM, PROVE, "same, whatever the checkpoint holds"),
+        (True,  False, True,  STREAM, SAVED, "a packed stream cannot be resumed at all"),
+        (False, True,  True,  STREAM, SAVED, "nor by an unpacked run"),
+        (False, True,  True,  PLAN,   ROUTE, "packed plan, streaming run: no record spans both"),
+        # A packed stream is judged by its own row first.
+        (True,  True,  False, PLAN,   PROVE, "packed stream, unpacked plan"),
+        (True,  False, True,  PLAN,   NONE,  "both packed and sized: the plan digest compares"),
+        # Settings are not evidence on a sized route; the digest compares the batches.
+        (True,  False, False, PLAN,   NONE,  "packed run, checkpoint predating the field"),
+        (False, False, True,  PLAN,   NONE,  "unpacked run, packed plan, identical batches"),
+        # The remaining cells: enumerating only the motivated ones left the rest free.
+        (True,  False, False, STREAM, ROUTE, "packed sized run, streaming checkpoint"),
+        (True,  True,  True,  PLAN,   PROVE, "packed stream judged first, sized record"),
+        (False, True,  False, PLAN,   NONE,  "neither packs, routes differ"),
+        (False, False, True,  STREAM, SAVED, "packed stream cannot be resumed, sized run"),
+        (False, False, False, STREAM, NONE,  "neither packs, sized run, stream record"),
+    ):
+        refusal = Run(current_packs)._packing_resume_refusal(
+            saved(saved_packs, route), None if streams else SIZED,
+        )
+        if expected is NONE:
+            assert refusal is None, f"{why}: expected none, got {refusal!r}"
+        else:
+            assert refusal is not None and expected in refusal, (
+                f"{why}: expected {expected!r}, got {refusal!r}"
+            )
+
+    # Where nothing will compare the batches, settings are the only evidence.
+    for current_packs, saved_packs in ((True, False), (False, True)):
+        args = (saved(saved_packs, PLAN), SIZED)
+        assert Run(current_packs)._packing_resume_refusal(*args) is None
+        unverified = Run(current_packs)._packing_resume_refusal(
+            *args, compared=False,
+        )
+        assert unverified is not None and "compare the batches" in unverified
+
+    # Agreeing runs are not refused even without a comparison.
+    for packs in (True, False):
+        assert Run(packs)._packing_resume_refusal(
+            saved(packs, PLAN), SIZED, compared=False,
+        ) is None
+
+    # Through the boundary, not the helper: the caller can reach around it.
+    checkpoint = {"data_shaping": saved(True, PLAN)}
+
+    def packing_refusal(ranks):
+        """What the packing verdict says at the boundary, if anything."""
+        try:
+            Boundary(False, ranks)._check_resume_stream(
+                lambda: checkpoint, SIZED,
+            )
+        except ValueError as refused:
+            message = str(refused)
+            return message if "compare the batches" in message else None
+        return None
+
+    assert packing_refusal(1) is None
+    assert packing_refusal(4) is not None
+
+    # Where nothing settles the rows, the whole record is compared.
+    packed = Run(True)
+    own = packed._data_shaping_digest(SIZED)
+    assert packed._packing_resume_refusal(
+        own, SIZED, compared=False,
+    ) is None
+    other_strategy = dict(own, packing=["wrapped"] + list(own["packing"])[1:])
+    assert packed._packing_resume_refusal(
+        other_strategy, SIZED, compared=False,
+    ) is not None
+
+    # "A comparison exists" is not "one rank": an absent digest settles nothing.
+    single = Boundary(True, 1)
+    current = single._data_shaping_digest(SIZED)
+    assert single._resume_digest_settles_rows(None, SIZED) is False
+    assert single._resume_digest_settles_rows({"version": 0}, SIZED) is False
+    assert single._resume_digest_settles_rows(current, SIZED) is True
+    assert Boundary(True, 4)._resume_digest_settles_rows(current, SIZED) is False
+    # A stream reaches the comparison and it declines.
+    assert single._resume_digest_settles_rows(current, None) is False
+
+    # Absent is a third state, and the fixture must be able to express it.
+    packed_record = saved(True, PLAN)
+    silent_record = {k: v for k, v in packed_record.items() if k != "packing"}
+    assert "packing" not in silent_record
+
+    unknown = Run(False)._packing_resume_refusal(
+        silent_record, SIZED, compared=False,
+    )
+    assert unknown is not None and "predates the packing record" in unknown
+    assert Run(False)._packing_resume_refusal(
+        silent_record, SIZED, compared=True,
+    ) is None
+    assert Run(False)._packing_resume_refusal({}, SIZED, compared=False) is None
+
+    # Absence is route-dependent, at the combination production builds.
+    silent_stream = {
+        k: v for k, v in saved(False, STREAM).items() if k != "packing"
+    }
+    assert "packing" not in silent_stream
+    assert Run(False)._packing_resume_refusal(
+        silent_stream, None, compared=False,
+    ) is None
+    silent_sized = {
+        k: v for k, v in saved(False, PLAN).items() if k != "packing"
+    }
+    assert Run(False)._packing_resume_refusal(
+        silent_sized, SIZED, compared=False,
+    ) is not None
+
+    # A checkpoint predating the field means unpacked, not unknown.
+    silent = {"route": STREAM}
+    assert Run(True)._packing_resume_refusal(silent, None) is not None
+    assert Run(False)._packing_resume_refusal(silent, None) is None
 
 

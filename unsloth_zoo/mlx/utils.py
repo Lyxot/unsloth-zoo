@@ -4433,7 +4433,7 @@ def _prepare_pretokenized_text_dataset(
                 # becomes a trainable target once it follows another
                 # document; dropping it here would delete real supervision.
                 if len(tokenized[0]) >= (
-                    1 if packing_strategy == "wrapped" else 2
+                    _minimum_prepared_row_length(packing_strategy)
                 ):
                     formatted.append(tokenized)
             else:
@@ -4502,6 +4502,16 @@ def _mlx_lazy_text_source(dataset):
     return getattr(dataset, "_mlx_source_dataset", dataset)
 
 
+_UNSUPPLIED = object()
+
+_LivePreparation = collections.namedtuple(
+    "_LivePreparation",
+    ("packing_strategy", "max_seq_length",
+     "completion_only_loss", "assistant_only_loss",
+     "append_eos", "dataset_text_field", "formatting_func"),
+)
+
+
 class _MLXIterableTokenizedDatasetView:
     """Iterable-only public view over MLX's lazy text normalization pipeline.
 
@@ -4556,22 +4566,94 @@ class _MLXIterableTokenizedDatasetView:
     def set_tokenizer(self, tokenizer):
         self._tokenizer = tokenizer
 
+    def set_live_preparation_reader(self, read_preparation):
+        """Point the view at the run's live row-preparation configuration.
+
+        One reader for both inputs rather than one each: the strategy and the
+        budget decide together whether a row is truncated and whether its
+        supervision survives, so a view holding a live answer for one and a
+        construction-time answer for the other prepares rows no configuration
+        ever asked for.
+        """
+        self._live_preparation_reader = read_preparation
+
+    def live_preparation(self):
+        """The run's current row-preparation configuration.
+
+        Every input that decides what a prepared row contains, not a subset:
+        the strategy and budget decide whether a row is truncated, and the
+        two loss flags decide whether it carries labels at all. A view
+        holding a live answer for some and a construction-time answer for the
+        rest prepares rows no configuration ever asked for.
+        """
+        reader = getattr(self, "_live_preparation_reader", None)
+        if reader is None:
+            return _LivePreparation(
+                None, self._max_seq_length,
+                self._completion_only_loss, self._assistant_only_loss,
+                self._append_eos, self._dataset_text_field,
+                self._formatting_func,
+            )
+        live = reader()
+
+        def supplied(index, fallback):
+            """Absent from the reader keeps the construction-time value.
+
+            Absent, not null: a reader that reports `None` is reporting a
+            value, and for a field where `None` means something -- no text
+            column, no assistant masking -- treating it as "unsaid" restores
+            a stale answer and prepares rows from a column the run no longer
+            reads. Only a reader too short to carry the field falls back.
+            """
+            return fallback if len(live) <= index else live[index]
+
+        return _LivePreparation(
+            live[0],
+            # The budget is the exception, and for a reason that does not
+            # generalise: no run trains at a null budget, so a null here is
+            # an unset argument rather than a choice.
+            self._max_seq_length if (
+                len(live) <= 1 or live[1] is None
+            ) else live[1],
+            supplied(2, self._completion_only_loss),
+            supplied(3, self._assistant_only_loss),
+            supplied(4, self._append_eos),
+            supplied(5, self._dataset_text_field),
+            supplied(6, self._formatting_func),
+        )
+
     def _iter_tokenized_rows(
         self, dataset=None, *, state=None, include_source=False,
+        packing_strategy=_UNSUPPLIED, max_seq_length=None,
     ):
         source = self._mlx_source_dataset if dataset is None else dataset
+        # Defaulted to the live configuration, not to None and not to the
+        # budget this view was built with: a caller that omits either would
+        # otherwise prepare rows as if packing were off, or against a budget
+        # the run has since changed.
+        live = self.live_preparation()
+        live_budget = live.max_seq_length
+        if packing_strategy is _UNSUPPLIED:
+            packing_strategy = live.packing_strategy
         return _iter_lazy_tokenized_text_rows(
             source,
             self._tokenizer,
-            dataset_text_field=self._dataset_text_field,
-            formatting_func=self._formatting_func,
-            append_eos=self._append_eos,
-            completion_only_loss=self._completion_only_loss,
-            assistant_only_loss=self._assistant_only_loss,
-            max_seq_length=self._max_seq_length,
+            dataset_text_field=live.dataset_text_field,
+            formatting_func=live.formatting_func,
+            append_eos=live.append_eos,
+            completion_only_loss=live.completion_only_loss,
+            assistant_only_loss=live.assistant_only_loss,
+            # The caller's budget when it has one, otherwise the live budget:
+            # the gate, packer, stager and resume digest all read the live
+            # argument, and half a stale predicate input is how two different
+            # streams record the same digest.
+            max_seq_length=(
+                live_budget if max_seq_length is None else max_seq_length
+            ),
             response_mask_fn=self._response_mask_fn,
             state=state,
             include_source=include_source,
+            packing_strategy=packing_strategy,
         )
 
     def __iter__(self):
@@ -4593,6 +4675,11 @@ class _MLXIterableTokenizedDatasetView:
                     ):
                         row[field] = list(mask)[:len(input_ids)]
             yield row
+
+
+def _minimum_prepared_row_length(packing_strategy):
+    """Shortest row worth preparing, by strategy."""
+    return 1 if packing_strategy == "wrapped" else 2
 
 
 def _preparation_row_limit(max_seq_length, packing_strategy=None):
@@ -4624,11 +4711,8 @@ def _labeled_row_has_supervision(labels, max_seq_length, packing_strategy=None):
     if labels is None:
         return True
     if packing_strategy == "wrapped":
-        # Every label, not labels[1:]. The first is skipped elsewhere because
-        # nothing precedes it -- but wrapped concatenates, so this row may
-        # follow another document and its first label then has a predecessor
-        # and is a real target. Dropping the row here deletes that.
-        return any(int(x) != -100 for x in labels)
+        # Wrapped admits every row.
+        return True
     return any(int(x) != -100 for x in labels[1:max_seq_length])
 
 
@@ -4700,6 +4784,19 @@ def _stage_tokenized_text_batch(
     instead passes the stream-level flag recorded at row normalization, where
     MLX origin is still visible.
     """
+    # A packer emits (ids, labels, segments); everything else emits pairs.
+    # Separated here so the rest of this function sees one shape, and a
+    # caller-supplied channel still wins when it has one.
+    if any(item is not None and len(item) > 2 for item in batch_items):
+        if segments is None:
+            segments = [
+                None if item is None or len(item) < 3 else item[2]
+                for item in batch_items
+            ]
+        batch_items = [
+            None if item is None else (item[0], item[1])
+            for item in batch_items
+        ]
     valid_items = [item for item in batch_items if item is not None]
     lengths = [
         0 if item is None else min(len(item[0]), max_seq_length)
@@ -5355,6 +5452,14 @@ def packed_row_transform(seq_length, strategy="bfd", segment_pad_id=None):
         rows = [row for row in window if len(row[0]) > 0]
         if not rows:
             return []
+        if any(row[1] is None for row in rows):
+            raise ValueError(
+                "Unsloth: packing needs rows that carry labels, and this "
+                "source produced rows without them. A lazy source cannot be "
+                "inspected before it is read, so this is reported here "
+                "rather than at setup. Pass a dataset with a 'labels' "
+                "column, use train_on_responses_only, or disable packing."
+            )
         table = pa.table({
             "input_ids": pa.array([list(row[0]) for row in rows]),
             "labels": pa.array([list(row[1]) for row in rows]),
@@ -9020,7 +9125,7 @@ def _create_ordered_text_plan(
                                             packing_strategy)
             labels = _truncate_for_preparation(labels, max_seq_length,
                                                packing_strategy)
-            if len(ids) >= (1 if packing_strategy == "wrapped" else 2):
+            if len(ids) >= (_minimum_prepared_row_length(packing_strategy)):
                 tokenized.append((ids, labels))
         labeled = True
     elif assistant_only_loss:
@@ -9048,7 +9153,7 @@ def _create_ordered_text_plan(
                                             packing_strategy)
             labels = _truncate_for_preparation(labels, max_seq_length,
                                                packing_strategy)
-            if len(ids) >= (1 if packing_strategy == "wrapped" else 2):
+            if len(ids) >= (_minimum_prepared_row_length(packing_strategy)):
                 tokenized.append((ids, labels))
         labeled = bool(tokenized)
         if completion_only_loss is True and not labeled:
@@ -9297,6 +9402,7 @@ def _iter_lazy_tokenized_text_rows(
     response_mask_fn=None,
     state=None,
     include_source=False,
+    packing_strategy=None,
 ):
     """Normalize an unsized source one row at a time and lock its schema."""
     state = {} if state is None else state
@@ -9468,7 +9574,10 @@ def _iter_lazy_tokenized_text_rows(
             if tokenized is not None:
                 ids, labels = tokenized
                 source_labels = labels
-                if max_seq_length is not None:
+                # Packing owns truncation: wrapped carries a long document
+                # into later chunks, so cutting here destroys them, and
+                # bin-packing truncates to its own budget after binning.
+                if max_seq_length is not None and packing_strategy is None:
                     ids = ids[:max_seq_length]
                     labels = (
                         labels[:max_seq_length] if labels is not None else None
@@ -9478,15 +9587,19 @@ def _iter_lazy_tokenized_text_rows(
                         if source_labels is not None else None
                     )
                 source_usable = (
-                    len(ids) >= 2
-                    and _labeled_row_has_supervision(source_labels, len(ids))
+                    len(ids) >= (_minimum_prepared_row_length(packing_strategy))
+                    and _labeled_row_has_supervision(
+                        source_labels, len(ids), packing_strategy,
+                    )
                 )
                 if response_mask_fn is not None:
                     ids, labels = _apply_mlx_response_mask_to_text_row(
                         ids, labels, response_mask_fn, state=state,
                     )
-                usable = len(ids) >= 2 and _labeled_row_has_supervision(
-                    labels, len(ids)
+                usable = len(ids) >= (
+                    _minimum_prepared_row_length(packing_strategy)
+                ) and _labeled_row_has_supervision(
+                    labels, max_seq_length, packing_strategy,
                 )
                 if (
                     formatter_applied
@@ -9533,15 +9646,17 @@ def _iter_lazy_tokenized_text_rows(
                     labeled = _tokenize_mlx_assistant_messages_row(tokenizer, row, state=state)
             if labeled is not None:
                 ids, labels = labeled
-                if max_seq_length is not None:
+                if max_seq_length is not None and packing_strategy is None:
                     ids = ids[:max_seq_length]
                     labels = labels[:max_seq_length]
                 if response_mask_fn is not None:
                     ids, labels = _apply_mlx_response_mask_to_text_row(
                         ids, labels, response_mask_fn, state=state,
                     )
-                usable = len(ids) >= 2 and _labeled_row_has_supervision(
-                    labels, len(ids)
+                usable = len(ids) >= (
+                    _minimum_prepared_row_length(packing_strategy)
+                ) and _labeled_row_has_supervision(
+                    labels, max_seq_length, packing_strategy,
                 )
                 _validate_state(
                     "raw",
@@ -9602,16 +9717,20 @@ def _iter_lazy_tokenized_text_rows(
                 ids = list(encode_mlx_text(tokenizer, text, state=state))
                 if eos_id is not None and (not ids or ids[-1] != eos_id):
                     ids.append(int(eos_id))
-                if max_seq_length is not None:
+                if max_seq_length is not None and packing_strategy is None:
                     ids = ids[:max_seq_length]
-                source_usable = len(ids) >= 2
+                source_usable = len(ids) >= (
+                    _minimum_prepared_row_length(packing_strategy)
+                )
                 labels = None
                 if response_mask_fn is not None:
                     ids, labels = _apply_mlx_response_mask_to_text_row(
                         ids, None, response_mask_fn, state=state,
                     )
-                usable = len(ids) >= 2 and _labeled_row_has_supervision(
-                    labels, len(ids)
+                usable = len(ids) >= (
+                    _minimum_prepared_row_length(packing_strategy)
+                ) and _labeled_row_has_supervision(
+                    labels, max_seq_length, packing_strategy,
                 )
                 if (
                     source_usable
@@ -9977,6 +10096,7 @@ def _iterate_lazy_text_training_batches(
     yield_host_staged=False,
     reject_mlx_valued=False,
     should_stop=None,
+    packing_strategy=_UNSUPPLIED,
 ):
     """Yield text batches without materializing an unsized source.
 
@@ -10135,8 +10255,14 @@ def _iterate_lazy_text_training_batches(
 
             def _tokenized_rows(source):
                 if prepared_view is not None:
+                    # Forwarded only when the caller actually supplied one:
+                    # passing the default through would override the view's
+                    # live reader with an explicit "not packing", which is
+                    # the wrong answer exactly when the run does pack.
                     return prepared_view._iter_tokenized_rows(
                         source, state=state,
+                        packing_strategy=packing_strategy,
+                        max_seq_length=max_seq_length,
                     )
                 return _iter_lazy_tokenized_text_rows(
                     source,
@@ -10149,6 +10275,10 @@ def _iterate_lazy_text_training_batches(
                     max_seq_length=max_seq_length,
                     response_mask_fn=response_mask_fn,
                     state=state,
+                    packing_strategy=(
+                        None if packing_strategy is _UNSUPPLIED
+                        else packing_strategy
+                    ),
                 )
 
             def _exactly_one_prepared_row_per_source():
@@ -10199,12 +10329,16 @@ def _iterate_lazy_text_training_batches(
                 else _tokenized_rows(pass_source)
             )
             # Placed on the row stream rather than on an emit path so every
-            # batch route inherits it: the length-window flush, the direct
-            # emit used when the window is one batch, and both pass-tail
-            # routes all draw from here.
-            rows_pending = iter(_apply_row_window_transform(
-                row_iterator, row_window_transform, row_window_size,
-            ))
+            # batch route inherits it: the length-window flush, the direct emit
+            # used when the window is one batch, and both pass-tail routes all
+            # draw from here.
+            rows_pending = iter(
+                row for row in _apply_row_window_transform(
+                    row_iterator, row_window_transform, row_window_size,
+                )
+                if len(row) < 2 or row[1] is None
+                or _labeled_row_has_supervision(row[1], len(row[1]))
+            )
             while True:
                 if should_stop is not None and should_stop():
                     return
@@ -10748,7 +10882,8 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
                              prefetch_skip_batches=0,
                              prefetch_control=None,
                              row_window_transform=None,
-                             row_window_size=DEFAULT_ROW_WINDOW_SIZE):
+                             row_window_size=DEFAULT_ROW_WINDOW_SIZE,
+                             packing_strategy=_UNSUPPLIED):
     """Streaming batch generator for MLX training.
 
     Map-style datasets retain the existing mlx-lm batching behavior. Unsized
@@ -10758,7 +10893,9 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
     a window > 1 emits length-grouped, seeded-permuted batches; ``sequential``
     and window 1 preserve exact source order. Yields ``(batch, lengths, labels)``
     like create_batches, with ``labels`` None unless text prompt/completion
-    masking is active.
+    masking is active. Packing that needs a segment mask adds a fourth
+    element, the per-token segment ids that keep attention inside one
+    document; strategies needing no mask yield the usual three.
     """
     from mlx_lm.tuner.trainer import iterate_batches
 
@@ -10786,6 +10923,7 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
             window_seed=seed,
             row_window_transform=row_window_transform,
             row_window_size=row_window_size,
+            packing_strategy=packing_strategy,
         )
         prefetch_depth = _validate_streaming_prefetch(prefetch_batches)
         if prefetch_depth and _distributed_rank_size(comm_group)[1] == 1:
