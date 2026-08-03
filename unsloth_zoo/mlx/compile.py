@@ -2705,6 +2705,42 @@ def qualify_packing(
     return PackingQualification(True)
 
 
+_SEGMENT_MASK_READERS = []
+
+
+def register_segment_mask_reader(read_segments):
+    """Add a reader to the installed composer, and return a remover.
+
+    The composer is one process-wide slot but there can be several trainers,
+    so replacing it would silently take isolation away from whichever
+    installed first. Readers are registered instead: each call asks them in
+    turn and the first that recognises the geometry answers. A trainer that
+    is not engaged reads nothing, so at most one answers in practice.
+    """
+    _SEGMENT_MASK_READERS.append(read_segments)
+    composed = [make_segment_mask_composer(reader)
+                for reader in _SEGMENT_MASK_READERS]
+
+    def compose_any(q, k, mask):
+        for compose in composed:
+            result = compose(q, k, mask)
+            if result is not None:
+                return result
+        return None
+
+    set_sdpa_mask_composer(compose_any)
+
+    def remove():
+        if read_segments in _SEGMENT_MASK_READERS:
+            _SEGMENT_MASK_READERS.remove(read_segments)
+        if not _SEGMENT_MASK_READERS:
+            set_sdpa_mask_composer(None)
+        else:
+            register_segment_mask_reader(_SEGMENT_MASK_READERS.pop())
+
+    return remove
+
+
 _SDPA_MASK_COMPOSER = None
 
 

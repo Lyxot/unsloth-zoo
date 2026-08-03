@@ -4405,6 +4405,7 @@ def _prepare_pretokenized_text_dataset(
     *,
     completion_only_loss=None,
     assistant_only_loss=False,
+    packing_strategy=None,
 ):
     """Materialize pretokenized text rows and report whether input_ids appeared."""
     completion_only_loss = _resolve_mlx_pretokenized_completion_only_loss(
@@ -4428,7 +4429,12 @@ def _prepare_pretokenized_text_dataset(
             if tokenized is not None:
                 saw_pretokenized = True
                 label_states.append(tokenized[1] is not None)
-                if len(tokenized[0]) >= 2:
+                # Wrapped concatenates, so a single-token row's label
+                # becomes a trainable target once it follows another
+                # document; dropping it here would delete real supervision.
+                if len(tokenized[0]) >= (
+                    1 if packing_strategy == "wrapped" else 2
+                ):
                     formatted.append(tokenized)
             else:
                 saw_other = True
@@ -4589,11 +4595,40 @@ class _MLXIterableTokenizedDatasetView:
             yield row
 
 
-def _labeled_row_has_supervision(labels, max_seq_length):
-    # Keep rows with a supervised token in labels[1:max_seq_length] (causal shift,
-    # length-capped); an all-masked batch aborts training. labels=None always kept.
+def _preparation_row_limit(max_seq_length, packing_strategy=None):
+    """How far preparation may truncate a row before the packer sees it."""
+    if packing_strategy is None:
+        return max_seq_length
+    return None
+
+
+def _truncate_for_preparation(sequence, max_seq_length, packing_strategy=None):
+    """Apply the preparation limit, if preparation still owns one."""
+    if sequence is None:
+        return None
+    limit = _preparation_row_limit(max_seq_length, packing_strategy)
+    return list(sequence) if limit is None else list(sequence)[:limit]
+
+
+def _labeled_row_has_supervision(labels, max_seq_length, packing_strategy=None):
+    """Whether a row can contribute supervision within the budget.
+
+    The length cap is what makes this strategy-dependent. Unpacked and under
+    bin-packing a row is truncated to the budget, so supervision beyond it can
+    never be reached and the row only consumes bin capacity. Wrapped truncates
+    nothing -- it chunks a long row across several packed rows -- so
+    supervision past the budget arrives in a later chunk, and applying the cap
+    would discard real supervision. That is the filtering row of the strategy
+    matrix; wrapped filters nothing, matching the reference.
+    """
     if labels is None:
         return True
+    if packing_strategy == "wrapped":
+        # Every label, not labels[1:]. The first is skipped elsewhere because
+        # nothing precedes it -- but wrapped concatenates, so this row may
+        # follow another document and its first label then has a predecessor
+        # and is a real target. Dropping the row here deletes that.
+        return any(int(x) != -100 for x in labels)
     return any(int(x) != -100 for x in labels[1:max_seq_length])
 
 
@@ -5242,15 +5277,21 @@ def _finite_text_rows(tokenized, *, with_offsets=False):
     for item in tokenized:
         if with_offsets:
             input_ids, offset = item
-            labels = None
+            labels = segments = None
         else:
-            input_ids, labels = item
+            # A packed row carries a third entry, the per-token segment ids;
+            # the row struct has held that channel since it was introduced,
+            # and this is where a packer's output enters it.
+            input_ids, labels, segments = (
+                item if len(item) > 2 else (item[0], item[1], None)
+            )
             offset = 0
         rows.append(
             _FiniteTextRow(
                 tuple(int(token) for token in input_ids),
                 int(offset),
                 None if labels is None else tuple(int(token) for token in labels),
+                None if segments is None else tuple(int(s) for s in segments),
             )
         )
     return tuple(rows)
@@ -5289,26 +5330,113 @@ def _shuffled_full_batch_schedule(
             return tuple(schedule), len(groups)
 
 
+def packed_row_transform(seq_length, strategy="bfd", segment_pad_id=None):
+    """A row-window transform that packs ``(ids, labels)`` rows.
+
+    Adapts the vendored packer to the seam's contract: rows arrive in a
+    window, in arrival order, and the transform may return a different number
+    of rows than it was given. Packing is exactly that -- several rows in, one
+    row out.
+
+    ``bfd`` carries a segment channel so attention can be restricted to each
+    document; ``wrapped`` splits documents across rows and cannot say where
+    they end, so it emits none and each packed row is one opaque segment.
+    """
+    if strategy not in ("bfd", "wrapped"):
+        raise ValueError(
+            f"Unsloth MLX: unknown packing strategy {strategy!r}; "
+            "expected 'bfd' or 'wrapped'."
+        )
+    pad_id = TEXT_SEGMENT_PAD_ID if segment_pad_id is None else segment_pad_id
+
+    def transform(window):
+        import pyarrow as pa
+
+        rows = [row for row in window if len(row[0]) > 0]
+        if not rows:
+            return []
+        table = pa.table({
+            "input_ids": pa.array([list(row[0]) for row in rows]),
+            "labels": pa.array([list(row[1]) for row in rows]),
+        })
+        packed = pack_rows(table, seq_length, strategy=strategy)
+        ids = packed.column("input_ids").to_pylist()
+        labels = packed.column("labels").to_pylist()
+        if strategy == "wrapped":
+            return [(row_ids, row_labels)
+                    for row_ids, row_labels in zip(ids, labels)]
+        # seq_lengths is the packer's own boundary record, and the only place
+        # the document structure survives; a segment id per token is what the
+        # mask engine consumes.
+        lengths = packed.column("seq_lengths").to_pylist()
+        packed_rows = []
+        for row_ids, row_labels, spans in zip(ids, labels, lengths):
+            segments, starts = [], []
+            for document, length in enumerate(spans):
+                starts.append(len(segments))
+                segments.extend([document] * length)
+            segments.extend([pad_id] * (len(row_ids) - len(segments)))
+            row_labels = list(row_labels)
+            # Isolating attention is not enough on its own.
+            for start in starts:
+                if start < len(row_labels):
+                    row_labels[start] = -100
+            packed_rows.append((row_ids, row_labels, segments))
+        return packed_rows
+
+    return transform
+
+
 def _prepare_sized_text_rows(rows, row_window_transform, row_window_size):
     """Apply a row-window transform to a materialized sized row list."""
     if row_window_transform is None:
         return rows
-    return list(_apply_row_window_transform(
+    packed = list(_apply_row_window_transform(
         rows, row_window_transform, _validate_row_window_size(row_window_size),
     ))
+    # Packing can produce a row with nothing to learn from -- wrapped emits a
+    # tail chunk whose labels are all masked, and a row whose only label sits
+    # at position zero has no predecessor to predict it from once the loss
+    # shifts.
+    return [
+        row for row in packed
+        if len(row) < 2 or row[1] is None
+        or _labeled_row_has_supervision(row[1], len(row[1]))
+    ]
+
+
+def _refuse_unschedulable_packed_rows(before, after, batch_size,
+                                      transformed):
+    """Refuse a packed row count this builder's scheduler cannot use."""
+    if not transformed or after >= batch_size:
+        return
+    raise ValueError(
+        f"Unsloth: packing reduced {before} rows to {after}, fewer than "
+        f"batch_size={batch_size}, so no full batch can be formed. Lower "
+        f"per_device_train_batch_size, lower max_seq_length so fewer "
+        f"documents share a row, or disable packing."
+    )
 
 
 def _create_tokenized_text_plan(tokenized, batch_size, max_seq_length,
                                 num_batches=None, seed=42, pad_id=0,
                                 row_window_transform=None,
-                                row_window_size=DEFAULT_ROW_WINDOW_SIZE):
+                                row_window_size=DEFAULT_ROW_WINDOW_SIZE,
+                                packing_strategy=None):
     """Plan pretokenized rows with mlx-lm's sorting and shuffle contract."""
     tokenized = [
         row for row in tokenized
-        if _labeled_row_has_supervision(row[1], max_seq_length)
+        if _labeled_row_has_supervision(row[1], max_seq_length,
+                                        packing_strategy)
     ]
+    before_transform = len(tokenized)
     tokenized = _prepare_sized_text_rows(
         tokenized, row_window_transform, row_window_size,
+    )
+
+    _refuse_unschedulable_packed_rows(
+        before_transform, len(tokenized), batch_size,
+        transformed=row_window_transform is not None,
     )
     schedule, cycle_length = _shuffled_full_batch_schedule(
         len(tokenized),
@@ -8415,7 +8543,8 @@ def _create_text_batch_plan(dataset, tokenizer, batch_size, max_seq_length,
                             assistant_only_loss=False, comm_group=None,
                             distributed_pad_mode="cycle",
                             row_window_transform=None,
-                            row_window_size=DEFAULT_ROW_WINDOW_SIZE):
+                            row_window_size=DEFAULT_ROW_WINDOW_SIZE,
+    packing_strategy=None):
     """Build a finite CPU-backed text batch plan.
 
     Uses iterate_batches from mlx_lm for efficient dynamic-padding batching:
@@ -8439,6 +8568,7 @@ def _create_text_batch_plan(dataset, tokenizer, batch_size, max_seq_length,
         dataset,
         completion_only_loss=completion_only_loss,
         assistant_only_loss=assistant_only_loss,
+        packing_strategy=packing_strategy,
     )
     if saw_pretokenized:
         return _create_tokenized_text_plan(
@@ -8450,6 +8580,7 @@ def _create_text_batch_plan(dataset, tokenizer, batch_size, max_seq_length,
             pad_id=_mlx_text_pad_id(tokenizer),
             row_window_transform=row_window_transform,
             row_window_size=row_window_size,
+            packing_strategy=packing_strategy,
         )
     if assistant_only_loss:
         _validate_mlx_text_assistant_only_dataset(dataset)
@@ -8482,6 +8613,7 @@ def _create_text_batch_plan(dataset, tokenizer, batch_size, max_seq_length,
                 pad_id=_mlx_text_pad_id(tokenizer),
                 row_window_transform=row_window_transform,
                 row_window_size=row_window_size,
+                packing_strategy=packing_strategy,
             )
         if assistant_only_loss:
             raise ValueError(
@@ -8494,7 +8626,7 @@ def _create_text_batch_plan(dataset, tokenizer, batch_size, max_seq_length,
                 "prompt/completion rows."
             )
         if _prompt_completion_formatter_conflict(
-            dataset, formatting_func, completion_only_loss
+            dataset, formatting_func, completion_only_loss,
         ):
             raise ValueError(
                 "Unsloth MLX: a formatting_func was provided for a prompt/completion "
@@ -8536,7 +8668,8 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
                    formatting_func=None, chat_template=None,
                    model_name=None, model_type=None, append_eos=True,
                    completion_only_loss=None, assistant_only_loss=False,
-                   comm_group=None, distributed_pad_mode="cycle"):
+                   comm_group=None, distributed_pad_mode="cycle",
+                   row_window_transform=None, packing_strategy=None):
     """Pre-tokenize and eagerly batch a HuggingFace dataset for MLX."""
     return _create_text_batch_plan(
         dataset=dataset,
@@ -8555,6 +8688,8 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
         assistant_only_loss=assistant_only_loss,
         comm_group=comm_group,
         distributed_pad_mode=distributed_pad_mode,
+        row_window_transform=row_window_transform,
+        packing_strategy=packing_strategy,
     ).materialize_all()
 
 
@@ -8859,7 +8994,7 @@ def _create_ordered_text_plan(
     comm_group=None,
     row_window_transform=None,
     row_window_size=DEFAULT_ROW_WINDOW_SIZE,
-):
+    packing_strategy=None):
     """Plan text batches with an explicit dataset order.
 
     Unsloth uses this to mirror CUDA's effective sampler stream without
@@ -8877,12 +9012,15 @@ def _create_ordered_text_plan(
         dataset,
         completion_only_loss=completion_only_loss,
         assistant_only_loss=assistant_only_loss,
+        packing_strategy=packing_strategy,
     )
     if saw_pretokenized:
         for ids, labels in tokenized_pairs:
-            ids = list(ids)[:max_seq_length]
-            labels = list(labels)[:max_seq_length] if labels is not None else None
-            if len(ids) >= 2:
+            ids = _truncate_for_preparation(ids, max_seq_length,
+                                            packing_strategy)
+            labels = _truncate_for_preparation(labels, max_seq_length,
+                                               packing_strategy)
+            if len(ids) >= (1 if packing_strategy == "wrapped" else 2):
                 tokenized.append((ids, labels))
         labeled = True
     elif assistant_only_loss:
@@ -8906,9 +9044,11 @@ def _create_ordered_text_plan(
             completion_only_loss=completion_only_loss,
             assistant_only_loss=assistant_only_loss,
         ):
-            ids = list(ids)[:max_seq_length]
-            labels = list(labels)[:max_seq_length]
-            if len(ids) >= 2:
+            ids = _truncate_for_preparation(ids, max_seq_length,
+                                            packing_strategy)
+            labels = _truncate_for_preparation(labels, max_seq_length,
+                                               packing_strategy)
+            if len(ids) >= (1 if packing_strategy == "wrapped" else 2):
                 tokenized.append((ids, labels))
         labeled = bool(tokenized)
         if completion_only_loss is True and not labeled:
@@ -8944,7 +9084,8 @@ def _create_ordered_text_plan(
     if labeled:
         tokenized = [
             row for row in tokenized
-            if _labeled_row_has_supervision(row[1], max_seq_length)
+            if _labeled_row_has_supervision(row[1], max_seq_length,
+                                        packing_strategy)
         ]
         tokenized = _prepare_sized_text_rows(
             tokenized, row_window_transform, row_window_size,

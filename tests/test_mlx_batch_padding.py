@@ -171,3 +171,111 @@ def test_disengaging_leaves_attention_untouched():
         assert compose(q, k, "causal") is None
 
 
+def test_packing_takes_ownership_of_truncation():
+    """Preparation must not cut a row the packer is about to chunk."""
+    from unsloth_zoo.mlx.utils import (
+        _preparation_row_limit, _truncate_for_preparation,
+    )
+
+    row = list(range(10))
+
+    # Unpacked: preparation owns the cap, as it always has.
+    assert _preparation_row_limit(4) == 4
+    assert _truncate_for_preparation(row, 4) == [0, 1, 2, 3]
+
+    # Packed: the packer owns it, under either strategy.
+    for strategy in ("bfd", "wrapped"):
+        assert _preparation_row_limit(4, strategy) is None
+        assert _truncate_for_preparation(row, 4, strategy) == row
+
+    # A copy either way, so a caller cannot mutate the packer's state.
+    assert _truncate_for_preparation(row, 4, "wrapped") is not row
+    assert _truncate_for_preparation(None, 4) is None
+
+
+def test_bin_packing_masks_the_target_that_crosses_a_document_boundary():
+    """Isolating attention is not enough; the loss pairs across the seam too."""
+    from unsloth_zoo.mlx.utils import packed_row_transform
+
+    rows = [([10, 11, 12], [10, 11, 12]), ([20, 21], [20, 21])]
+    packed = packed_row_transform(8, strategy="bfd")(rows)
+
+    crossings = 0
+    for ids, labels, segments in packed:
+        for position in range(1, len(segments)):
+            if segments[position] != segments[position - 1]:
+                crossings += 1
+                assert labels[position] == -100
+    # The fixture must actually contain a boundary, or this proves nothing.
+    assert crossings
+
+    # Supervision inside a document is untouched.
+    assert any(label != -100 for ids, labels, _ in packed for label in labels)
+
+
+def test_wrapped_keeps_a_single_token_document():
+    """Concatenation makes a one-token document trainable."""
+    from unsloth_zoo.mlx.utils import _prepare_pretokenized_text_dataset
+
+    rows = [{"input_ids": [20], "labels": [20]},
+            {"input_ids": [1, 2, 3], "labels": [1, 2, 3]}]
+
+    unpacked, _ = _prepare_pretokenized_text_dataset(rows)
+    assert [len(ids) for ids, _ in unpacked] == [3]
+
+    wrapped, _ = _prepare_pretokenized_text_dataset(
+        rows, packing_strategy="wrapped",
+    )
+    assert sorted(len(ids) for ids, _ in wrapped) == [1, 3]
+
+    # Bin-packing truncates rather than concatenating.
+    binned, _ = _prepare_pretokenized_text_dataset(
+        rows, packing_strategy="bfd",
+    )
+    assert [len(ids) for ids, _ in binned] == [3]
+
+    # And it survives all the way to the plan, not merely past the reader:
+    from unsloth_zoo.mlx.utils import (
+        _create_tokenized_text_plan, packed_row_transform,
+    )
+
+    pairs = [([20], [20]), ([1, 2, 3], [1, 2, 3])] * 4
+
+    def tokens_in_plan(strategy):
+        plan = _create_tokenized_text_plan(
+            pairs, 2, 8, num_batches=1, seed=0,
+            row_window_transform=packed_row_transform(8, strategy=strategy),
+            packing_strategy=strategy,
+        )
+        return {token for row in plan.rows for token in row.input_ids}
+
+    assert 20 in tokens_in_plan("wrapped")
+    assert 20 not in tokens_in_plan("bfd")
+
+
+def test_a_packed_row_with_nothing_to_learn_from_is_dropped_everywhere():
+    """The rule lives at the seam, not in whichever builder remembered it."""
+    from unsloth_zoo.mlx.utils import (
+        _create_ordered_text_plan, _create_tokenized_text_plan,
+        _prepare_sized_text_rows, packed_row_transform,
+    )
+
+    transform = packed_row_transform(1, strategy="wrapped")
+
+    # At the seam itself: a row whose only label cannot be predicted goes.
+    assert _prepare_sized_text_rows([([20], [20])], transform, 8) == []
+    # A row with a real target survives.
+    roomy = packed_row_transform(8, strategy="wrapped")
+    assert _prepare_sized_text_rows([([1, 2], [-100, 2])], roomy, 8)
+
+    # Both sized builders inherit it, rather than one of them having it.
+    with pytest.raises(ValueError):
+        _create_tokenized_text_plan(
+            [([20], [20])] * 8, 2, 1, num_batches=1, seed=0,
+            row_window_transform=transform, packing_strategy="wrapped",
+        )
+    with pytest.raises(ValueError):
+        _create_ordered_text_plan(
+            [{"input_ids": [20], "labels": [20]}] * 8, None, 2, 1, seed=0,
+            row_window_transform=transform, packing_strategy="wrapped",
+        )

@@ -340,7 +340,7 @@ def test_engagement_retraces_the_compiled_step():
             mx.eval(step(ones, ones, ones))
         assert composed == [False]
 
-        # Same shapes, so the graph would be reused if the buffer were not an input.
+        # Same shapes, so the graph would be reused if the buffer were not an input.n input.n input.
         buffers.engage("train", mx.array([[0, 0, 1, 1]]))
         with buffers.within("train"):
             mx.eval(step(ones, ones, ones))
@@ -377,6 +377,136 @@ def test_engagement_retraces_the_compiled_step():
         assert not mx.allclose(outside, inside).item()
     finally:
         set_sdpa_mask_composer(previous)
+
+
+def test_a_packed_run_actually_isolates_attention():
+    """The mask must reach attention, not merely exist."""
+    import dataclasses
+
+    import numpy as np
+
+    import unsloth_zoo.mlx.compile as compile_module
+    import unsloth_zoo.mlx.trainer as trainer_module
+
+    config = next(
+        getattr(trainer_module, name) for name in dir(trainer_module)
+        if dataclasses.is_dataclass(getattr(trainer_module, name, None))
+        and "packing" in {
+            f.name for f in dataclasses.fields(getattr(trainer_module, name))
+        }
+    )
+    owner = next(
+        getattr(trainer_module, name) for name in dir(trainer_module)
+        if isinstance(getattr(trainer_module, name, None), type)
+        and hasattr(getattr(trainer_module, name), "_mlx_segment_buffers_for_run")
+    )
+
+    class Run(owner):
+        def __init__(self):
+            # A phase without a dataset never runs, so it is not qualified.
+            self.train_dataset = [{"input_ids": [1, 2], "labels": [1, 2]}]
+            self.eval_dataset = None
+            self.args = config()
+            self.args.packing = True
+
+    restore = compile_module._SDPA_MASK_COMPOSER
+    try:
+        run = Run()
+        buffers = owner._mlx_segment_buffers_for_run(run)
+        assert compile_module._SDPA_MASK_COMPOSER is not None
+
+        query = mx.random.normal((1, 2, 4, 8))
+        owner._mlx_engaged_segments(
+            run, "train", (None, None, None, mx.array([[0, 0, 1, 1]])),
+        )
+        with owner._mlx_segment_window(run, "train"):
+            isolated = np.array(mx.fast.scaled_dot_product_attention(
+                query, query, query, scale=1.0, mask="causal",
+            ))
+        plain = np.array(mx.fast.scaled_dot_product_attention(
+            query, query, query, scale=1.0, mask="causal",
+        ))
+
+        assert not np.allclose(isolated, plain)
+    finally:
+        compile_module.set_sdpa_mask_composer(restore)
+
+    # The gate is asked first, and its refusal reaches the caller.
+    import importlib
+
+    module = importlib.import_module("mlx_lm.models.qwen2")
+
+    def tiny():
+        return module.Model(module.ModelArgs(
+            model_type="qwen2", hidden_size=32, num_hidden_layers=2,
+            intermediate_size=64, num_attention_heads=2, rms_norm_eps=1e-5,
+            vocab_size=256, num_key_value_heads=2,
+        ))
+
+    def run_at(**overrides):
+        run = Run()
+        for key, value in overrides.items():
+            setattr(run.args, key, value)
+        return run
+
+    owner._mlx_qualify_packing_or_refuse(run_at(max_seq_length=64), tiny())
+    with pytest.raises(ValueError, match="cannot be used here"):
+        owner._mlx_qualify_packing_or_refuse(
+            run_at(max_seq_length=2048), tiny(),
+        )
+    # wrapped isolates nothing, so it needs no gate.
+    owner._mlx_qualify_packing_or_refuse(
+        run_at(max_seq_length=2048, packing_strategy="wrapped"), tiny(),
+    )
+
+
+def test_a_second_trainer_does_not_take_isolation_from_the_first():
+    """One composer slot, possibly several trainers."""
+    import numpy as np
+
+    import unsloth_zoo.mlx.compile as compile_module
+    from unsloth_zoo.mlx.compile import (
+        SegmentMaskBuffers, install_safe_sdpa_mask_patch,
+        register_segment_mask_reader,
+    )
+
+    install_safe_sdpa_mask_patch()
+    restore = compile_module._SDPA_MASK_COMPOSER
+    first, second = SegmentMaskBuffers(), SegmentMaskBuffers()
+    remove_first = remove_second = None
+    try:
+        remove_first = register_segment_mask_reader(first.read)
+        query = mx.random.normal((1, 2, 4, 8))
+
+        def attend():
+            return np.array(mx.fast.scaled_dot_product_attention(
+                query, query, query, scale=1.0, mask="causal",
+            ))
+
+        plain = attend()
+        first.engage("train", mx.array([[0, 0, 1, 1]]))
+        with first.within("train"):
+            alone = attend()
+        assert not np.allclose(alone, plain)
+
+        # A second trainer starts. The first must be unaffected.
+        remove_second = register_segment_mask_reader(second.read)
+        with first.within("train"):
+            alongside = attend()
+        assert np.allclose(alongside, alone)
+
+        # And the second isolates on its own ids, not the first's.
+        second.engage("eval", mx.array([[0, 1, 1, 1]]))
+        with second.within("eval"):
+            other = attend()
+        assert not np.allclose(other, plain)
+        assert not np.allclose(other, alone)
+    finally:
+        if remove_second is not None:
+            remove_second()
+        if remove_first is not None:
+            remove_first()
+        compile_module.set_sdpa_mask_composer(restore)
 
 
 def test_resume_from_checkpoint_matches_fresh_run(tmp_path):

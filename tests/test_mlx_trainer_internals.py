@@ -8252,3 +8252,56 @@ def test_sdpa_mask_composer_replaces_the_mask_when_it_returns_one(monkeypatch):
 _ROWS = [((1, 2, 3), (-100, 2, 3)), ((4, 5, 6), (-100, 5, 6))]
 
 
+def test_the_trainer_refuses_a_packing_configuration_it_cannot_honour():
+    """The refusals reach a caller, in terms of what the caller set."""
+    import dataclasses
+
+    import unsloth_zoo.mlx.trainer as trainer_module
+
+    config = next(
+        getattr(trainer_module, name) for name in dir(trainer_module)
+        if dataclasses.is_dataclass(getattr(trainer_module, name, None))
+        and "packing" in {
+            f.name for f in dataclasses.fields(getattr(trainer_module, name))
+        }
+    )
+    owner = next(
+        getattr(trainer_module, name) for name in dir(trainer_module)
+        if isinstance(getattr(trainer_module, name, None), type)
+        and hasattr(getattr(trainer_module, name), "_mlx_check_packing_configuration")
+    )
+
+    class Run(owner):
+        def __init__(self, dataset, **overrides):
+            self.train_dataset = dataset
+            self.eval_dataset = None
+            self.args = config()
+            self.args.packing = True
+            for key, value in overrides.items():
+                setattr(self.args, key, value)
+
+    labelled = [{"input_ids": [1, 2], "labels": [1, 2]}]
+
+    # A configuration it can honour raises nothing.
+    Run(labelled)._mlx_check_packing_configuration()
+
+    with pytest.raises(ValueError, match="not recognised"):
+        Run(labelled, packing_strategy="bin-packing")._mlx_check_packing_configuration()
+
+    with pytest.raises(ValueError, match="neftune"):
+        Run(labelled, neftune_noise_alpha=5.0)._mlx_check_packing_configuration()
+
+    # Raw text has no label channel; its supervision is a span.
+    with pytest.raises(ValueError, match="rows carry labels"):
+        Run([{"text": "hi"}])._mlx_check_packing_labels()
+
+    # Unless something supplies labels, which response-only training does.
+    Run([{"text": "hi"}], completion_only_loss=True)._mlx_check_packing_labels()
+    Run(labelled)._mlx_check_packing_labels()
+
+    # A marker set after construction is honoured, which is the whole point.
+    late = Run([{"text": "hi"}])
+    late._mlx_response_only_marker = object()
+    late._mlx_check_packing_labels()
+
+

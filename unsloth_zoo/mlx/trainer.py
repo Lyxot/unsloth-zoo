@@ -473,6 +473,79 @@ class _MLXLazyEvalBatchView:
                 close()
 
 
+def _mlx_compiled_step_state(model, optimizer, segment_buffers=None,
+                             phase="train"):
+    """What a compiled step carries across calls."""
+    state = [model.state, optimizer.state, mx.random.state]
+    if segment_buffers is not None:
+        state.append(segment_buffers.buffer(phase))
+    return state
+
+
+def _mlx_effective_packing(args):
+    """Whether each phase packs, resolved per phase."""
+    training = bool(getattr(args, "packing", False))
+    requested = getattr(args, "eval_packing", None)
+    return {
+        "train": training,
+        "eval": training if requested is None else bool(requested),
+    }
+
+
+def _mlx_streaming_packing_refusal(args, streaming_phases):
+    """Refuse a phase that would pack through the streaming producer."""
+    packing = _mlx_effective_packing(args)
+    blocked = sorted(
+        phase for phase, streaming in streaming_phases.items()
+        if streaming and packing.get(phase)
+    )
+    if not blocked:
+        return None
+    names = " and ".join(blocked)
+    return (f"Unsloth: packing is not yet supported for streaming data, and "
+            f"{names} would be served by the streaming producer. Pass a "
+            f"sized (non-lazy) dataset for {names}, or disable packing for "
+            f"it.")
+
+
+def _mlx_any_split_is_lazy(dataset):
+    """Whether ``dataset`` reaches the streaming producer."""
+    if isinstance(dataset, dict):
+        return any(_mlx_any_split_is_lazy(split) for split in dataset.values())
+    return _is_mlx_lazy_text_source(dataset)
+
+
+def _mlx_prepared_packing_stamp(args, packer, rows):
+    """What a set of prepared batches was built for."""
+    if packer is None:
+        return None
+    return (
+        getattr(args, "packing_strategy", "bfd"),
+        int(getattr(args, "max_seq_length", 0) or 0),
+        int(rows or 0),
+    )
+
+
+def _mlx_packing_configuration_refusal(args):
+    """Why this configuration cannot pack, or None."""
+    strategy = getattr(args, "packing_strategy", "bfd")
+    if strategy not in ("bfd", "wrapped"):
+        return (f"Unsloth: packing_strategy={strategy!r} is not recognised; "
+                f"expected 'bfd' or 'wrapped'.")
+
+    # NEFTune scales its noise by the padded row length, so on packed rows it
+    # would scale by the budget rather than by the documents' own lengths.
+    # Only bfd is affected: wrapped rows are full by construction, which is
+    # the length the unpacked path would have used anyway.
+    if strategy == "bfd" and getattr(args, "neftune_noise_alpha", None):
+        return ("Unsloth: packing_strategy='bfd' cannot be combined with "
+                "neftune_noise_alpha, because NEFTune scales its noise by the "
+                "row length and a packed row's length is the budget rather "
+                "than any document's. Use packing_strategy='wrapped', or "
+                "disable NEFTune.")
+    return None
+
+
 def _mlx_streaming_epoch_batches(declared, global_batch_size, grad_accum,
                                  prefix, source):
     """Micro-batches in one streaming pass, or the refusal explaining why not.
@@ -520,6 +593,7 @@ def _mlx_declared_iterable_length(dataset):
 
 from .utils import (
     TEXT_SEGMENT_PAD_ID,
+    _labeled_row_has_supervision,
     make_cce_loss_fn,
     make_baseline_loss_fn,
     make_vlm_cce_loss_fn,
@@ -1047,6 +1121,8 @@ _MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
     "streaming_prefetch_batches",
     "logging_dir",
     "run_name",
+    "packing_strategy",
+    "eval_packing",
 )
 
 
@@ -1177,6 +1253,13 @@ class MLXTrainingConfig:
     # _MLX_CONFIG_OPTIONAL_COPY_FIELDS so they stay an exact suffix of it.
     logging_dir: str | None = None
     run_name: str | None = None
+    # Which packer, when packing is on. "bfd" never splits a document, so
+    # attention can be restricted to each one; "wrapped" concatenates and
+    # splits freely, so each packed row is one opaque segment.
+    packing_strategy: str = "bfd"
+    # Unset follows packing, so a run that packs its training data packs its
+    # evaluation too. An explicit bool overrides.
+    eval_packing: bool | None = None
 
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]
@@ -1791,6 +1874,314 @@ def _resolve_training_steps(args, batches, batch_iter, *, includes_epochs=False)
 class MLXTrainer:
     """MLX-native trainer for Apple Silicon, mirroring SFTTrainer's constructor API."""
 
+
+    def _mlx_segment_window(self, phase):
+        """Scope the engaged segments to one step, or do nothing when unpacked.
+
+        A run that does not pack has no buffers, so this is a null context and
+        the step is exactly what it was.
+        """
+        buffers = getattr(self, "_mlx_segment_buffers", None)
+        if buffers is None:
+            from contextlib import nullcontext
+
+            return nullcontext()
+        return buffers.within(phase)
+
+    def _mlx_refuse_stale_prepared_packing(self):
+        """Refuse when prepared rows were packed by a different strategy.
+
+        `train_on_responses_only` builds and stores its batches eagerly, so
+        those rows carry whichever packer ran then. The arguments stay
+        mutable afterwards, and a change would leave the mask and the gate
+        following the new strategy while training consumed rows built by the
+        old one -- reporting one algorithm and running another.
+        """
+        packing = self._mlx_packing_phases()
+        for phase, attribute, batches in (
+            ("train", "_mlx_prepared_packing", getattr(self, "_batches", None)),
+            ("eval", "_mlx_prepared_eval_packing",
+             getattr(self, "_eval_batches_labeled", None)),
+        ):
+            if batches is None or not hasattr(self, attribute):
+                continue
+            prepared = getattr(self, attribute)
+            rows = (
+                self.args.per_device_train_batch_size if phase == "train"
+                else (getattr(self.args, "per_device_eval_batch_size", None)
+                      or self.args.per_device_train_batch_size)
+            )
+            wanted = (
+                _mlx_prepared_packing_stamp(self.args, object(), rows)
+                if packing.get(phase) else None
+            )
+            if prepared == wanted:
+                continue
+            raise ValueError(
+                f"Unsloth: the {phase} batches were already prepared for "
+                f"(strategy, max_seq_length, batch) = {prepared!r} and the "
+                f"configuration now asks for {wanted!r}. Rebuild the trainer, "
+                f"or settle those before preparing response-only data."
+            )
+
+    def _mlx_packing_phases(self):
+        """Which phases will really pack: resolved, and with a dataset.
+
+        A phase without a dataset never runs, so treating it as packing has
+        only ever produced false refusals -- or, once buffers followed the
+        unfiltered flags, a composer installed for a run that packs nothing
+        and a step reaching for a segment channel that is not there.
+        """
+        packing = _mlx_effective_packing(self.args)
+        for phase, attribute in (("train", "train_dataset"),
+                                 ("eval", "eval_dataset")):
+            if getattr(self, attribute, None) is None:
+                packing = dict(packing, **{phase: False})
+        return packing
+
+    def _mlx_qualify_packing_or_refuse(self, model):
+        """Ask the gate before packing engages, and refuse with its reason.
+
+        The gate is fail-closed and answers per phase, in the mode and at the
+        batch that phase will run. Asked here rather than at construction
+        because it runs the model, so it needs the model in the state it will
+        train in -- after wrapping, quantisation and adapters are final.
+        """
+        packing = self._mlx_packing_phases()
+        # A phase without a dataset never runs, so qualifying it can only
+        # refuse a configuration that was going to work -- a configured eval
+        # batch with no eval dataset would otherwise be probed and could trip
+        # the mask-memory limit for a run that never evaluates.
+        if getattr(self, "eval_dataset", None) is None:
+            packing = dict(packing, eval=False)
+        if getattr(self, "train_dataset", None) is None:
+            packing = dict(packing, train=False)
+        if not any(packing.values()):
+            return
+        # Only bin-packing depends on the mask, so only it needs the gate;
+        # wrapped rows are one opaque segment and isolate nothing.
+        if getattr(self.args, "packing_strategy", "bfd") != "bfd":
+            return
+        from .compile import qualify_packing
+
+        training_rows = self.args.per_device_train_batch_size
+        evaluation_rows = (
+            getattr(self.args, "per_device_eval_batch_size", None)
+            or training_rows
+        )
+        verdict = qualify_packing(
+            model,
+            packed_length=self.args.max_seq_length,
+            # Each phase is described only when it packs, and evaluation is
+            # described with the batch it will really use -- it falls back to
+            # the training batch when none is configured, so omitting it left
+            # a packing phase unqualified.
+            batch_size=training_rows if packing["train"] else None,
+            eval_batch_size=evaluation_rows if packing["eval"] else None,
+            args=self.args,
+        )
+        if not verdict:
+            raise ValueError(
+                f"Unsloth: packing_strategy='bfd' cannot be used here — "
+                f"{verdict.reason}. Use packing_strategy='wrapped', which "
+                f"needs no attention isolation, or disable packing."
+            )
+
+    def _mlx_segment_buffers_for_run(self):
+        """The buffers this run's compiled steps register, created once.
+
+        Created only when some phase packs, because registering a slot the run
+        will never fill changes the compiled step's input signature for every
+        unpacked run as well. Created once, because the steps register the
+        object and later read it -- a second set would leave the steps holding
+        buffers nobody writes.
+        """
+        if not any(self._mlx_packing_phases().values()):
+            return None
+        existing = getattr(self, "_mlx_segment_buffers", None)
+        # Registration is tracked separately from the buffers. A trainer built
+        # for wrapped creates buffers and installs nothing; switching to bfd
+        # before train() would otherwise find those buffers and skip the
+        # install, leaving packed rows with no isolation mask at all.
+        if existing is not None and getattr(
+            self, "_mlx_segment_reader_registered", False
+        ) is False and getattr(self.args, "packing_strategy", "bfd") == "bfd":
+            from .compile import (
+                install_safe_sdpa_mask_patch, register_segment_mask_reader,
+            )
+
+            install_safe_sdpa_mask_patch()
+            register_segment_mask_reader(existing.read)
+            self._mlx_segment_reader_registered = True
+        if existing is None:
+            from .compile import (
+                SegmentMaskBuffers, install_safe_sdpa_mask_patch,
+                register_segment_mask_reader,
+            )
+
+            existing = SegmentMaskBuffers()
+            self._mlx_segment_buffers = existing
+            # Creating the buffers is not enough: attention reads through the
+            # patched entry point and the composer is what puts the mask there.
+            if getattr(self.args, "packing_strategy", "bfd") == "bfd":
+                self._mlx_segment_reader_registered = True
+                install_safe_sdpa_mask_patch()
+                # Registered rather than installed: the composer is one
+                # process-wide slot, so replacing it would take isolation
+                # away from any trainer that installed before this one.
+                register_segment_mask_reader(existing.read)
+        return existing
+
+    def _mlx_engaged_segments(self, phase, batch):
+        """Point this phase's buffer at ``batch``'s segment ids, or clear it.
+
+        A packed batch carries per-token segment ids as its fourth entry. A
+        batch without them is not packed, and the buffer is cleared rather
+        than left holding the previous batch's -- a stale engagement would
+        mask the wrong documents, which is worse than not masking at all.
+        """
+        buffers = getattr(self, "_mlx_segment_buffers", None)
+        if buffers is None:
+            return None
+        segments = batch[3] if batch is not None and len(batch) > 3 else None
+        buffers.engage(phase, segments)
+        return segments
+
+    def _mlx_packing_row_transform(self, phase):
+        """The packer for ``phase``, or None when that phase does not pack.
+
+        Built per phase because the two resolve independently: a run may pack
+        its training data and not its evaluation, or the reverse. Returning
+        None rather than an identity transform keeps the unpacked path exactly
+        as it was, which is what makes packing's arrival visible in a diff.
+        """
+        if not self._mlx_packing_phases().get(phase):
+            return None
+        from .utils import packed_row_transform
+
+        return packed_row_transform(
+            self.args.max_seq_length,
+            strategy=getattr(self.args, "packing_strategy", "bfd"),
+        )
+
+    def _mlx_check_packing_configuration(self):
+        """Refuse a packing configuration that cannot do what it says.
+
+        Every refusal here is a configuration a caller asked for and that
+        would otherwise be honoured silently in a weaker form -- an
+        unrecognised strategy, a strategy paired with something it cannot
+        support, or a phase routed through a producer that does not pack. The
+        alternative to raising is a run that completes and looks ordinary
+        while training on something other than what was requested.
+        """
+        packing = self._mlx_packing_phases()
+        for phase, dataset in (
+            ("train", getattr(self, "train_dataset", None)),
+            ("eval", getattr(self, "eval_dataset", None)),
+        ):
+            if dataset is None:
+                packing = dict(packing, **{phase: False})
+        # A configuration nothing will use is not a configuration error: a
+        # run with no evaluation dataset must not be refused for what its
+        # evaluation packing would have meant.
+        if not any(packing.values()):
+            return
+
+        refusal = _mlx_packing_configuration_refusal(self.args)
+        if refusal is not None:
+            raise ValueError(refusal)
+
+        strategy = getattr(self.args, "packing_strategy", "bfd")
+        if strategy == "bfd" and normalize_mlx_patch_mode(
+            getattr(self.args, "patch_mode", "patched")
+        ) == "unpatched":
+            raise ValueError(
+                "Unsloth: packing_strategy='bfd' needs the patched attention "
+                "entry point to place its isolation mask, and "
+                "patch_mode='unpatched' removes it. Use "
+                "packing_strategy='wrapped', which needs no mask, or leave "
+                "patch_mode at 'patched'."
+            )
+
+        # Packing is text-only. Bin-packing is refused by the gate's
+        # structural checks, but wrapped skips the gate entirely, so without
+        # this a multimodal run would report packing and either crash on a
+        # batch wider than three fields or quietly train unpacked.
+        if getattr(self, "_is_vlm", False):
+            raise ValueError(
+                "Unsloth: packing is text-only and this is a multimodal "
+                "model, whose media geometry a packed row cannot carry. "
+                "Disable packing."
+            )
+
+        # Which phase the streaming producer will actually serve, which is not
+        # the same question as which dataset is lazy.
+        streaming = bool(getattr(self.args, "streaming", False))
+        streaming_phases = {
+            "train": streaming and self.train_dataset is not None,
+            "eval": bool(
+                streaming
+                and getattr(self, "eval_dataset", None) is not None
+                and _mlx_any_split_is_lazy(self.eval_dataset)
+            ),
+        }
+        refusal = _mlx_streaming_packing_refusal(self.args, streaming_phases)
+        if refusal is not None:
+            raise ValueError(refusal)
+
+    def _mlx_check_packing_labels(self):
+        """Refuse a phase whose rows cannot carry labels.
+
+        Asked when data is prepared rather than when the trainer is built.
+        Response-only labelling is applied to a trainer that already exists,
+        so asking at construction would refuse the very route the message
+        recommends before it could be taken. Each packing phase is asked
+        about its own dataset, since a run may pack only one of them.
+        """
+        packing = self._mlx_packing_phases()
+        for phase, dataset in (
+            ("train", getattr(self, "train_dataset", None)),
+            ("eval", getattr(self, "eval_dataset", None)),
+        ):
+            if not packing.get(phase) or dataset is None:
+                continue
+            if self._mlx_dataset_can_carry_labels(dataset):
+                continue
+            raise ValueError(
+                f"Unsloth: packing needs a dataset whose rows carry labels, "
+                f"so that a document's supervision survives being packed "
+                f"alongside others, and the {phase} dataset's do not. Pass a "
+                f"pretokenized dataset with a 'labels' column for {phase}, "
+                f"or use train_on_responses_only, or disable packing for it."
+            )
+
+    def _mlx_dataset_can_carry_labels(self, dataset):
+        """Whether ``dataset``'s rows will reach the builders that carry labels."""
+        if getattr(self.args, "completion_only_loss", False):
+            return True
+        if getattr(self.args, "assistant_only_loss", False):
+            return True
+        if getattr(self, "_mlx_response_only_marker", None) is not None:
+            return True
+        # A mapping of splits carries its rows one level down; iterating it
+        # yields split names, which say nothing about labels.
+        if isinstance(dataset, dict):
+            return all(
+                self._mlx_dataset_can_carry_labels(split)
+                for split in dataset.values()
+            )
+        # Reading a row to decide must not consume the data: a generator would
+        # lose its first row to this check and train on the remainder.
+        if not hasattr(dataset, "__getitem__") and not hasattr(dataset, "__len__"):
+            return True
+        try:
+            first = next(iter(dataset))
+        except Exception:
+            return False
+        return isinstance(first, dict) and (
+            "labels" in first or "completion" in first
+        )
+
     def __init__(
         self,
         model,
@@ -1827,12 +2218,17 @@ class MLXTrainer:
         if packing is not None:
             self.args.packing = packing
 
-        if self.args.packing:
-            print(
-                "Unsloth: packing=True is not yet supported on MLX. "
-                "Falling back to packing=False (standard padding)."
+        if any(self._mlx_packing_phases().values()):
+            self._mlx_check_packing_configuration()
+            self._mlx_segment_buffers_for_run()
+            engaged = " and ".join(
+                phase for phase, packs in self._mlx_packing_phases().items()
+                if packs
             )
-            self.args.packing = False
+            print(
+                f"Unsloth: packing rows to {self.args.max_seq_length} tokens "
+                f"with {self.args.packing_strategy} for {engaged}."
+            )
 
         if (
             not self._is_vlm
@@ -3780,13 +4176,17 @@ class MLXTrainer:
 
             if not failed and not self.stop_requested:
                 try:
-                    if is_vlm:
-                        loss, ntoks = loss_fn(self.model, batch_data)
-                    else:
-                        batch, lengths, labels = (
-                            batch_data[0], batch_data[1], batch_data[2],
-                        )
-                        loss, ntoks = loss_fn(self.model, batch, lengths, labels)
+                    self._mlx_engaged_segments("eval", batch_data)
+                    with self._mlx_segment_window("eval"):
+                        if is_vlm:
+                            loss, ntoks = loss_fn(self.model, batch_data)
+                        else:
+                            batch, lengths, labels = (
+                                batch_data[0], batch_data[1], batch_data[2],
+                            )
+                            loss, ntoks = loss_fn(
+                                self.model, batch, lengths, labels,
+                            )
                     # Zero-token eval batches (distributed_pad_mode="empty" padding
                     # rows) make loss NaN; mask them so NaN * 0 does not poison the
                     # distributed all-sum. mx.where never selects the NaN branch.
@@ -3844,6 +4244,15 @@ class MLXTrainer:
             completion_only_loss=completion_only_loss,
             assistant_only_loss=assistant_only_loss,
         )
+        # Evaluation packs on its own resolution, so it needs its own packer;
+        # inheriting training's flag would leave it measuring a different
+        # regime than the one it was told to measure.
+        eval_transform = self._mlx_packing_row_transform(phase="eval")
+        if eval_transform is not None:
+            common["row_window_transform"] = eval_transform
+            common["packing_strategy"] = getattr(
+                args, "packing_strategy", "bfd",
+            )
         if args.streaming and _is_mlx_lazy_text_source(eval_dataset):
             max_batches = getattr(args, "max_eval_batches", None)
             if max_batches is not None:
@@ -4285,6 +4694,15 @@ class MLXTrainer:
         # _distributed_should_stop(). Local assignment only, no DDP collective.
         if self._stop_request_generation() < getattr(self, "_run_generation", 0):
             self.stop_requested = False
+        # Asked here, where the model is the one that will train: wrapping,
+        # quantisation and adapters are final by now, and the gate runs the
+        # model to decide.
+        if any(self._mlx_packing_phases().values()):
+            self._mlx_check_packing_configuration()
+            self._mlx_segment_buffers_for_run()
+        self._mlx_refuse_stale_prepared_packing()
+        self._mlx_check_packing_labels()
+        self._mlx_qualify_packing_or_refuse(self.model)
         # Then release the previous run's iterator/prefetch producer. Ordered
         # after the stop clear because that clear is a local assignment that
         # cannot fail, while this can block or propagate an interrupt; running it
@@ -5237,9 +5655,13 @@ class MLXTrainer:
         # Construction-time Python constant: selects one of two step-graph
         # shapes for the whole run. Never a runtime or mx.array condition —
         # that would add a report/no-report compile trace signature.
+        # Created once per run so the compiled steps register the same object
+        # they will later read. None until packing engages, which is the
+        # shape the state carries today.
+        _segment_buffers = getattr(self, "_mlx_segment_buffers", None)
         _report_grad_norm = bool(getattr(args, "report_grad_norm", False))
         _compute_report_norm = _report_grad_norm and max_grad_norm <= 0
-        state = [model.state, optimizer.state, mx.random.state]
+        state = _mlx_compiled_step_state(model, optimizer, _segment_buffers)
         # grad_accum==1 fast path: only for unclipped updates, since
         # clip_grad_norm can spike peak memory on bf16 VLM runs.
         _direct_single_step_update = (
@@ -5406,7 +5828,12 @@ class MLXTrainer:
 
         def _local_grad_step(batch_data, prev_state):
             """Local loss/grad accumulation step, safe to compile under DDP."""
-            (lvalue, toks), grad = _loss_and_grad(batch_data)
+            # This path does not go through step_fn, so it engages and scopes
+            # for itself. Without it a packed run under DDP would attend
+            # across documents while looking entirely ordinary.
+            self._mlx_engaged_segments("train", batch_data)
+            with self._mlx_segment_window("train"):
+                (lvalue, toks), grad = _loss_and_grad(batch_data)
             toks_f = toks.astype(mx.float32)
             grad, toks_f = _accumulate_weighted_grad(grad, toks_f, prev_state)
             # Carried as state across loop iterations, or reduced eagerly
@@ -5417,7 +5844,12 @@ class MLXTrainer:
 
         # Unified step for VLM (dict batch) and text (tuple batch) training.
         def step_fn(batch_data, prev_state, do_update):
-            (lvalue, toks), grad = _loss_and_grad(batch_data)
+            # Engaged from the batch and scoped to this step's own forward and
+            # backward, so the mask reaches this model's attention and nothing
+            # else reaching the shared entry point can pick it up.
+            self._mlx_engaged_segments("train", batch_data)
+            with self._mlx_segment_window("train"):
+                (lvalue, toks), grad = _loss_and_grad(batch_data)
 
             if _direct_single_step_update:
                 grad_norm = _apply_update_direct(grad, toks.astype(mx.float32))
@@ -6488,7 +6920,7 @@ class MLXTrainer:
                 _ddp_compile_local_grad = False
                 if isinstance(batches, _EAGER_REFETCHABLE_PLAN_TYPES):
                     batch_data = batches[scheduled_index]
-                state = [model.state, optimizer.state, mx.random.state]
+                state = _mlx_compiled_step_state(model, optimizer, _segment_buffers)
                 local_error = None
                 try:
                     result = step_fn(batch_data, prev_state, do_update)
@@ -6760,7 +7192,7 @@ class MLXTrainer:
                             batch_data = batches[scheduled_index]
                         if rng_state_before is not None:
                             mx.random.state[0] = rng_state_before
-                        state = [model.state, optimizer.state, mx.random.state]
+                        state = _mlx_compiled_step_state(model, optimizer, _segment_buffers)
                         lvalue, toks, grad_accum_state, grad_norm = step_fn(
                             batch_data, grad_accum_state, do_update,
                         )
@@ -7597,9 +8029,28 @@ class MLXTrainer:
                         )
                         self._prepared_batches_include_epochs = True
                     batch_kwargs["completion_only_loss"] = text_completion_only_loss
+                    # The ordered builder packs too: it accepted packing=True
+                    # and said so, so it must not quietly hand back
+                    # unsegmented rows.
+                    ordered_transform = self._mlx_packing_row_transform(
+                        phase="train",
+                    )
+                    if ordered_transform is not None:
+                        batch_kwargs["row_window_transform"] = ordered_transform
+                        batch_kwargs["packing_strategy"] = getattr(
+                            self.args, "packing_strategy", "bfd",
+                        )
                     batches = _create_ordered_text_plan(**batch_kwargs)
                 else:
                     batch_kwargs["completion_only_loss"] = text_completion_only_loss
+                    transform = self._mlx_packing_row_transform(phase="train")
+                    if transform is not None:
+                        batch_kwargs["row_window_transform"] = transform
+                        # The filter's length cap means different things per
+                        # strategy, so the builder has to know which one ran.
+                        batch_kwargs["packing_strategy"] = getattr(
+                            self.args, "packing_strategy", "bfd",
+                        )
                     batches = _create_text_batch_plan(**batch_kwargs)
                 return batches, None
 
@@ -7762,7 +8213,8 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                             num_epochs=None, return_dataset=False,
                             comm_group=None, distributed_pad_mode="cycle",
                             return_plan=False, row_window_transform=None,
-                            row_window_size=None):
+                            row_window_size=None,
+                            packing_strategy=None):
     """Create padded batches with label masks for train_on_responses_only.
 
     Tokenizes each dataset item, applies the masking closure to get labels,
@@ -7814,9 +8266,13 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         # Mirror `_prepare_dataset`'s EOS contract; mismatch desyncs labeled vs unlabeled.
         if append_eos and eos_id is not None and (not encoded or encoded[-1] != eos_id):
             encoded.append(eos_id)
-        if len(encoded) > max_seq_length:
+        # Wrapped carries a long document into later packed rows, so cutting
+        # here would destroy those chunks and the supervision in them before
+        # the packer ran. Bin-packing truncates to its own budget, after
+        # binning, so it does not need this either once packing is on.
+        if packing_strategy is None and len(encoded) > max_seq_length:
             encoded = encoded[:max_seq_length]
-        if len(encoded) < 2:
+        if len(encoded) < (1 if packing_strategy == "wrapped" else 2):
             return None
         result = mask_fn({"input_ids": [encoded]})
         labels = result["labels"]
@@ -7829,9 +8285,17 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
     # e.g. long reasoning/analysis channels in GPT-OSS that exceed max_seq_length.
     # Such samples cause NaN loss since cross_entropy(mean) computes 0/0.
     def _has_valid_labels(labels):
-        """Return whether a response-masked row still has trainable labels."""
-        # Loss supervises labels[1:] (causal shift), so the first label never trains.
-        return any(label != -100 for label in labels[1:])
+        """Return whether a response-masked row still has trainable labels.
+
+        Delegates rather than deciding: this route reimplemented the rule and
+        disagreed with the other sized builders about the length cap, so a
+        row supervised only beyond the budget was admitted here and rejected
+        there. It then consumed a slot in its packing window and displaced a
+        real document into the next one.
+        """
+        return _labeled_row_has_supervision(
+            labels, max_seq_length, packing_strategy,
+        )
 
     max_workers = min(4, os.cpu_count() or 1)
     all_items = []
@@ -7951,11 +8415,17 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
     plan = FiniteTextBatchPlan(
         tuple(
             _FiniteTextRow(
-                tuple(int(token) for token in input_ids),
+                tuple(int(token) for token in row[0]),
                 offset=1,
-                labels=tuple(int(label) for label in labels),
+                labels=tuple(int(label) for label in row[1]),
+                # Bin-packing appends a per-token segment channel; rows that
+                # were not packed, or were packed by wrapped, carry none.
+                segments=(
+                    tuple(int(segment) for segment in row[2])
+                    if len(row) > 2 else None
+                ),
             )
-            for input_ids, labels in all_items
+            for row in all_items
         ),
         schedule,
         cycle_length=cycle_length,
@@ -7974,9 +8444,16 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
 
 def _create_response_masked_dataset(items):
     """Build a Dataset-like public view from tokenized response-masked rows."""
+    # Packed rows carry a third entry, the per-token segment ids. The public
+    # view keeps it so a caller reading this dataset back sees the same rows
+    # training saw, and so unpacking here does not depend on the arity.
     rows = [
-        {"input_ids": list(input_ids), "labels": list(labels)}
-        for input_ids, labels in items
+        {
+            "input_ids": list(row[0]),
+            "labels": list(row[1]),
+            **({"segments": list(row[2])} if len(row) > 2 else {}),
+        }
+        for row in items
     ]
     try:
         from datasets import Dataset
@@ -8126,6 +8603,7 @@ def _prepare_response_labeled_eval_batches(
     comm_group = getattr(trainer, "distributed_world", None)
 
     def _create(eval_dataset):
+        _eval_packer = trainer._mlx_packing_row_transform(phase="eval")
         batches, response_masked_dataset = _create_labeled_batches(
             dataset=eval_dataset,
             tokenizer=tokenizer,
@@ -8150,6 +8628,14 @@ def _prepare_response_labeled_eval_batches(
             return_dataset=True,
             comm_group=comm_group,
             distributed_pad_mode="empty",
+            # Response labelling is what gives these rows a label channel, so
+            # this builder can pack; without the packer it would report
+            # packing and evaluate on unpacked rows.
+            row_window_transform=_eval_packer,
+            packing_strategy=(
+                getattr(args, "packing_strategy", None)
+                if _eval_packer is not None else None
+            ),
         )
         return batches, response_masked_dataset
 
@@ -8169,6 +8655,11 @@ def _prepare_response_labeled_eval_batches(
     else:
         eval_batches, trainer.eval_dataset = _create(trainer.eval_dataset)
     trainer._eval_batches_labeled = eval_batches
+    trainer._mlx_prepared_eval_packing = _mlx_prepared_packing_stamp(
+        trainer.args,
+        trainer._mlx_packing_row_transform(phase="eval"),
+        eval_batch_size,
+    )
     return True
 
 
@@ -8331,6 +8822,7 @@ def train_on_responses_only(
             else None
         )
         comm_group = getattr(trainer, "distributed_world", None)
+        _train_packer = trainer._mlx_packing_row_transform(phase="train")
         batches, response_masked_dataset = _create_labeled_batches(
             dataset=train_dataset,
             tokenizer=_tokenizer,
@@ -8355,6 +8847,11 @@ def train_on_responses_only(
             return_dataset=True,
             comm_group=comm_group,
             return_plan=True,
+            row_window_transform=_train_packer,
+            packing_strategy=(
+                getattr(args, "packing_strategy", None)
+                if _train_packer is not None else None
+            ),
         )
         trainer.train_dataset = response_masked_dataset
         trainer._mlx_train_dataset_for_batches = response_masked_dataset
@@ -8370,6 +8867,12 @@ def train_on_responses_only(
             labeled_num_epochs is not None
         )
         trainer._batches = batches
+        # These rows are already packed, so what built them is a property of
+        # the data now, not of the configuration -- and that is the whole
+        # geometry, not only the algorithm.
+        trainer._mlx_prepared_packing = _mlx_prepared_packing_stamp(
+            args, _train_packer, args.per_device_train_batch_size,
+        )
 
         _prepare_response_labeled_eval_batches(
             trainer,
