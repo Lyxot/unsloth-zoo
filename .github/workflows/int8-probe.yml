@@ -2,6 +2,8 @@ name: int8-probe
 
 on:
   workflow_dispatch:
+  push:
+    branches: [pr1098-runner-probe]
 
 jobs:
   probe:
