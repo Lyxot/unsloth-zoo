@@ -630,23 +630,24 @@ def _build_kernel_set(
     return update, finalize, _build_dlogits_kernel()
 
 
-def _can_fuse_forward(hidden, weight, chunk_size):
-    """Whether the fused projection beats chunked logits for this shape.
+def _can_fuse_forward(hidden, weight):
+    """Whether the fused projection can replace chunked logits for this shape.
 
     The kernel keeps every score in threadgroup memory and writes one float32
-    partial per 64-wide vocabulary tile, so the last clause is the whole payoff:
-    the partials must not outweigh the half-precision logits chunk they replace.
+    partial per 64-wide vocabulary tile. Those partials can outweigh a single
+    minimum-size logits chunk at a large vocabulary, but the chunked path holds
+    several chunks at once, so fusing lowers the peak at every chunk budget.
     The hidden dimension only lengthens the accumulation loop, so it is floored
-    for occupancy rather than capped. The kernel addresses both inputs with
-    32-bit element offsets.
+    for occupancy rather than capped. The kernel addresses its inputs and its
+    per-tile partials with 32-bit element offsets.
     """
     return (hidden.shape[0] >= 32 and weight.shape[0] >= 4096
             and hidden.shape[1] >= 64
             and hidden.shape[0] * hidden.shape[1] < 2**32
             and weight.shape[0] * weight.shape[1] < 2**32
+            and hidden.shape[0] * ((weight.shape[0] + 63) // 64) < 2**32
             and weight.ndim == 2 and weight.shape[1] == hidden.shape[1]
-            and hidden.dtype == weight.dtype and hidden.dtype in (mx.float16, mx.bfloat16)
-            and 4 * ((weight.shape[0] + 63) // 64) <= 2 * chunk_size)
+            and hidden.dtype == weight.dtype and hidden.dtype in (mx.float16, mx.bfloat16))
 
 
 def _forward_chunked_fused_finalize(
@@ -702,7 +703,7 @@ def _forward_chunked_fused_finalize(
         targets_raw, vocab_size, ignore_index,
     )
     targets = targets_raw.astype(mx.int32)
-    if fused_forward is not None and _can_fuse_forward(hidden_compute, weight_compute, chunk_size):
+    if fused_forward is not None and _can_fuse_forward(hidden_compute, weight_compute):
         loss, lse = fused_forward(
             hidden_compute, weight_compute, targets,
             mx.array([logit_softcap], dtype=mx.float32),

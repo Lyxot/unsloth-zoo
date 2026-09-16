@@ -930,6 +930,28 @@ def test_fused_forward_declines_offsets_past_32_bits():
     def array(*shape):
         return SimpleNamespace(shape=shape, ndim=len(shape), dtype=mx.float16)
 
-    assert runtime_cce._can_fuse_forward(array(1 << 19, 8191), array(4096, 8191), 4096)
-    assert not runtime_cce._can_fuse_forward(array(1 << 19, 8192), array(4096, 8192), 4096)
-    assert not runtime_cce._can_fuse_forward(array(64, 8192), array(1 << 19, 8192), 4096)
+    assert runtime_cce._can_fuse_forward(array(1 << 19, 8191), array(4096, 8191))
+    assert not runtime_cce._can_fuse_forward(array(1 << 19, 8192), array(4096, 8192))
+    assert not runtime_cce._can_fuse_forward(array(64, 8192), array(1 << 19, 8192))
+    # One partial per row and 64-wide vocabulary tile.
+    assert runtime_cce._can_fuse_forward(array((1 << 20) - 1, 64), array(262144, 64))
+    assert not runtime_cce._can_fuse_forward(array(1 << 20, 64), array(262144, 64))
+
+
+def test_forward_only_cce_fuses_at_the_smallest_chunk_budget(monkeypatch):
+    _skip_torch_shim()
+    from unittest.mock import Mock
+    from unsloth_zoo.mlx.cce import runtime_cce as fused, make_chunked_cross_entropy_loss
+    kernel = Mock(wraps=fused.get_fused_forward() or pytest.skip("requires fused Metal support"))
+    monkeypatch.setattr(fused, "get_fused_forward", lambda: kernel)
+    # Minimum-size logits chunks, as on a small-memory device.
+    monkeypatch.setattr(fused, "_CHUNK_BUDGET", 1)
+    mx.random.seed(722)
+    hidden = (mx.random.normal((64, 64)) * 0.2).astype(mx.bfloat16)
+    weight = (mx.random.normal((65600, 64)) * 0.05).astype(mx.bfloat16)
+    targets = mx.arange(64) * 1000
+    expected, actual = [make_chunked_cross_entropy_loss(forward_only=flag)[0](hidden, weight, targets)
+                        for flag in (False, True)]
+    mx.eval(expected, actual)
+    assert kernel.called
+    assert mx.allclose(expected, actual, rtol=2e-5, atol=2e-5).item()
