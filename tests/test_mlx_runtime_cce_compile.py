@@ -881,3 +881,55 @@ def test_finite_logits_past_the_cap_match_the_saturated_loss(dtype, ratio):
     # Even classes saturate to the cap, odd ones stay at 0.
     expected = math.log(vocab / 2 * (1.0 + math.exp(-cap)))
     assert losses.item() == pytest.approx(rows * expected, rel=1e-4)
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("softcap", [0.0, 5.0])
+# The wide case only fuses because the hidden dimension is uncapped.
+@pytest.mark.parametrize("dim", [128, 1408])
+def test_forward_only_cce_preserves_vjp_and_training(monkeypatch, dtype, softcap, dim):
+    _skip_torch_shim()
+    from unittest.mock import Mock
+    from unsloth_zoo.mlx.cce import runtime_cce as fused, make_chunked_cross_entropy_loss
+    kernel = Mock(wraps=fused.get_fused_forward() or pytest.skip("requires fused Metal support"))
+    monkeypatch.setattr(fused, "get_fused_forward", lambda: kernel)
+    mx.random.seed(721)
+    hidden = (mx.random.normal((67, dim)) * (128 / dim) ** 0.5).astype(dtype)
+    weight = (mx.random.normal((4357, dim)) * 0.05).astype(dtype)
+    targets = mx.where(mx.arange(67) % 11 == 7, -100, 4356 - mx.arange(67))
+    cotangent = mx.linspace(-0.7, 0.9, 67)
+    training, evaluation = [make_chunked_cross_entropy_loss(logit_softcap=softcap, forward_only=flag)[0] for flag in (False, True)]
+    def run(fn):
+        grad = mx.value_and_grad(lambda h, w: (fn(h, w, targets) * cotangent).sum(), argnums=(0, 1))
+        return mx.compile(grad)(hidden, weight)
+    expected = run(training)
+    mx.eval(expected)
+    assert not kernel.called
+    if softcap:
+        hidden = hidden * 1000
+        def native(h, w, y):
+            scores = mx.tanh((h @ w.T).astype(mx.float32) / softcap) * softcap
+            target = mx.take_along_axis(scores, mx.maximum(y, 0)[:, None], axis=1)[:, 0]
+            return mx.where(y == -100, 0, mx.logsumexp(scores, axis=1) - target)
+        expected = run(native)
+        mx.eval(expected)
+    actual = run(evaluation)
+    mx.eval(actual)
+    assert kernel.called
+    assert actual[0].item() == pytest.approx(expected[0].item(), rel=2e-5, abs=2e-5)
+    for observed, reference in zip(actual[1], expected[1]):
+        error = mx.max(mx.abs(observed.astype(mx.float32) - reference.astype(mx.float32)))
+        tolerance = 0.02 if dtype == mx.bfloat16 else 0.002
+        assert error.item() <= 2e-5 + tolerance * mx.max(mx.abs(reference)).item()
+
+
+def test_fused_forward_declines_offsets_past_32_bits():
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.cce import runtime_cce
+
+    def array(*shape):
+        return SimpleNamespace(shape=shape, ndim=len(shape), dtype=mx.float16)
+
+    assert runtime_cce._can_fuse_forward(array(1 << 19, 8191), array(4096, 8191), 4096)
+    assert not runtime_cce._can_fuse_forward(array(1 << 19, 8192), array(4096, 8192), 4096)
+    assert not runtime_cce._can_fuse_forward(array(64, 8192), array(1 << 19, 8192), 4096)

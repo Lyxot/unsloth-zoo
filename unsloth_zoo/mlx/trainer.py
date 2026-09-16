@@ -3920,7 +3920,11 @@ class MLXTrainer:
         # Evaluation runs eager, so compacted VLM shapes cost no compiled
         # variants and the eager batch lists qualify as well as plans.
         compact_vlm = compaction and is_vlm
+        # The eval factory rebinds loss_fn to a partial carrying no markers.
         small_capacity_limit = getattr(loss_fn, "_unsloth_cce_small_capacity_limit", 0)
+        eval_factory = getattr(loss_fn, "_unsloth_eval_loss_factory", None)
+        if eval_factory is not None:
+            loss_fn = eval_factory()
         if compact_batches:
             if isinstance(eval_batches, FinitePreferenceBatchPlan):
                 eval_batches.configure_cce_compaction(kind=loss_fn._unsloth_cce_kind)

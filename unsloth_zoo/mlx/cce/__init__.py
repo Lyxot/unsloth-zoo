@@ -72,12 +72,13 @@ def _get_runtime_cce(
     mode: str = "affine",
     label_smoothing: float = 0.0,
     weight_is_frozen: bool = False,
+    forward_only: bool = False,
     precompute_hidden_gradient: bool = False,
 ):
     # Normalize BEFORE key lookup: a cached entry must never let an invalid
     # value (e.g. True -> 1.0) bypass validation.
     label_smoothing = _normalize_label_smoothing(label_smoothing)
-    key = (ignore_index, logit_softcap, chunk_size, quantized, group_size, bits, mode, label_smoothing, weight_is_frozen, precompute_hidden_gradient)
+    key = (ignore_index, logit_softcap, chunk_size, quantized, group_size, bits, mode, label_smoothing, weight_is_frozen, forward_only, precompute_hidden_gradient)
     runtime_cce = _RUNTIME_CCE_CACHE.get(key)
     if runtime_cce is None:
         runtime_cce, _ = make_chunked_cross_entropy_loss(
@@ -90,6 +91,7 @@ def _get_runtime_cce(
             mode=mode,
             label_smoothing=label_smoothing,
             weight_is_frozen=weight_is_frozen,
+            forward_only=forward_only,
             precompute_hidden_gradient=precompute_hidden_gradient,
         )
         _RUNTIME_CCE_CACHE[key] = runtime_cce

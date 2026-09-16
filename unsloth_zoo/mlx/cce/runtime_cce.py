@@ -19,6 +19,10 @@
 """Chunked cross-entropy helpers built from MLX runtime custom kernels."""
 
 from collections import OrderedDict
+from functools import lru_cache
+from pathlib import Path
+import math
+import re
 from typing import Callable
 
 import mlx.core as mx
@@ -626,6 +630,25 @@ def _build_kernel_set(
     return update, finalize, _build_dlogits_kernel()
 
 
+def _can_fuse_forward(hidden, weight, chunk_size):
+    """Whether the fused projection beats chunked logits for this shape.
+
+    The kernel keeps every score in threadgroup memory and writes one float32
+    partial per 64-wide vocabulary tile, so the last clause is the whole payoff:
+    the partials must not outweigh the half-precision logits chunk they replace.
+    The hidden dimension only lengthens the accumulation loop, so it is floored
+    for occupancy rather than capped. The kernel addresses both inputs with
+    32-bit element offsets.
+    """
+    return (hidden.shape[0] >= 32 and weight.shape[0] >= 4096
+            and hidden.shape[1] >= 64
+            and hidden.shape[0] * hidden.shape[1] < 2**32
+            and weight.shape[0] * weight.shape[1] < 2**32
+            and weight.ndim == 2 and weight.shape[1] == hidden.shape[1]
+            and hidden.dtype == weight.dtype and hidden.dtype in (mx.float16, mx.bfloat16)
+            and 4 * ((weight.shape[0] + 63) // 64) <= 2 * chunk_size)
+
+
 def _forward_chunked_fused_finalize(
     hidden: mx.array,
     weight: mx.array,
@@ -642,6 +665,7 @@ def _forward_chunked_fused_finalize(
     forward_update_kernel: Callable | None,
     forward_update_finalize_kernel: Callable | None,
     label_smoothing: float = 0.0,
+    fused_forward: Callable | None = None,
 ) -> tuple[mx.array, mx.array]:
     hidden_compute = hidden
     weight_compute = weight
@@ -678,6 +702,13 @@ def _forward_chunked_fused_finalize(
         targets_raw, vocab_size, ignore_index,
     )
     targets = targets_raw.astype(mx.int32)
+    if fused_forward is not None and _can_fuse_forward(hidden_compute, weight_compute, chunk_size):
+        loss, lse = fused_forward(
+            hidden_compute, weight_compute, targets,
+            mx.array([logit_softcap], dtype=mx.float32),
+        )
+        loss = mx.where(valid_pre, loss, mx.zeros_like(loss))
+        return _poison_invalid_targets(loss, invalid_pre), _poison_invalid_targets(lse, invalid_pre)
     compute_bytes = 2 if hidden_compute.dtype in (mx.float16, mx.bfloat16) else 4
     if label_smoothing > 0.0:
         compute_bytes = 4  # smoothing casts each logits chunk to fp32
@@ -979,6 +1010,7 @@ def make_runtime_cce_loss_fused_finalize(
     mode: str = "affine",
     label_smoothing: float = 0.0,
     weight_is_frozen: bool = False,
+    forward_only: bool = False,
     precompute_hidden_gradient: bool = False,
 ):
     label_smoothing = _normalize_label_smoothing(label_smoothing)
@@ -990,6 +1022,9 @@ def make_runtime_cce_loss_fused_finalize(
         # do not carry the vocabulary-sum term. eps=0 keeps the kernel path.
         forward_update_kernel = forward_update_finalize_kernel = dlogits_kernel = None
     use_metal_kernel = dlogits_kernel is not None
+    fused_forward = None
+    if forward_only and not quantized and label_smoothing == 0.0 and chunk_size <= 0:
+        fused_forward = get_fused_forward()
     ignore_arr = mx.array([ignore_index], dtype=mx.int32)
     softcap_arr = mx.array([logit_softcap], dtype=mx.float32)
     chunk_plan_cache: OrderedDict[
@@ -1289,6 +1324,7 @@ def make_runtime_cce_loss_fused_finalize(
             forward_update_kernel=forward_update_kernel,
             forward_update_finalize_kernel=forward_update_finalize_kernel,
             label_smoothing=label_smoothing,
+            fused_forward=fused_forward,
         )
         return losses, lse
 
@@ -1399,11 +1435,14 @@ def make_chunked_cross_entropy_loss(
     mode: str = "affine",
     label_smoothing: float = 0.0,
     weight_is_frozen: bool = False,
+    forward_only: bool = False,
     precompute_hidden_gradient: bool = False,
 ):
     """Return a standalone CCE loss and a kernel-usage flag.
 
     Set weight_is_frozen only when classifier gradients will not be requested.
+    forward_only tunes evaluation while preserving the custom VJP. Construct
+    hinted callables outside mx.compile; initialization probes kernel support.
     precompute_hidden_gradient builds a frozen or quantized head's hidden gradient
     in the forward (Metal kernels, no label smoothing), which saves backward memory
     but doubles the cost of a call that is never differentiated.
@@ -1419,5 +1458,137 @@ def make_chunked_cross_entropy_loss(
         mode=mode,
         label_smoothing=label_smoothing,
         weight_is_frozen=weight_is_frozen,
+        forward_only=forward_only,
         precompute_hidden_gradient=precompute_hidden_gradient,
     )
+
+
+def _steel_header():
+    root = Path(mx.__file__).resolve().parent / "include"
+    seen = set()
+
+    def read(name):
+        if name in seen:
+            return ""
+        seen.add(name)
+        source = (root / name).read_text().replace("#pragma once", "")
+        return re.sub(r'#include "([^"]+)"', lambda match: read(match[1]), source)
+
+    return read("mlx/backend/metal/kernels/steel/gemm/loader.h") + read(
+        "mlx/backend/metal/kernels/steel/gemm/mma.h"
+    )
+
+
+_FUSED_FORWARD_SOURCE = r"""
+constexpr short BM=32, BN=64, BK=32, WM=2, WN=2;
+    constexpr short TG=WM*WN*32, LD=BK+16/sizeof(T);
+    uint tid=thread_position_in_grid.x%TG;
+    uint tv=thread_position_in_grid.x/TG;
+    uint tn=thread_position_in_grid.y;
+    uint sg=tid/32, lane=tid%32;
+    uint N=hidden_shape[0], D=hidden_shape[1], V=weight_shape[0];
+    uint NV=(V+BN-1)/BN;
+    short nr=metal::min(uint(BM),N-tn*BM), vr=metal::min(uint(BN),V-tv*BN);
+
+    constexpr uint INPUT_BYTES=(BM+BN)*LD*sizeof(T), SCORE_BYTES=BM*BN*sizeof(float);
+    threadgroup float shared[(INPUT_BYTES>SCORE_BYTES?INPUT_BYTES:SCORE_BYTES)/4];
+    threadgroup T* A=reinterpret_cast<threadgroup T*>(shared);
+    threadgroup T* B=A+BM*LD;
+    threadgroup float* scores=shared;
+
+    using LA=mlx::steel::BlockLoader<T,BM,BK,LD,1,TG>;
+    using LB=mlx::steel::BlockLoader<T,BN,BK,LD,1,TG>;
+    using MMA=mlx::steel::BlockMMA<T,T,BM,BN,BK,WM,WN,false,true,LD,LD,float>;
+    LA la(hidden+tn*BM*D,D,A,sg,lane);
+    LB lb(weight+tv*BN*D,D,B,sg,lane);
+    MMA op(sg,lane);
+    for(uint k=0;k<D;k+=BK){
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if(nr==BM && D-k>=BK) la.load_unsafe();
+        else la.load_safe(short2(metal::min(uint(BK),D-k),nr));
+        if(vr==BN && D-k>=BK) lb.load_unsafe();
+        else lb.load_safe(short2(metal::min(uint(BK),D-k),vr));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        op.mma(A,B); la.next(); lb.next();
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    STEEL_PRAGMA_UNROLL
+    for(short i=0;i<MMA::TM;++i){
+        STEEL_PRAGMA_UNROLL
+        for(short j=0;j<MMA::TN;++j){
+            auto frag=op.Ctile.frag_at(i,j);
+            short row=op.sm+i*MMA::TM_stride, col=op.sn+j*MMA::TN_stride;
+            scores[row*BN+col]=float(T(frag[0]));
+            scores[row*BN+col+1]=float(T(frag[1]));
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(uint r=tid/4;r<BM;r+=TG/4){
+        if(r>=nr) continue;
+        float maximum=-INFINITY, correct=0.0f;
+        float cap=params[0]; int target=targets[tn*BM+r];
+        for(uint j=tid%4;j<vr;j+=4){
+            float score=scores[r*BN+j];
+            if(cap>0.0f) score=cap*cce_softcap_tanh(score/cap);
+            scores[r*BN+j]=score;
+            maximum=metal::max(maximum,score);
+            if(int(tv*BN+j)==target) correct=score;
+        }
+        maximum=metal::max(maximum,simd_shuffle_xor(maximum,1));
+        maximum=metal::max(maximum,simd_shuffle_xor(maximum,2));
+        float sum=0.0f;
+        for(uint j=tid%4;j<vr;j+=4) sum+=metal::exp(scores[r*BN+j]-maximum);
+        sum+=simd_shuffle_xor(sum,1); sum+=simd_shuffle_xor(sum,2);
+        correct+=simd_shuffle_xor(correct,1); correct+=simd_shuffle_xor(correct,2);
+        if(tid%4==0){
+            partial_lse[(tn*BM+r)*NV+tv]=maximum+metal::log(sum);
+            if ((target >= int(tv*BN) && target < int(tv*BN+vr)) || (tv==0 && (target<0 || target>=int(V)))) partial_target[tn*BM+r]=correct;
+        }
+    }
+"""
+
+
+@lru_cache(maxsize=1)
+def _fused_forward_kernel():
+    return mx.fast.metal_kernel(
+        name="cce_steel_forward_32_64_32",
+        input_names=["hidden", "weight", "targets", "params"],
+        output_names=["partial_lse", "partial_target"],
+        header=_steel_header() + _SOFTCAP_HEADER,
+        source=_FUSED_FORWARD_SOURCE,
+        ensure_row_contiguous=True,
+    )
+
+
+def _fused_forward(hidden, weight, targets32, softcap_arr):
+    n = hidden.shape[0]
+    tiles = (weight.shape[0] + 63) // 64
+    partial_lse, target_logit = _fused_forward_kernel()(
+        inputs=[hidden, weight, targets32, softcap_arr],
+        template=[("T", hidden.dtype)],
+        grid=(tiles * 128, (n + 31) // 32, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(n, tiles), (n,)],
+        output_dtypes=[mx.float32, mx.float32],
+    )
+    lse = mx.logsumexp(partial_lse, axis=-1)
+    return lse - target_logit, lse
+
+
+@lru_cache(maxsize=1)
+def get_fused_forward():
+    # Compile outside loss tracing so unsupported installed headers fall back.
+    try:
+        if not mx.metal.is_available():
+            return None
+        for dtype in (mx.float16, mx.bfloat16):
+            hidden = mx.zeros((32, 64), dtype=dtype)
+            weight = mx.zeros((64, 64), dtype=dtype)
+            targets = mx.arange(32, dtype=mx.int32)
+            loss, lse = _fused_forward(hidden, weight, targets, mx.array([0.0], dtype=mx.float32))
+            mx.eval(loss, lse)
+            if abs(loss[0].item() - math.log(64)) > 1e-5:
+                return None
+        return _fused_forward
+    except (OSError, RuntimeError, AttributeError, ValueError):
+        return None

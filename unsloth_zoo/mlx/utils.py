@@ -2174,7 +2174,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
             weight_is_frozen=_skip_weight_grad,
         )
 
-        def loss_fn(model, batch, lengths, labels=None, cce_indices=None):
+        def loss_fn(model, batch, lengths, labels=None, cce_indices=None, *, _runtime=rt_cce):
             if labels is None:
                 inputs, targets = batch[:, :-1], batch[:, 1:]
             else:
@@ -2203,9 +2203,24 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
             hidden_flat, targets_flat = _compact_cce_inputs(
                 hidden_flat, targets_flat, cce_indices,
             )
-            loss = rt_cce(model)(hidden_flat, w, targets_flat)
+            loss = _runtime(model)(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
+
+        def make_eval_loss():
+            weight = lm_layer.weight
+            if (label_smoothing != 0.0 or weight.dtype not in (mx.float16, mx.bfloat16)
+                    or weight.shape[0] < 4096 or weight.shape[1] < 64):
+                return loss_fn
+            runtime = _get_runtime_cce(
+                ignore_index=-100,
+                logit_softcap=softcap,
+                label_smoothing=label_smoothing,
+                forward_only=True,
+            )
+            return partial(loss_fn, _runtime=lambda model: runtime)
+
+        loss_fn._unsloth_eval_loss_factory = make_eval_loss
 
     loss_fn._unsloth_cce_backend = "runtime-cce"
     loss_fn._unsloth_cce_compaction = lm_layer.weight.shape[0] >= 8192
