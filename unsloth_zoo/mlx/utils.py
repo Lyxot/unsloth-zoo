@@ -4309,7 +4309,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             weight_is_frozen=_skip_weight_grad,
         )
 
-        def loss_fn(model, batch_dict):
+        def loss_fn(model, batch_dict, *, _runtime=rt_cce):
             hidden, masked_targets, ntoks = _vlm_cce_forward(
                 model, batch_dict, image_token_ids=_image_token_ids,
                 assistant_token_id=_assistant_token_id)
@@ -4327,9 +4327,19 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
                 flat = indices[:, 0] * masked_targets.shape[1] + columns
                 flat = mx.where((columns >= 0) & (columns < masked_targets.shape[1]), flat, -1)
                 hidden_flat, targets_flat = _compact_cce_inputs(hidden_flat, targets_flat, flat)
-            loss = rt_cce(model)(hidden_flat, w, targets_flat)
+            loss = _runtime(model)(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
+
+        def make_eval_loss():
+            if lm_layer.weight.dtype not in (mx.float16, mx.bfloat16):
+                return loss_fn
+            runtime = _get_runtime_cce(
+                ignore_index=-100, logit_softcap=softcap, forward_only=True,
+            )
+            return partial(loss_fn, _runtime=lambda model: runtime)
+
+        loss_fn._unsloth_eval_loss_factory = make_eval_loss
 
     loss_fn._unsloth_cce_backend = "runtime-cce"
     loss_fn._unsloth_cce_compaction = lm_layer.weight.shape[0] >= 8192

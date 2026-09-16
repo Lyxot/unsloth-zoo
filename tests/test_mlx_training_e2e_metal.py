@@ -1594,6 +1594,47 @@ def test_vlm_evaluation_compacts_sparse_batches(monkeypatch, quantized):
 
 
 @metal_only
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_vlm_evaluation_uses_fused_projection(monkeypatch, dtype):
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx import cce
+    from unsloth_zoo.mlx.cce import runtime_cce as rt
+
+    monkeypatch.setattr(cce, "_RUNTIME_CCE_CACHE", {})
+    mx.random.seed(737)
+    model = _cce_text_model(2053, 64, quantized=False)
+    model.set_dtype(getattr(mx, dtype))
+    model.get_input_embeddings = lambda *args, **kwargs: None
+    ids = mx.arange(1026).reshape(2, 513)
+    batch = {"input_ids": ids, "labels": mx.where(ids % 3 == 1, ids, -100)}
+    def forward(m, b, **kwargs):
+        targets = b["labels"][:, 1:-4]
+        return m.model.embed_tokens(b["input_ids"])[:, :-5], targets, (targets != -100).sum()
+    monkeypatch.setattr(mlx_utils, "_vlm_cce_forward", forward)
+    calls = []
+    fused = rt.get_fused_forward()
+    assert fused is not None
+    def recorded(*args, **kwargs):
+        calls.append(args[0].shape)
+        return fused(*args, **kwargs)
+    monkeypatch.setattr(rt, "get_fused_forward", lambda: recorded)
+    loss = mlx_utils.make_vlm_cce_loss_fn(model)
+    expected = loss(model, batch)
+    trainer = SimpleNamespace(
+        model=model, stop_requested=False,
+        _distributed_eval_status=lambda failed=False: (False, failed),
+        _raise_distributed_failure_from_any=lambda failed, _context, error: None,
+        _fire_prediction_step=lambda: None,
+    )
+    actual = MLXTrainer._evaluate_batch_totals(trainer, [batch], loss, is_vlm=True)
+    mx.eval(expected, actual[:2])
+    # Evaluation compacts the batch before the fused projection sees it.
+    assert len(calls) == 1 and calls[0][0] < 1016
+    assert actual[1].item() == expected[1].item()
+    assert actual[0].item() / actual[1].item() == pytest.approx(expected[0].item(), abs=2e-5)
+
+
+@metal_only
 def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
     """Real-runtime contract for planned VLM training: with a qualified
     compile decision the trainer surveys, installs a width plan, and runs
