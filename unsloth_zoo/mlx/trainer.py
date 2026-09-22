@@ -640,6 +640,8 @@ from .preference import (
     create_kto_batch_plan,
     create_preference_batch_plan,
     encode_generation_prompt_text,
+    make_cpo_loss_fn,
+    make_cpo_cce_loss_fn,
     make_dpo_loss_fn,
     make_dpo_cce_loss_fn,
     make_kto_loss_fn,
@@ -1646,6 +1648,9 @@ class MLXTrainingConfig:
             "precompute_ref_batch_size",
             "desirable_weight",
             "undesirable_weight",
+            "cpo_alpha",
+            "simpo_gamma",
+            "alpha",
         }
         _field_names = {field.name for field in config_fields}
         copied_all_fields = (_field_names - _appended_fields) <= set(provided)
@@ -1783,6 +1788,39 @@ class MLXKTOConfig(MLXTrainingConfig):
     num_generation_prompts: int = field(default=8, kw_only=True)
     generation_max_tokens: int = field(default=128, kw_only=True)
     generation_temperature: float = field(default=0.0, kw_only=True)
+
+
+@dataclass(init=False)
+class MLXCPOConfig(MLXTrainingConfig):
+    """Configuration owned by MLXCPOTrainer.
+
+    As in TRL's CPOConfig, loss_type="alphapo" is shorthand for
+    loss_type="simpo" with cpo_alpha=0.0, and max_prompt_length must stay below
+    max_length. max_completion_length is inert, as for MLXORPOConfig.
+    """
+
+    beta: float = field(default=0.1, kw_only=True)
+    label_smoothing: float = field(default=0.0, kw_only=True)
+    loss_type: str = field(default="sigmoid", kw_only=True)
+    disable_dropout: bool = field(default=True, kw_only=True)
+    cpo_alpha: float = field(default=1.0, kw_only=True)
+    simpo_gamma: float = field(default=0.5, kw_only=True)
+    alpha: float = field(default=0.0, kw_only=True)
+    max_length: int | None = field(default=1024, kw_only=True)
+    max_prompt_length: int | None = field(default=512, kw_only=True)
+    max_completion_length: int | None = field(default=None, kw_only=True)
+    truncation_mode: str = field(default="keep_end", kw_only=True)
+    # As MLXORPOConfig.
+    generate_during_eval: bool = field(default=False, kw_only=True)
+    num_generation_prompts: int = field(default=8, kw_only=True)
+    generation_max_tokens: int = field(default=128, kw_only=True)
+    generation_temperature: float = field(default=0.0, kw_only=True)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.loss_type == "alphapo":
+            self.loss_type = "simpo"
+            self.cpo_alpha = 0.0
 
 
 def _shape_guard_report(
@@ -6188,11 +6226,12 @@ class MLXTrainer:
                             "Unsloth MLX preference: resume requires a checkpoint "
                             "from the same preference objective."
                         )
-                if preference_kind == "orpo" and resume_provenance != {
-                    "kind": "orpo_no_reference"
+                if preference_kind in ("orpo", "cpo") and resume_provenance != {
+                    "kind": f"{preference_kind}_no_reference"
                 }:
                     raise ValueError(
-                        "Unsloth MLX ORPO: checkpoint objective does not match."
+                        f"Unsloth MLX {preference_kind.upper()}: checkpoint "
+                        "objective does not match."
                     )
                 if (
                     preference_kind == "dpo"
@@ -6352,6 +6391,27 @@ class MLXTrainer:
                 _main_print(
                     f"Unsloth: Using KTO loss (beta={args.beta}, "
                     f"loss_type={objective.loss_types[0]})."
+                )
+            elif preference_kind == "cpo":
+                objective = resolve_preference_objective(
+                    "cpo",
+                    beta=args.beta,
+                    label_smoothing=args.label_smoothing,
+                    loss_type=args.loss_type,
+                    cpo_alpha=args.cpo_alpha,
+                    simpo_gamma=args.simpo_gamma,
+                    alpha=args.alpha,
+                )
+                loss_fn = (make_cpo_cce_loss_fn(model, objective)
+                           if args.use_cce else make_cpo_loss_fn(objective))
+                use_cce = hasattr(loss_fn, "_unsloth_cce_backend")
+                self._preference_reference_provenance = {
+                    "kind": "cpo_no_reference"
+                }
+                _main_print(
+                    f"Unsloth: Using CPO loss (beta={args.beta}, "
+                    f"loss_type={objective.loss_types[0]}, "
+                    f"cpo_alpha={objective.cpo_alpha})."
                 )
             else:
                 objective = resolve_preference_objective(
@@ -9162,9 +9222,10 @@ class MLXTrainer:
         model_type = config.get("model_type") if isinstance(config, dict) else None
         model_name = getattr(self.model, "_hf_repo", None)
 
-        if self.preference_kind == "kto" and is_vlm:
+        if self.preference_kind in ("kto", "cpo") and is_vlm:
             raise ValueError(
-                "Unsloth MLX KTO: vision-language models are not supported."
+                f"Unsloth MLX {self.preference_kind.upper()}: vision-language "
+                "models are not supported."
             )
 
         if is_vlm:
@@ -9315,7 +9376,7 @@ class MLXTrainer:
             if float(getattr(args, "label_smoothing_factor", 0.0) or 0.0):
                 raise ValueError(
                     "Unsloth MLX preference: label_smoothing_factor is an SFT "
-                    "option. Use MLXDPOConfig(label_smoothing=...) for DPO."
+                    "option. Use label_smoothing on MLXDPOConfig or MLXCPOConfig."
                 )
             if not math.isfinite(float(args.beta)) or float(args.beta) < 0:
                 raise ValueError("Unsloth MLX preference: beta must be finite and non-negative.")
@@ -9925,6 +9986,13 @@ class MLXKTOTrainer(MLXTrainer):
 
     def _reference_adapter_names(self, args):
         return self.model_adapter_name, self.ref_adapter_name
+
+
+class MLXCPOTrainer(MLXTrainer):
+    """MLX trainer for Contrastive Preference Optimization."""
+
+    config_class = MLXCPOConfig
+    preference_kind = "cpo"
 
 
 def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
