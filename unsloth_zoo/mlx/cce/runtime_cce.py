@@ -1227,8 +1227,8 @@ def make_runtime_cce_loss_fused_finalize(
         # 8 MB is calibrated against ONE token-side buffer per chunk, not the true live
         # set: logits and d_logits are always both live. Two cells break that ratio badly
         # enough to invert the result, so each is held out rather than re-calibrating the
-        # rest. Trainable bfloat16 on the kernel path is 4x, not 2x: dlogits_out_dtype
-        # below writes d_logits float32 and the hidden GEMM casts it back.
+        # rest. Trainable bfloat16 on the kernel path is 4x, not 2x: the weight
+        # gradient branch below writes d_logits float32.
         # Label smoothing stays excluded. Promoting either one costs memory instead of saving it.
         promoted_chunk = 4096
         promoted_bytes = promoted_chunk * compute_bytes
@@ -1521,40 +1521,19 @@ def make_runtime_cce_loss_fused_finalize(
         # Vocabulary chunks are disjoint; only each GEMM needs fp32 accumulation.
         grad_weight = mx.zeros(weight_compute.shape, dtype=weight.dtype)
         hidden_f32 = hidden_compute.astype(mx.float32)
+        # The weight gradient is consumed last (tied embedding add, optimizer update),
+        # so it recomputes each chunk's d_logits rather than keeping them alive across
+        # the backward. This distinct, uncopied hidden stops mx.compile merging the two logits GEMMs.
+        hidden_recompute = mx.depends([hidden_compute], [lse])[0]
         n_reads = 4
         smoothing_arr = (
             mx.array([1.0 - label_smoothing, label_smoothing / vocab_size], dtype=mx.float32)
             if label_smoothing > 0.0 else None
         )
 
-        for chunk_idx, v_start in enumerate(chunk_starts_int):
-            v_end = min(v_start + resolved_chunk_size, vocab_size)
-            weight_chunk = weight_compute[v_start:v_end]
-
-            logits = hidden_compute @ weight_chunk.T
-
-            if dlogits_kernel is not None:
-                total_threads = (logits.size + n_reads - 1) // n_reads
-                dlogits_out_dtype = (mx.float32 if logits.dtype == mx.bfloat16
-                                     and not weight_is_frozen else logits.dtype)
-                d_logits = dlogits_kernel(
-                    inputs=[
-                        logits,
-                        lse,
-                        targets32,
-                        grad_output32,
-                        chunk_starts_arr[chunk_idx],
-                        ignore_arr,
-                        softcap_arr,
-                    ] + ([smoothing_arr] if smoothing_arr is not None else []),
-                    output_shapes=[logits.shape],
-                    output_dtypes=[dlogits_out_dtype],
-                    template=[("O", dlogits_out_dtype)],
-                    grid=(total_threads, 1, 1),
-                    threadgroup=(256, 1, 1),
-                )[0]
-            else:
-                d_logits = _fallback_dlogits(
+        def chunk_d_logits(logits, chunk_idx, v_start, v_end, out_dtype):
+            if dlogits_kernel is None:
+                return _fallback_dlogits(
                     logits,
                     lse,
                     targets32,
@@ -1565,23 +1544,47 @@ def make_runtime_cce_loss_fused_finalize(
                     logit_softcap=logit_softcap,
                     label_smoothing=label_smoothing,
                     vocab_size=vocab_size,
-                ).astype(logits.dtype)
+                ).astype(logits.dtype)  # fallback rounds for the weight GEMM too
+            return dlogits_kernel(
+                inputs=[
+                    logits,
+                    lse,
+                    targets32,
+                    grad_output32,
+                    chunk_starts_arr[chunk_idx],
+                    ignore_arr,
+                    softcap_arr,
+                ] + ([smoothing_arr] if smoothing_arr is not None else []),
+                output_shapes=[logits.shape],
+                output_dtypes=[out_dtype],
+                template=[("O", out_dtype)],
+                grid=((logits.size + n_reads - 1) // n_reads, 1, 1),
+                threadgroup=(256, 1, 1),
+            )[0]
 
-            d_logits_compute = d_logits.astype(hidden_compute.dtype)
-            grad_hidden = grad_hidden + d_logits_compute @ weight_chunk
+        for chunk_idx, v_start in enumerate(chunk_starts_int):
+            v_end = min(v_start + resolved_chunk_size, vocab_size)
+            weight_chunk = weight_compute[v_start:v_end]
+            logits = hidden_compute @ weight_chunk.T
+            d_logits = chunk_d_logits(logits, chunk_idx, v_start, v_end, logits.dtype)
+            grad_hidden = grad_hidden + d_logits.astype(hidden_compute.dtype) @ weight_chunk
+            # Under mx.compile the gradient sum would otherwise run as one
+            # fused chain that keeps every chunk's d_logits alive.
+            grad_hidden = mx.depends([grad_hidden], [d_logits])[0]
+
+            logits = hidden_recompute @ weight_chunk.T
+            d_logits = chunk_d_logits(
+                logits, chunk_idx, v_start, v_end,
+                mx.float32 if logits.dtype == mx.bfloat16 else logits.dtype,
+            )
             # Weight gradient GEMM in float32 for accumulation precision
-            d_logits_f32 = d_logits.astype(mx.float32)
-            grad_weight_chunk = (d_logits_f32.T @ hidden_f32).astype(weight.dtype)
+            grad_weight_chunk = (d_logits.astype(mx.float32).T @ hidden_f32).astype(weight.dtype)
             grad_weight = mx.slice_update(
                 grad_weight,
                 grad_weight_chunk,
                 start_indices=weight_chunk_starts[chunk_idx],
                 axes=(0, 1),
             )
-            if weight_is_frozen:
-                # Under mx.compile the gradient sum would otherwise run as one
-                # fused chain that keeps every chunk's d_logits alive.
-                grad_hidden = mx.depends([grad_hidden], [d_logits])[0]
 
         return grad_hidden.astype(hidden.dtype), grad_weight.astype(weight.dtype), mx.zeros_like(targets)
 
