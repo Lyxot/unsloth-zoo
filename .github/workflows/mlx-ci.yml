@@ -27,7 +27,7 @@ permissions:
 
 jobs:
   mlx-smoke:
-    name: MLX install + import smoke (Apple Silicon, ${{ matrix.mlx }})
+    name: MLX install + import smoke (Apple Silicon, ${{ matrix.mlx }}, transformers ${{ matrix.transformers }})
     # Opt-in: schedule / workflow_dispatch always run; PR runs only with `mlx` label.
     if: >-
       github.event_name == 'schedule' ||
@@ -46,6 +46,9 @@ jobs:
         # `latest` the supported combination is never exercised on Apple hardware
         # at all, since PR runs are opt-in behind the `mlx` label.
         mlx: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["pinned", "latest"]' || '["pinned"]') }}
+        # STAGING ONLY: every transformers the lifted darwin cap admits that changes the
+        # joint resolution. 5.5.0 / 5.12.1 resolve mlx-vlm 0.6.4; 5.14.1+ resolve 0.7.x.
+        transformers: ['5.5.0', '5.12.1', '5.14.1', '5.15.1', '5.16.1', '5.17.0']
     # The detection leg reports, it does not gate. It deliberately installs
     # combinations nobody supports yet, so letting it fail the workflow would
     # turn every upstream release into a red main until someone bumps the pin.
@@ -87,8 +90,14 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install "torch>=2.4.0,<2.15.0"
-          pip install -e .[mlx]
+          pip install -e .[mlx] "transformers==${{ matrix.transformers }}"
           pip install pytest==9.0.3
+          python - <<'PY'
+          from importlib.metadata import version
+          for name in ("mlx", "mlx-lm", "mlx-vlm", "mlx-audio", "transformers", "tokenizers"):
+              print(f"{name}=={version(name)}")
+          assert version("transformers") == "${{ matrix.transformers }}", version("transformers")
+          PY
           # The vision model used by tests/test_mlx_generate_metal.py loads
           # remote processor code that imports timm, which .[mlx] does not pull.
           pip install timm
