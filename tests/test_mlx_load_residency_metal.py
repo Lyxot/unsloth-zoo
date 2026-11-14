@@ -386,6 +386,8 @@ def test_staged_rows_match_stock_once_filled(tmp_path, kind, monkeypatch):
     monkeypatch.setattr(mx, "async_eval", lambda ids, queued = (queued := []): queued.append((ids.dtype, ids.ndim, ids.tolist())))
     # Another forward asks for the slot while this one waits on the slot's last reader.
     monkeypatch.setattr(mx, "eval", lambda *arrays: rivals.append(table._staged(steps[0])) or evaluate(*arrays))
+    row_batches, read_rows = [], zoo_offload.read_rows
+    monkeypatch.setattr(zoo_offload, "read_rows", lambda jobs: (row_batches.append(len(jobs)), read_rows(jobs)))
     zoo_offload.STAGED_FILLS.fills = fills = []
     try:
         for ids in steps:
@@ -402,6 +404,7 @@ def test_staged_rows_match_stock_once_filled(tmp_path, kind, monkeypatch):
     finally:
         zoo_offload.STAGED_FILLS.fills = None
     assert rivals and all(rival is None for rival in rivals)
+    assert row_batches == [3 * len(table._tables[0].fields)] * 2  # each fill reads its rows as one batch of row reads
     assert len(queued) == 4 and all(a == (mx.int64, 1, b.reshape(-1).tolist()) for a, b in zip(queued, (steps[0], steps[1], steps[1], steps[1])))
     for actual, reference in zip(outs, expected):
         assert actual.dtype == reference.dtype and actual.shape == reference.shape
@@ -445,6 +448,39 @@ def test_offloaded_rows_the_page_cache_dropped_are_read_again(tmp_path, monkeypa
     # One row at a time, as the sample is checked; the last two rows span a resident page and an evicted one.
     rows = ((0, 1), (2, 1), (1, 2), (2, 1.5), (4, 0.875))
     assert [in_core(pages, np.array([r]), int(n * mmap.PAGESIZE)).tolist() for r, n in rows] == [[False], [True], [True], [False], [False]]
+
+
+def test_row_reads_use_the_pool_only_for_storage_reads(tmp_path, monkeypatch):
+    rows = np.random.default_rng(0).integers(0, 256, (40, 16), dtype = np.uint8)
+    (tmp_path / "rows.bin").write_bytes(rows.tobytes())
+    fd = os.open(tmp_path / "rows.bin", os.O_RDONLY)
+    pooled, native, calls = [], zoo_offload.read_ranges, [0]
+    monkeypatch.setattr(zoo_offload, "read_ranges", lambda jobs: (pooled.append(len(jobs)), native(jobs)))
+    monkeypatch.setattr(zoo_offload, "_pool_batches", [0])
+
+    def batch(*storage):
+        # A clock on which the batch's reads numbered in storage take a storage read's time.
+        calls[0], out = 0, np.zeros_like(rows)
+        clock = lambda: (calls.__setitem__(0, calls[0] + 1), float(calls[0] % 2 == 0 and calls[0] // 2 - 1 in storage))[1]
+        monkeypatch.setattr(zoo_offload, "time", type("clock", (), {"perf_counter": staticmethod(clock)}))
+        zoo_offload.read_rows([(fd, 16 * i, memoryview(out[i])) for i in range(len(rows))])
+        np.testing.assert_array_equal(out, rows)
+        return pooled
+
+    try:
+        assert batch() == [] and batch(5) == []  # one stray storage read stays in turn
+        assert batch(3, 9) == [30]  # the second one sends the rest to the pool
+        for _ in range(zoo_offload._CACHED_RETRY - 1):
+            batch()
+        assert pooled == [30] + [40] * (zoo_offload._CACHED_RETRY - 1)
+        assert batch(0, 1) == [30] + [40] * (zoo_offload._CACHED_RETRY - 1) + [38]  # the retry met storage again
+        del pooled[:]
+        for _ in range(zoo_offload._CACHED_RETRY - 1):
+            batch()
+        assert pooled == [40] * (zoo_offload._CACHED_RETRY - 1) and batch() == pooled and batch() == pooled
+        assert len(pooled) == zoo_offload._CACHED_RETRY - 1
+    finally:
+        os.close(fd)
 
 
 def test_offloaded_rows_are_never_loaded(tmp_path):

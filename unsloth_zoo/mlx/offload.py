@@ -31,6 +31,7 @@ import re
 import struct
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, wait
 
 import mlx.core as mx
@@ -145,6 +146,30 @@ def read_ranges(jobs):
     wait(futures)
     for future in futures:
         future.result()
+
+
+# A row read from the page cache returns in about a microsecond, one from storage in a hundred or more.
+_STORAGE_READ_SECONDS = 20e-6
+# Row batches that went to the pool; after one, every _CACHED_RETRY-th batch tries the page cache again.
+_pool_batches = [0]
+_CACHED_RETRY = 8
+
+
+def read_rows(jobs):
+    """read_ranges for one-row jobs: rows in the page cache are read in turn, the rest of a batch on the pool."""
+    waited = _pool_batches[0]
+    if waited % _CACHED_RETRY:
+        _pool_batches[0] = waited + 1
+        return read_ranges(jobs)
+    slow = 0
+    for done, (fd, offset, view) in enumerate(jobs, 1):
+        start = time.perf_counter()
+        _read_all(fd, view, offset)
+        if time.perf_counter() - start > _STORAGE_READ_SECONDS:
+            slow += 1
+            if slow > 1:
+                _pool_batches[0] = waited + 1
+                return read_ranges(jobs[done:])
 
 
 class CheckpointTensors:
@@ -437,7 +462,7 @@ class DiskEmbedding(nn.Module):
             for position, (index, row) in enumerate(zip(shard.tolist(), (ids - offsets[shard]).tolist())):
                 for field, view in zip(tables[index].fields, slot[1]):
                     jobs.append((field.fd, field.offset + row * field.row_bytes, memoryview(view[position])))
-            read_ranges(jobs)
+            read_rows(jobs)
             slot[3] = False
 
         fill.abandon = lambda: slot.__setitem__(3, False)
