@@ -483,6 +483,40 @@ def test_row_reads_use_the_pool_only_for_storage_reads(tmp_path, monkeypatch):
         os.close(fd)
 
 
+@pytest.mark.parametrize("room", [True, False])
+def test_small_fields_are_read_ahead_once_where_memory_has_room(tmp_path, monkeypatch, room):
+    import mmap
+    # Shards whose rows held in memory span more than a page of each small field.
+    name, module = "ngram_embedding", pytest.importorskip("mlx_vlm.models.qwen4_exp.language").ShardedEmbedding(60000, 64, 3)
+    nn.quantize(module, group_size = 32, bits = 4)
+    model = _lazy_copy(lambda: _holder(name, module), str(tmp_path))
+    ids = mx.array([[7, 400, 59999, 30000]])
+    expected = _site(model, name)(ids)
+    offload_ple(model, str(tmp_path), 0.5)
+    table, advised, started, read_ahead = _site(model, name), [], [], zoo_offload._read_ahead
+    monkeypatch.setattr(zoo_offload, "_madvise", lambda *call: advised.append(call))
+    monkeypatch.setattr(zoo_offload, "_read_ahead", lambda ranges: started.append(read_ahead(ranges)))
+    monkeypatch.setattr(zoo_offload, "_READ_AHEAD_ROOM", 0 if room else 1 << 60)
+    for _ in range(2):
+        np.testing.assert_array_equal(_bits(table(ids)), _bits(expected))
+    assert len(started) == room
+    if room:
+        started[0].join()
+        small = [(shard, field) for shard in table._tables for field in shard.fields if field.name != "weight"]
+        assert len(advised) == len(small) == 2 * len(table._tables) and {call[2] for call in advised} == {mmap.MADV_WILLNEED}
+        for (address, length, _), (shard, field) in zip(advised, small):
+            first = field.map.ctypes.data + shard.resident * field.row_bytes  # the rows held in memory are never read
+            assert first - field.map.ctypes.data > mmap.PAGESIZE and address % mmap.PAGESIZE == 0
+            assert address <= first < address + mmap.PAGESIZE
+            assert address + length == field.map.ctypes.data + field.map.size
+    # A table with nothing but weights has nothing small to read.
+    (tmp_path / "dense").mkdir()
+    dense = _lazy_copy(lambda: _holder("embed_tokens_per_layer", nn.Embedding(64, 8)), str(tmp_path / "dense"))
+    offload_ple(dense, str(tmp_path / "dense"), 1.0)
+    mx.eval(dense.language_model.model.embed_tokens_per_layer(mx.array([[1, 2]])))
+    assert len(started) == room
+
+
 def test_offloaded_rows_are_never_loaded(tmp_path):
     rows, dims = 8192, 2048  # 64 MiB of float32
     model = _lazy_copy(lambda: _holder("embed_tokens_per_layer", nn.Embedding(rows, dims)), str(tmp_path))

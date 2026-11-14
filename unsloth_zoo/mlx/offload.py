@@ -311,6 +311,34 @@ def _in_core(mapped, rows, row_bytes):
     return resident[high + 1] - resident[low] == high - low + 1
 
 
+_madvise = None
+_MADV_WILLNEED = 3
+# A table's small fields are read ahead when the memory MLX leaves free is this many times their size.
+_READ_AHEAD_ROOM = 4
+
+
+def _read_ahead(ranges):
+    """Start a thread that brings each (memory map, first byte) of ranges into the page cache from that byte on."""
+    global _madvise
+    if _madvise is None:
+        try:
+            _madvise = ctypes.CDLL(None, use_errno = True).madvise
+            _madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        except (OSError, AttributeError):
+            _madvise = False
+    if not _madvise:
+        return None
+
+    def run():
+        for mapped, skip in ranges:  # the advice returns once the range is read
+            first = (mapped.ctypes.data + skip) // mmap.PAGESIZE * mmap.PAGESIZE
+            _madvise(first, mapped.ctypes.data + mapped.size - first, _MADV_WILLNEED)
+
+    thread = threading.Thread(target = run, name = "unsloth-offload-ahead", daemon = True)
+    thread.start()
+    return thread
+
+
 class _RowTable:
     """A [rows, ...] tensor and its quantization siblings, read by row: the first `resident` rows are held in memory, a
     row's first lookup uses pread, and later lookups gather from the page cache via a read-only map with no syscall
@@ -397,10 +425,22 @@ class DiskEmbedding(nn.Module):
         object.__setattr__(self, "_tables", tuple(tables))
         object.__setattr__(self, "_offsets", offsets)
         object.__setattr__(self, "quantization", quantization)
+        object.__setattr__(self, "_ahead", False)
         self.dims = dims
         self.normalize_zero = normalize_zero
 
+    def _read_small_fields_ahead(self):
+        """A quantized row's scales and biases are a fifth of its bytes and two of its three page reads."""
+        object.__setattr__(self, "_ahead", True)
+        ranges = [(field.map, table.resident * field.row_bytes)
+                  for table in self._tables for field in table.fields if field.name != "weight"]
+        room = mx.device_info()["memory_size"] - mx.get_active_memory()
+        if ranges and sum(mapped.size - skip for mapped, skip in ranges) * _READ_AHEAD_ROOM <= room:
+            _read_ahead(ranges)
+
     def __call__(self, x):
+        if not self._ahead:
+            self._read_small_fields_ahead()
         fills = getattr(STAGED_FILLS, "fills", None)
         if fills is not None and (staged := self._staged(x)) is not None:
             fills.append(staged[1])
