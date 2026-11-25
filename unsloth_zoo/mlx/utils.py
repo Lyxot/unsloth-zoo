@@ -15195,27 +15195,34 @@ def _unpack_hadamard_modules(model):
     return bool(dense)
 
 
-def _dense_scaled_quantized_modules(model):
+def _dense_quantized_modules_mlx_lm_skips(model):
     """mlx-lm's dequantize_model skips NVFP4 modules with a global scale (mlx-vlm's ScaledQuantized*, the loader's scaled
-    embedding) and would save their packed weights as dense; fold the scale and any AWQ pre_quant_scale in instead."""
+    embedding) and mlx-vlm's own QuantizedSwitchLinear experts, and would save their packed weights as dense; dequantize
+    them here, folding in the global scale and any AWQ pre_quant_scale."""
+    vlm_switch = getattr(sys.modules.get("mlx_vlm.models.switch_layers"), "QuantizedSwitchLinear", None)
+    vlm_switch = vlm_switch if isinstance(vlm_switch, type) else ()
     dense = []
     for name, module in model.named_modules():
         scale_name = next((key for key in ("weight_scale_2", "weight_global_scale")
                            if getattr(module, key, None) is not None), None)
         packed = getattr(module, "weight", None)
-        if scale_name is None or getattr(module, "scales", None) is None or getattr(packed, "dtype", None) != mx.uint32:
+        if ((scale_name is None and not isinstance(module, vlm_switch)) or getattr(module, "scales", None) is None
+                or getattr(packed, "dtype", None) != mx.uint32):
             continue
-        weight = mx.dequantize(packed, module.scales, getattr(module, "biases", None), module.group_size,
-                               module.bits, module.mode, dtype=mx.float32)
-        scale = getattr(module, scale_name).astype(mx.float32)
-        if scale.size > 1:
-            scale = scale.reshape(*weight.shape[:-2], -1, 1)
-        weight = weight / scale if scale_name == "weight_global_scale" else weight * scale
-        pre = getattr(module, "pre_quant_scale", None)
-        if pre is not None:
-            pre = pre.astype(mx.float32)
-            weight = weight * (pre.reshape(*pre.shape[:-1], 1, pre.shape[-1]) if pre.ndim > 1 else pre)
-        weight = weight.astype(mx.bfloat16)
+        args = (packed, module.scales, getattr(module, "biases", None), module.group_size, module.bits, module.mode)
+        if scale_name is None:  # as dequantize_model does for mlx-lm's own experts
+            weight = mx.dequantize(*args)
+        else:
+            weight = mx.dequantize(*args, dtype=mx.float32)
+            scale = getattr(module, scale_name).astype(mx.float32)
+            if scale.size > 1:
+                scale = scale.reshape(*weight.shape[:-2], -1, 1)
+            weight = weight / scale if scale_name == "weight_global_scale" else weight * scale
+            pre = getattr(module, "pre_quant_scale", None)
+            if pre is not None:
+                pre = pre.astype(mx.float32)
+                weight = weight * (pre.reshape(*pre.shape[:-1], 1, pre.shape[-1]) if pre.ndim > 1 else pre)
+            weight = weight.astype(mx.bfloat16)
         bias = getattr(module, "bias", None)
         if hasattr(module, "num_embeddings"):
             layer = nn.Embedding(*weight.shape)
@@ -18903,7 +18910,7 @@ def save_merged_model(model, tokenizer, path, dequantize=False,
 
     if dequantize:
         unpacked = _unpack_hadamard_modules(model)
-        _dense_scaled_quantized_modules(model)
+        _dense_quantized_modules_mlx_lm_skips(model)
         model = dequantize_model(model)
         # Rewrite what is saved: it may resolve from `model.config` or `model.args`.
         cfg = _get_model_config(model)
